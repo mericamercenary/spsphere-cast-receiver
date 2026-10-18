@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>SPSphere preview</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0b0d10; }
+    canvas { width: 100vw; height: 100vh; display: block; }
+    #hud {
+      position: fixed; left: 16px; bottom: 12px; color: #f2f5f7;
+      font: 20px/1.3 sans-serif;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="view" width="1280" height="720"></canvas>
+  <div id="hud"></div>
+  <script src="player.js"></script>
+  <script>
+    var params = new URLSearchParams(location.search);
+    var canvas = document.getElementById("view");
+    if (params.get("mode") === "2d") {
+      var proto = canvas.getContext;
+      canvas.getContext = function (kind) {
+        if (kind === "webgl" || kind === "experimental-webgl") return null;
+        return proto.call(canvas, kind);
+      };
+    }
+    function markReady(player) {
+      var pending = 0;
+      function done() {
+        pending -= 1;
+        if (pending > 0) return;
+        player.draw();
+        document.documentElement.dataset.castReady = "1";
+      }
+      player.images.forEach(function (img) {
+        if (img.complete && img.naturalWidth) return;
+        pending += 1;
+        img.addEventListener("load", done);
+        img.addEventListener("error", function () {
+          document.documentElement.dataset.castError = img.src;
+          done();
+        });
+      });
+      if (pending === 0) done();
+    }
+
+    var player = SpsphereCast.create(canvas);
+    window.__player = player;
+    var speed = Number(params.get("speed") || SpsphereCast.DEFAULT_DPS);
+    player.setSpeed(speed);
+
+    if (params.get("easetest") === "1") {
+      player.setQueue(["samples/front.jpg", "samples/next.jpg"]);
+      player.yaw = 80;
+      player.pitch = 20;
+      player.fov = 60;
+      player.playing = false;
+      player.manual = true;
+      player.play();
+      var stayed = Math.abs(player.yaw - 80) < 0.01 && player._panBlend === 0 && player.held === false;
+      player.advance(16);
+      var crept = player.yaw > 80 && player.yaw < 80.4;
+      for (var n = 0; n < 6; n++) player.stepAim(16);
+      var pitched = player.pitch < 19 && player.pitch > 2;
+      player.appendItems([{ id: "extra", url: "samples/next.jpg" }]);
+      var added = player.items.length === 3 && player.index === 0 && Math.abs(player.yaw - 80) < 0.5;
+      player.gotoId("extra");
+      var jumped = player.index === 2 && Math.abs(player.yaw - 80) < 0.5 && player.itemDegrees === 0;
+      player.moveId("extra", 0);
+      var moved = player.ids[0] === "extra" && player.index === 0;
+      player.pause(true);
+      var held = player.held === true && player.playing === false;
+      var yawHeld = player.yaw;
+      player.advance(2000);
+      var frozen = Math.abs(player.yaw - yawHeld) < 0.01;
+      var pass = stayed && crept && pitched && added && jumped && moved && held && frozen;
+      document.title = pass ? "EASE" : ("FAIL " + JSON.stringify({
+        stayed: stayed, crept: crept, pitched: pitched, added: added, jumped: jumped, moved: moved, held: held, frozen: frozen,
+        yaw: player.yaw, pitch: player.pitch, blend: player._panBlend,
+      }));
+      document.getElementById("hud").textContent = document.title;
+      player.halt();
+    } else if (params.get("aimtest") === "1") {
+      var bytes = new ArrayBuffer(32);
+      var view = new DataView(bytes);
+      view.setUint8(0, 1);
+      view.setUint8(1, 1);
+      view.setUint32(4, 9, true);
+      view.setFloat32(8, 12.5, true);
+      view.setFloat32(12, -3, true);
+      view.setFloat32(16, 1.5, true);
+      view.setFloat32(20, 68, true);
+      view.setFloat64(24, 1700000, true);
+      var decoded = SpsphereCast.decodeAim(bytes);
+      var packetOk = decoded && decoded.anchor && decoded.seq === 9 && Math.abs(decoded.yaw - 12.5) < 0.001 && decoded.ts === 1700000;
+      player.yaw = 0;
+      player.pitch = 0;
+      player.fov = 75;
+      player.applyAim({ seq: 1, yaw: 0, pitch: 0, roll: 0, fov: 75, anchor: true, ts: 1 });
+      player.applyAim({ seq: 2, yaw: 40, pitch: 10, roll: 0, fov: 60, anchor: false, ts: 2 });
+      var ms = 0;
+      var arrived = -1;
+      for (var i = 0; i < 40; i++) {
+        player.stepAim(16);
+        ms += 16;
+        if (arrived < 0 && Math.abs(player.yaw - 40) < 1 && Math.abs(player.pitch - 10) < 1 && Math.abs(player.fov - 60) < 1.5) {
+          arrived = ms;
+        }
+      }
+      var staleIgnored = player.applyAim({ seq: 1, yaw: 90, pitch: 0, roll: 0, fov: 75, anchor: false, ts: 3 }) === false;
+      var landed = Math.abs(player.yaw - 40) < 1.5 && Math.abs(player.pitch - 10) < 1.5;
+      var anchored = SpsphereCast.create(canvas);
+      anchored.yaw = 80;
+      anchored.applyAim({ seq: 1, yaw: 12, pitch: 0, roll: 0, fov: 75, anchor: true, ts: 1 });
+      anchored.applyAim({ seq: 2, yaw: 27, pitch: 20, roll: 0, fov: 60, anchor: false, ts: 2 });
+      for (var j = 0; j < 50; j++) anchored.stepAim(16);
+      var anchorOk = Math.abs(anchored.yaw - 95) < 1.5 && Math.abs(anchored.pitch - 20) < 1.5;
+      var pass = packetOk && staleIgnored && landed && anchorOk && arrived >= 1 && arrived <= 200;
+      document.title = pass ? ("AIM " + arrived) : ("FAIL " + JSON.stringify({
+        arrived: arrived, yaw: player.yaw, pitch: player.pitch, fov: player.fov,
+        anchorYaw: anchored.yaw, packetOk: packetOk, staleIgnored: staleIgnored,
+      }));
+      document.getElementById("hud").textContent = document.title;
+      player.halt();
+      anchored.halt();
+    } else if (params.get("selftest") === "1") {
+      player.setQueue(["samples/front.jpg", "samples/next.jpg"]);
+      player.play();
+      var turned = player.advance(40000);
+      var fadeOk = turned.index === 1 && turned.phase === "fade";
+      var settled = player.advance(SpsphereCast.CROSSFADE_MS);
+      var settledOk = settled.index === 1 && settled.phase === "pan" && settled.itemDegrees < 1;
+      var single = SpsphereCast.create(canvas);
+      single.setQueue(["samples/front.jpg"]);
+      single.setSpeed(18);
+      single.play();
+      var stayed = single.advance(120000);
+      var singleOk = stayed.index === 0 && stayed.phase === "pan";
+      document.title = (fadeOk && settledOk && singleOk) ? "PASS" : ("FAIL " + JSON.stringify({ turned: turned, settled: settled, stayed: stayed }));
+      document.getElementById("hud").textContent = document.title;
+      player.halt();
+      single.halt();
+    } else if (params.get("posetest") === "1") {
+      var same = SpsphereCast.applyPose([0.2, -0.4, -0.8], 0, 0);
+      var ident = same[0] === 0.2 && same[1] === -0.4 && same[2] === -0.8;
+      var pitched = SpsphereCast.applyPose([0, 0, -1], 18 * Math.PI / 180, 0);
+      var pitchOk = Math.abs(pitched[0]) < 1e-6 && Math.abs(pitched[1] + Math.sin(18 * Math.PI / 180)) < 1e-6 && pitched[1] < 0;
+      var swatch = document.createElement("canvas");
+      swatch.width = 256;
+      swatch.height = 128;
+      var sg = swatch.getContext("2d");
+      sg.fillStyle = "#2266dd";
+      sg.fillRect(0, 0, 256, 71);
+      sg.fillStyle = "#228844";
+      sg.fillRect(0, 71, 256, 57);
+      player.setQueue([{ id: "tilt", url: swatch.toDataURL("image/png"), posePitch: 0, poseRoll: 0 }]);
+      var photo = player.images[0];
+      function readCenter() {
+        player.draw();
+        var gl = player._gl;
+        var px = new Uint8Array(4);
+        var x = (player.canvas.width / 2) | 0;
+        var y = (player.canvas.height / 2) | 0;
+        gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+        return [px[0], px[1], px[2]];
+      }
+      function finish() {
+        var webgl = player._mode === "webgl";
+        var level = webgl ? readCenter() : [0, 0, 0];
+        player.poses[0] = { pitch: 18 * Math.PI / 180, roll: 0 };
+        var dropped = webgl ? readCenter() : [0, 0, 0];
+        var levelSky = level[2] > level[1] && level[2] > 80;
+        var droppedGround = dropped[1] > dropped[2] && dropped[1] > 80;
+        var pass = ident && pitchOk && webgl && levelSky && droppedGround;
+        document.title = pass ? "POSE" : ("FAIL " + JSON.stringify({
+          ident: ident, pitchOk: pitchOk, webgl: webgl, level: level, dropped: dropped, pitched: pitched,
+        }));
+        document.getElementById("hud").textContent = document.title;
+        document.documentElement.dataset.castReady = pass ? "1" : "0";
+        player.halt();
+      }
+      if (photo.complete && photo.naturalWidth) finish();
+      else photo.addEventListener("load", finish);
+    } else {
+      player.setQueue(["samples/front.jpg", "samples/next.jpg"]);
+      var jump = Number(params.get("advance") || 0);
+      if (params.get("still") === "1") {
+        if (jump > 0) {
+          player.play();
+          var panMs = (SpsphereCast.ROTATIONS * 360 / player.speed) * 1000;
+          if (jump > panMs) {
+            player.advance(panMs);
+            player.advance(jump - panMs);
+          } else {
+            player.advance(jump);
+          }
+        }
+        player.halt();
+        markReady(player);
+      } else {
+        player.play();
+        if (jump > 0) player.advance(jump);
+      }
+    }
+  </script>
+</body>
+</html>
