@@ -46,7 +46,7 @@ That does not turn off mixed content. An HTTPS page asking for `http://192.168.x
 - TV → phone: `{type: "fetch", id, reason}`
 - phone → TV: `{type: "chunk", id, i, n, data}` where `data` is base64 of at most 32 KiB of the JPEG (keeps each Cast message under the 64 KB limit), `i` is 0-based and `n` is the chunk count. Or `{type: "fetchError", id, message}`.
 
-After one LAN failure the TV skips the LAN for the rest of that queue. A transfer that makes no progress for 20 s fails. Without `chunks: true` (older phone apps) a LAN error is shown at once, and a photo still not delivered after 30 s shows a message but keeps waiting.
+After one LAN failure the TV skips the LAN for the rest of the session; `lan: false` in the `queue` message skips it from the start. Current Chromium (Local Network Access) blocks an HTTPS page on a public host from reading `http://192.168.x.x` and `ws://192.168.x.x` with no way to grant it on a TV, so the Cast channel is the path that works. A transfer that makes no progress for 20 s fails. Without `chunks: true` (older phone apps) a LAN error is shown at once, and a photo still not delivered after 30 s shows a message but keeps waiting.
 
 The TV reports every photo back to the phone: `{type: "photo", id, ok: true, via: "lan"|"cast", width, height}` or `{type: "error", id, message}` where `message` starts with `Couldn't load photo:`. The same text is shown in the middle of the TV while that photo is current. A later `photo` ok for the same id clears it.
 

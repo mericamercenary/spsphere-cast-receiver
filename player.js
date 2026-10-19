@@ -183,6 +183,9 @@
     return img;
   };
 
+  /** Ask for every later photo over the Cast channel without trying the LAN URL. */
+  Player.prototype.skipLan = function () { this._lanDead = true; };
+
   Player.prototype._watchImage = function (img, url, onFail) {
     var self = this;
     var settled = false;
@@ -211,7 +214,7 @@
     img.onerror = function () {
       finish(false, isBlobOrData(url)
         ? "the TV couldn't decode the image"
-        : "the TV couldn't download it from the phone (" + hostOf(url) + "). The TV may block http:// photos on a secure page, or the phone and TV are on different networks");
+        : "the TV blocked or couldn't reach the download from the phone (" + hostOf(url) + "). Cast's browser stops secure pages from reading devices on your home network, so the phone has to send the photo over Cast. Update SPSphere on the phone");
     };
     if (!isBlobOrData(url)) {
       var fallback = self.canFetch;

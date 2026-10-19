@@ -106,6 +106,8 @@
         player.canFetch = !!msg.chunks;
         connectAim(msg.ws);
         player.setSpeed(msg.speed || SpsphereCast.DEFAULT_DPS);
+        // lan: false skips the phone's http:// URLs and asks for bytes at once.
+        if (player.canFetch && msg.lan === false) player.skipLan();
         player.setQueue(msg.items || []);
         player.play();
       } else if (msg.type === "append") {
