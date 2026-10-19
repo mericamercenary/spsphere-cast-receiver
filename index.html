@@ -19,6 +19,13 @@
       content: ""; position: absolute; top: 6px; bottom: 6px; width: 7px;
       background: #f2f5f7; border-radius: 2px;
     }
+    #err {
+      position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+      max-width: 70vw; padding: 20px 28px; border-radius: 12px;
+      background: rgba(60, 14, 18, 0.92); color: #ffe3e3;
+      font: 26px/1.35 sans-serif; text-align: center; pointer-events: none;
+    }
+    #err[hidden] { display: none; }
     #hold::before { left: 7px; }
     #hold::after { right: 7px; }
   </style>
@@ -27,6 +34,7 @@
   <canvas id="view"></canvas>
   <div id="hold" hidden></div>
   <div id="hud">Waiting for photos…</div>
+  <div id="err" role="alert" hidden></div>
   <script src="player.js"></script>
   <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
   <script>
@@ -89,12 +97,19 @@
         return;
       }
       if (!msg || !msg.type) return;
+      if (msg.type === "chunk" || msg.type === "fetchError") {
+        player.receiveChunk(msg);
+        return;
+      }
       if (msg.type === "queue") {
+        // Phones that can send photo bytes over Cast say so with chunks: true.
+        player.canFetch = !!msg.chunks;
         connectAim(msg.ws);
         player.setSpeed(msg.speed || SpsphereCast.DEFAULT_DPS);
         player.setQueue(msg.items || []);
         player.play();
       } else if (msg.type === "append") {
+        if (msg.chunks != null) player.canFetch = !!msg.chunks;
         player.appendItems(msg.items || []);
       } else if (msg.type === "remove") {
         player.removeId(msg.id);
@@ -120,6 +135,24 @@
     }
 
     window.__castHandle = handle;
+
+    function sendPhone(payload) {
+      try { context.sendCustomMessage(NAMESPACE, undefined, payload); } catch (e) {}
+    }
+
+    // Tell the phone whether each photo made it onto the TV.
+    window.__onCastPhoto = function (info) {
+      if (info.ok) {
+        sendPhone({ type: "photo", id: info.id, ok: true, via: info.via, width: info.width, height: info.height });
+      } else {
+        sendPhone({ type: "error", id: info.id, message: info.message });
+      }
+    };
+
+    // Ask the phone to send a photo's bytes over the Cast channel.
+    window.__requestCastPhoto = function (req) {
+      sendPhone({ type: "fetch", id: req.id, reason: req.reason || "" });
+    };
 
     window.__onCastStatus = function (snap) {
       try {

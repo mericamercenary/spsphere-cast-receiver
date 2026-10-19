@@ -41,7 +41,18 @@ The phone answers every image response, including the CORS preflight, with:
 
 The page loads each JPEG with `crossorigin="anonymous"` and `referrerpolicy="no-referrer"`, so WebGL can read the pixels and Chrome's private-network check can succeed. `data:` and `blob:` URLs skip CORS.
 
-That does not turn off mixed content. An HTTPS page asking for `http://192.168.x.x` is insecure content. Chromecast can allow it per application (`ALLOW_INSECURE_CONTENT` in the device config). A Google TV Cast WebView may still block the request or refuse to upgrade an IP address to HTTPS. There is no header the phone can send that overrides that. If the TV blocks it, the sphere stays empty. The same rule applies to `ws://`: the page tries the LAN socket first, and if it never opens, aim, previous, and next still arrive as Cast custom messages on `urn:x-cast:com.cameron.viewer360`. Photo bytes have no Cast-message fallback; they have to come from the phone's HTTP server.
+That does not turn off mixed content. An HTTPS page asking for `http://192.168.x.x` is insecure content. Chromecast can allow it per application (`ALLOW_INSECURE_CONTENT` in the device config). A Google TV Cast WebView may still block the request or refuse to upgrade an IP address to HTTPS. There is no header the phone can send that overrides that. If the TV blocks it, the sphere stays empty. The same rule applies to `ws://`: the page tries the LAN socket first, and if it never opens, aim, previous, and next still arrive as Cast custom messages on `urn:x-cast:com.cameron.viewer360`. If the LAN photo fails (error, or no answer in 10 s) and the phone's `queue` message had `chunks: true`, the TV asks for the bytes over the Cast channel instead, one photo at a time, current photo first:
+
+- TV → phone: `{type: "fetch", id, reason}`
+- phone → TV: `{type: "chunk", id, i, n, data}` where `data` is base64 of at most 32 KiB of the JPEG (keeps each Cast message under the 64 KB limit), `i` is 0-based and `n` is the chunk count. Or `{type: "fetchError", id, message}`.
+
+After one LAN failure the TV skips the LAN for the rest of that queue. A transfer that makes no progress for 20 s fails. Without `chunks: true` (older phone apps) a LAN error is shown at once, and a photo still not delivered after 30 s shows a message but keeps waiting.
+
+The TV reports every photo back to the phone: `{type: "photo", id, ok: true, via: "lan"|"cast", width, height}` or `{type: "error", id, message}` where `message` starts with `Couldn't load photo:`. The same text is shown in the middle of the TV while that photo is current. A later `photo` ok for the same id clears it.
+
+## Textures
+
+WebGL 1 samples black from a texture whose size is not a power of two unless its wrap mode is `CLAMP_TO_EDGE`. Real photos are 5376, 5760, 7680 wide, so the player clamps and wraps longitude in the shader. Photos wider than 4096 (or the GPU's `MAX_TEXTURE_SIZE`, if smaller) are shrunk on a canvas first. Only the current photo and its neighbours hold a GPU texture. The bundled samples are 1024x512, a power of two, which is why the desktop preview never showed the black sphere.
 
 Do not add `upgrade-insecure-requests`. That would rewrite the phone URLs to HTTPS, and the phone does not serve TLS.
 
