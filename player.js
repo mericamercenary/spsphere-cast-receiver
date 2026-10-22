@@ -6,7 +6,9 @@
    look, matching ProjectionMath.applyPose. The phone bakes cubemaps to
    equirect JPEGs with the standard face orientation, so this page samples
    equirects only. A tiled photo is split to the TV's max texture size and
-   drawn as sphere segments. The screen has no counters. */
+   drawn as sphere segments. Tiles that do not fit stay full resolution and
+   load for the current view. A failed load leaves the last frame on screen.
+   The screen has no counters. */
 (function (root) {
   var ROTATIONS = 2;
   var FULL_TURN = 360;
@@ -109,6 +111,14 @@
     this._tileDraw = [];
     this._tileW = 0;
     this._tileH = 0;
+    this._presented = false;
+    this._gpuBytes = 0;
+    this._gpuBudget = null;
+    this._resident = [];
+    this._lodHold = null;
+    this._promoting = false;
+    this._glLost = false;
+    this._glHooks = false;
     this.session = null;
     this._m0 = new Float32Array(16);
     this._m1 = new Float32Array(16);
@@ -657,6 +667,36 @@
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.indices, gl.STATIC_DRAW);
     gl.disable(gl.CULL_FACE);
     gl.clearColor(0.04, 0.05, 0.07, 1);
+    if (!this._glHooks && this.canvas.addEventListener) {
+      this._glHooks = true;
+      var lostSelf = this;
+      this.canvas.addEventListener("webglcontextlost", function (event) {
+        if (event && event.preventDefault) event.preventDefault();
+        lostSelf._glLost = true;
+        lostSelf._resident = [];
+        lostSelf._gpuBytes = 0;
+        warn("webgl context lost");
+      }, false);
+      this.canvas.addEventListener("webglcontextrestored", function () {
+        lostSelf._glLost = false;
+        lostSelf._resident = [];
+        lostSelf._gpuBytes = 0;
+        lostSelf._lodHold = null;
+        lostSelf._promoting = false;
+        warn("webgl context restored");
+        if (lostSelf.session && lostSelf.session.loaded) {
+          lostSelf.session.loaded.forEach(function (piece) {
+            var payload = piece.payload || (piece.tex && piece.tex._spsPayload);
+            piece.payload = payload || null;
+            piece.tex = payload ? { deferred: true, _evicted: true, _spsPayload: payload } : null;
+          });
+          lostSelf.session.live = [];
+        }
+        lostSelf._setup();
+        lostSelf._followView();
+        lostSelf.draw();
+      }, false);
+    }
     this._installTileProgram(gl);
     this._blank = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, this._blank);
@@ -691,7 +731,66 @@
   };
 
   Player.prototype._deleteTex = function (tex) {
-    if (this._gl && tex) this._gl.deleteTexture(tex);
+    if (!tex) return;
+    this._dropResident(tex);
+    if (tex.deferred || tex._evicted) return;
+    if (this._gl) this._gl.deleteTexture(tex);
+  };
+
+  Player.prototype._dropResident = function (tex) {
+    if (!tex || !this._resident) return;
+    for (var i = 0; i < this._resident.length; i++) {
+      if (this._resident[i].tex !== tex) continue;
+      this._gpuBytes -= this._resident[i].bytes;
+      this._resident.splice(i, 1);
+      break;
+    }
+    if (this._gpuBytes < 0) this._gpuBytes = 0;
+  };
+
+  Player.prototype._evictDistant = function (view) {
+    var worst = -1;
+    var worstDist = -1;
+    for (var i = 0; i < this._resident.length; i++) {
+      var item = this._resident[i];
+      var dist = uDist(item.u, view.u) + Math.abs(item.v - view.v);
+      if (dist > worstDist) {
+        worstDist = dist;
+        worst = i;
+      }
+    }
+    if (worst < 0) return false;
+    var gone = this._resident[worst];
+    this._resident.splice(worst, 1);
+    this._gpuBytes -= gone.bytes;
+    if (this._gpuBytes < 0) this._gpuBytes = 0;
+    gone.tex._evicted = true;
+    gone.tex.deferred = true;
+    if (this._gl) this._gl.deleteTexture(gone.tex);
+    return true;
+  };
+
+  Player.prototype._lodView = function () {
+    var center = viewCenterUv(this.yaw, this.pitch);
+    var aspect = this.canvas.width / Math.max(this.canvas.height, 1);
+    var ext = viewExtents(this.fov, aspect);
+    return {
+      u: center.u,
+      v: center.v,
+      halfU: ext.halfU,
+      halfV: ext.halfV,
+      yaw: this.yaw,
+      pitch: this.pitch,
+    };
+  };
+
+  Player.prototype._deferred = function (img, tile) {
+    return {
+      deferred: true,
+      _evicted: true,
+      _spsPayload: img && img._spsPayload,
+      _tileId: tile && tile.id,
+    };
   };
 
   Player.prototype._ensureSession = function () {
@@ -701,10 +800,22 @@
       request: function (id, token) {
         if (window.__castSend) window.__castSend({ type: "fetch", id: id, token: token });
       },
-      materialize: function (payload, done) { materializeJpeg(payload, done); },
-      upload: function (img) { return self._uploadTile(img); },
+      materialize: function (payload, done) {
+        materializeJpeg(payload, function (err, img) {
+          if (img) img._spsPayload = payload;
+          done(err, img);
+        });
+      },
+      upload: function (img, tile) { return self._uploadTile(img, tile); },
+      // Clearing src after a successful decode fires onerror in Chrome. Drop
+      // the handlers first so that error cannot finish the load a second time.
       dropImage: function (img) {
-        if (img) img.src = "";
+        if (!img) return;
+        img.onload = null;
+        img.onerror = null;
+        try {
+          if (typeof img.src === "string" && img.src) img.src = "";
+        } catch (error) {}
       },
       release: function (tex) { self._deleteTex(tex); },
       onStatus: function (text) {
@@ -716,7 +827,7 @@
       onShown: function (state) {
         var raw = (state.tiles || []).map(function (piece) { return piece.tile || piece; });
         if (!coversSphere(raw, state.width, state.height)) {
-          self._tileDraw = [];
+          warn("photo does not cover the sphere", state && state.id);
           self._busy = false;
           self._markBusy();
           return;
@@ -730,17 +841,9 @@
         self.draw();
       },
       onFail: function () {
-        self._tileDraw = [];
       },
       onMemory: function (photoId) {
-        self._tileDraw = [];
-        if (window.__castSend) {
-          window.__castSend({
-            type: "error",
-            id: photoId,
-            message: "The TV ran out of memory at full resolution.",
-          });
-        }
+        warn("full-resolution tile did not upload", photoId);
       },
     });
   };
@@ -751,6 +854,8 @@
     if (!entry) return;
     this._ensureSession();
     this._tileDraw = [];
+    this._lodHold = null;
+    this._promoting = false;
     this.session.open(entry);
   };
 
@@ -777,31 +882,170 @@
     if (at === this.index) this._openCurrent();
   };
 
-  Player.prototype._uploadTile = function (img) {
-    var gl = this._gl;
-    if (!gl || !img || !img.width) throw new Error("no image");
-    var maxEdge = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 4096;
-    if (img.width > maxEdge || img.height > maxEdge) {
-      var tooBig = new Error("The TV ran out of memory at full resolution.");
-      tooBig.oom = true;
-      throw tooBig;
-    }
+  Player.prototype._texImage = function (gl, source) {
     var tex = gl.createTexture();
+    if (!tex) return null;
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
-    var glErr = gl.getError();
-    if (gl.isContextLost() || glErr === gl.OUT_OF_MEMORY) {
+    if (gl.getError) gl.getError();
+    try {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+    } catch (error) {
       gl.deleteTexture(tex);
-      var oom = new Error("The TV ran out of memory at full resolution.");
-      oom.oom = true;
-      throw oom;
+      warn("texture upload failed", error && error.message);
+      return null;
+    }
+    if (gl.isContextLost && gl.isContextLost()) {
+      warn("webgl context lost");
+      return null;
+    }
+    var glErr = gl.getError ? gl.getError() : 0;
+    if (glErr === gl.OUT_OF_MEMORY || glErr === gl.INVALID_VALUE || glErr === gl.INVALID_OPERATION) {
+      gl.deleteTexture(tex);
+      warn("texture upload failed", String(glErr));
+      return null;
     }
     return tex;
+  };
+
+  Player.prototype._uploadTile = function (img, tile) {
+    var gl = this._gl;
+    if (!gl || (gl.isContextLost && gl.isContextLost())) {
+      warn("webgl context lost");
+      return this._deferred(img, tile);
+    }
+    if (!img) throw new Error("no image");
+    var maxEdge = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 4096;
+    var budget = this._gpuBudget == null ? Infinity : this._gpuBudget;
+    var entry = this.session && this.session.entry;
+    var view = this._lodView();
+    var slot = null;
+    if (entry && entry.tiles && tile) {
+      var plan = planResidence(entry.tiles, entry.width, entry.height, view, maxEdge, budget);
+      for (var i = 0; i < entry.tiles.length; i++) {
+        if (entry.tiles[i].id === tile.id) slot = plan[i];
+      }
+    }
+    if (slot && !slot.resident) return this._deferred(img, tile);
+    var win = slot && slot.window;
+    var source = img;
+    var upW = img.width || (tile && tile.texW) || 0;
+    var upH = img.height || (tile && tile.texH) || 0;
+    if (win && !win.full) {
+      var cropped = cropSource(img, win.cropX, win.cropY, win.texW, win.texH);
+      if (!cropped) {
+        warn("could not keep a full-resolution window", tile && tile.id);
+        return this._deferred(img, tile);
+      }
+      source = cropped;
+      upW = win.texW;
+      upH = win.texH;
+    }
+    if (upW > maxEdge || upH > maxEdge) {
+      warn("tile is larger than MAX_TEXTURE_SIZE", upW + "x" + upH);
+      return this._deferred(img, tile);
+    }
+    var bytes = upW * upH * 4;
+    var spanW = (entry && entry.width) || (tile && tile.srcW) || 1;
+    var spanH = (entry && entry.height) || (tile && tile.srcH) || 1;
+    var incoming = tile
+      ? uDist((tile.srcX + tile.srcW / 2) / spanW, view.u) + Math.abs((tile.srcY + tile.srcH / 2) / spanH - view.v)
+      : 0;
+    var self = this;
+    function farthestResident() {
+      var best = -1;
+      for (var r = 0; r < self._resident.length; r++) {
+        var item = self._resident[r];
+        var dist = uDist(item.u, view.u) + Math.abs(item.v - view.v);
+        if (dist > best) best = dist;
+      }
+      return best;
+    }
+    if (budget !== Infinity) {
+      while (this._gpuBytes + bytes > budget && farthestResident() > incoming + 1e-6) {
+        if (!this._evictDistant(view)) break;
+      }
+      if (this._gpuBytes + bytes > budget) {
+        warn("texture budget", tile && tile.id);
+        return this._deferred(img, tile);
+      }
+    }
+    var tex = null;
+    var attempts = this._resident.length + 1;
+    while (attempts-- > 0) {
+      tex = this._texImage(gl, source);
+      if (tex) break;
+      // A failed upload can evict a tile farther from the view. It cannot
+      // drop the tile the viewer is looking at in order to keep an edge tile.
+      if (!(farthestResident() > incoming + 1e-6)) break;
+      if (!this._evictDistant(view)) break;
+    }
+    if (!tex) return this._deferred(img, tile);
+    tex._bytes = bytes;
+    tex._window = win && !win.full ? win : null;
+    tex._spsPayload = img._spsPayload || null;
+    tex._tileId = tile && tile.id;
+    this._gpuBytes += bytes;
+    this._resident.push({
+      id: tex._tileId,
+      tex: tex,
+      bytes: bytes,
+      u: tile ? (tile.srcX + tile.srcW / 2) / spanW : view.u,
+      v: tile ? (tile.srcY + tile.srcH / 2) / spanH : view.v,
+    });
+    return tex;
+  };
+
+  Player.prototype._followView = function () {
+    if (this._promoting || this._glLost || !this.session || !this.session.shown || !this.session.entry) return;
+    var view = this._lodView();
+    if (this._lodHold && Math.abs(shortest(view.yaw - this._lodHold.yaw)) < 2 && Math.abs(view.pitch - this._lodHold.pitch) < 2) return;
+    var entry = this.session.entry;
+    var gl = this._gl;
+    var maxEdge = gl ? (gl.getParameter(gl.MAX_TEXTURE_SIZE) || 4096) : 4096;
+    var budget = this._gpuBudget == null ? Infinity : this._gpuBudget;
+    var plan = planResidence(entry.tiles, entry.width, entry.height, view, maxEdge, budget);
+    var self = this;
+    var jobs = [];
+    this.session.loaded.forEach(function (piece, index) {
+      var slot = plan[index];
+      if (!slot || !slot.resident) return;
+      if (piece.tex && !piece.tex.deferred && !piece.tex._evicted) return;
+      var payload = piece.payload || (piece.tex && piece.tex._spsPayload);
+      if (!payload) return;
+      jobs.push({ piece: piece, payload: payload });
+    });
+    this._lodHold = { yaw: view.yaw, pitch: view.pitch };
+    if (!jobs.length) return;
+    this._promoting = true;
+    var left = jobs.length;
+    jobs.forEach(function (job) {
+      materializeJpeg(job.payload, function (err, img) {
+        left -= 1;
+        if (!err && img && self.session && self.session.entry === entry) {
+          img._spsPayload = job.payload;
+          try {
+            var tex = self._uploadTile(img, job.piece.tile);
+            if (tex && !tex.deferred) {
+              job.piece.tex = tex;
+              job.piece.payload = job.payload;
+              self.session.live.push(tex);
+              self.draw();
+            }
+          } catch (error) {
+            warn("texture upload failed", error && error.message);
+          }
+          if (self.session.hooks.dropImage) self.session.hooks.dropImage(img);
+        } else if (err) {
+          warn("could not reopen a tile", err && err.message);
+        }
+        if (left <= 0) self._promoting = false;
+      });
+    });
   };
 
   Player.prototype._installTileProgram = function (gl) {
@@ -859,12 +1103,27 @@
 
   Player.prototype._drawTiles = function () {
     var gl = this._gl;
+    if (!gl || (gl.isContextLost && gl.isContextLost())) return;
+    this._followView();
     var w = this.canvas.width;
     var h = this.canvas.height;
     gl.viewport(0, 0, w, h);
+    var tiles = this._tileDraw || [];
+    var drawable = [];
+    for (var n = 0; n < tiles.length; n++) {
+      var piece = tiles[n];
+      if (!piece || !piece.tex || piece.tex.deferred || piece.tex._evicted) continue;
+      var spec = piece.tex._window || piece.tile;
+      if (!spec || spec.srcW < 1 || spec.srcH < 1) continue;
+      drawable.push({ tex: piece.tex, spec: spec });
+    }
+    // An empty list used to clear the color buffer, so a late load error
+    // turned a frame that had already drawn into the background color.
+    if (!this._tileProg || !drawable.length) {
+      if (!this._presented) gl.clear(gl.COLOR_BUFFER_BIT);
+      return;
+    }
     gl.clear(gl.COLOR_BUFFER_BIT);
-    var tiles = this._tileDraw;
-    if (!this._tileProg || !tiles || !tiles.length) return;
     gl.useProgram(this._tileProg);
     var pos = gl.getAttribLocation(this._tileProg, "aPos");
     if (pos >= 0 && this._buf) {
@@ -882,24 +1141,23 @@
     gl.uniform1f(loc.roll, pose.roll);
     var spanW = this._tileW || 1;
     var spanH = this._tileH || 1;
-    for (var i = 0; i < tiles.length; i++) {
-      var piece = tiles[i];
-      var tile = piece.tile;
-      if (!piece.tex || !tile || tile.srcW < 1 || tile.srcH < 1) continue;
+    for (var i = 0; i < drawable.length; i++) {
+      var tile = drawable[i].spec;
       gl.uniform1f(loc.u0, tile.srcX / spanW);
       gl.uniform1f(loc.u1, (tile.srcX + tile.srcW) / spanW);
       gl.uniform1f(loc.v0, tile.srcY / spanH);
       gl.uniform1f(loc.v1, (tile.srcY + tile.srcH) / spanH);
-      gl.uniform1f(loc.padL, tile.padL);
-      gl.uniform1f(loc.padT, tile.padT);
+      gl.uniform1f(loc.padL, tile.padL || 0);
+      gl.uniform1f(loc.padT, tile.padT || 0);
       gl.uniform1f(loc.srcW, tile.srcW);
       gl.uniform1f(loc.srcH, tile.srcH);
       gl.uniform1f(loc.texW, tile.texW);
       gl.uniform1f(loc.texH, tile.texH);
       gl.uniform1i(loc.tex, 0);
-      bindTex(gl, gl.TEXTURE0, piece.tex);
+      bindTex(gl, gl.TEXTURE0, drawable[i].tex);
       gl.drawElements(gl.TRIANGLES, this._count, gl.UNSIGNED_SHORT, 0);
     }
+    this._presented = true;
     gl.useProgram(this._prog);
   };
 
@@ -1226,6 +1484,16 @@
   }
 
   function materializeJpeg(payload, done) {
+    var settled = false;
+    function finish(err, img) {
+      if (settled) return;
+      settled = true;
+      if (img) {
+        img.onload = null;
+        img.onerror = null;
+      }
+      done(err, img);
+    }
     try {
       var binary = atob(payload);
       var bytes = new Uint8Array(binary.length);
@@ -1234,16 +1502,20 @@
       var url = URL.createObjectURL(blob);
       var img = new Image();
       img.onload = function () {
+        img.onload = null;
+        img.onerror = null;
         URL.revokeObjectURL(url);
-        done(null, img);
+        finish(null, img);
       };
       img.onerror = function () {
+        img.onload = null;
+        img.onerror = null;
         URL.revokeObjectURL(url);
-        done(new Error("Couldn't open this photo"));
+        finish(new Error("Couldn't open this photo"));
       };
       img.src = url;
     } catch (error) {
-      done(error);
+      finish(error);
     }
   }
 
@@ -1355,7 +1627,13 @@
     var self = this;
     var token = box.token;
     var gen = box.gen;
+    var settled = false;
     var finish = function (err, image) {
+      // Chrome fires onerror when the decoded image's src is cleared. That
+      // second callback used to release the textures just drawn and clear
+      // the frame. The first result owns this tile.
+      if (settled) return;
+      settled = true;
       if (gen !== self.generation || token !== self.token) {
         if (image && self.hooks.dropImage) self.hooks.dropImage(image);
         return;
@@ -1367,7 +1645,7 @@
       }
       var tex = null;
       try {
-        tex = self.hooks.upload(image);
+        tex = self.hooks.upload(image, box.tile);
       } catch (error) {
         if (self.hooks.dropImage) self.hooks.dropImage(image);
         if (isOom(error)) self._oom(box.photoId);
@@ -1380,8 +1658,9 @@
         self._oom(box.photoId);
         return;
       }
+      if (image._spsPayload && !tex._spsPayload) tex._spsPayload = image._spsPayload;
       self.live.push(tex);
-      self.loaded.push({ tex: tex, tile: box.tile });
+      self.loaded.push({ tex: tex, tile: box.tile, payload: image._spsPayload || null });
       self.pending = null;
       self.tileIndex += 1;
       if (!self.entry || self.tileIndex >= self.entry.tiles.length) {
@@ -1429,19 +1708,40 @@
       return;
     }
     this.entry = null;
+    warn("photo failed", reason);
     if (this.hooks.onStatus) this.hooks.onStatus("error");
     if (this.hooks.onFail) this.hooks.onFail(reason);
   };
 
   PhotoSession.prototype._oom = function (photoId) {
-    this._releaseAll();
-    this.loaded = [];
+    // A tile that does not fit is not a request for a smaller photo. Keep any
+    // full-resolution tiles that already cover the sphere; otherwise leave the
+    // last frame where it is and log the miss.
+    warn("full-resolution tile did not upload", photoId);
     this.assemblers = {};
-    this.tileIndex = 0;
-    this.waitingShrink = true;
-    this.pending = { id: photoId, token: this.token, started: this._now() };
-    if (this.hooks.onStatus) this.hooks.onStatus("busy");
-    if (this.hooks.onMemory) this.hooks.onMemory(photoId);
+    this.pending = null;
+    this.waitingShrink = false;
+    var covered = this.entry && this.loaded.length && coversSphere(
+      this.loaded.map(function (piece) { return piece.tile; }),
+      this.entry.width,
+      this.entry.height,
+    );
+    if (covered) {
+      this.shown = true;
+      if (this.hooks.onShown) {
+        this.hooks.onShown({
+          id: this.entry.id,
+          width: this.entry.width,
+          height: this.entry.height,
+          tiles: this.loaded.slice(),
+        });
+      }
+    } else {
+      this._releaseAll();
+      this.loaded = [];
+      this.entry = null;
+    }
+    if (this.hooks.onStatus) this.hooks.onStatus("");
   };
 
   PhotoSession.prototype.tick = function (now) {
@@ -1456,6 +1756,192 @@
     }
     this._failOrRetry("timeout");
   };
+
+  function warn(code, detail) {
+    if (typeof console === "undefined" || !console.warn) return;
+    var text = "spsphere cast: " + code;
+    if (detail) text += " " + detail;
+    console.warn(text);
+  }
+
+  function uDist(a, b) {
+    var d = Math.abs(a - b) % 1;
+    if (d > 0.5) d = 1 - d;
+    return d;
+  }
+
+  function viewCenterUv(yawDeg, pitchDeg) {
+    var yawM = new Float32Array(16);
+    var pitchM = new Float32Array(16);
+    var rollM = new Float32Array(16);
+    var view = new Float32Array(16);
+    fillAimView(yawM, pitchM, rollM, view, yawDeg || 0, pitchDeg || 0, 0);
+    var x = -view[2];
+    var y = -view[6];
+    var z = -view[10];
+    var len = Math.sqrt(x * x + y * y + z * z) || 1;
+    x /= len;
+    y /= len;
+    z /= len;
+    var lon = Math.atan2(x, -z);
+    var lat = Math.asin(clamp(y, -1, 1));
+    var u = 0.5 + lon / (Math.PI * 2);
+    u = u - Math.floor(u);
+    var v = clamp(0.5 - lat / Math.PI, 0, 1);
+    return { u: u, v: v };
+  }
+
+  function viewExtents(fovDeg, aspect) {
+    var vRad = (fovDeg || 75) * Math.PI / 180;
+    var halfV = vRad / 2;
+    var halfH = Math.atan(Math.tan(halfV) * (aspect > 0 ? aspect : 1));
+    return { halfU: halfH / (Math.PI * 2), halfV: halfV / Math.PI };
+  }
+
+  function rangesOverlap(a0, a1, b0, b1) {
+    return a0 < b1 && b0 < a1;
+  }
+
+  function uOverlap(u0, u1, center, half) {
+    var left = center - half;
+    var right = center + half;
+    for (var k = -1; k <= 1; k++) {
+      if (rangesOverlap(u0, u1, left + k, right + k)) return true;
+    }
+    return false;
+  }
+
+  function fitCrop(imgW, imgH, maxEdge, budget) {
+    var w = Math.min(imgW, maxEdge);
+    var h = Math.min(imgH, maxEdge);
+    if (w < 1 || h < 1) return null;
+    if (w * h * 4 <= budget) return { w: w, h: h, full: w === imgW && h === imgH };
+    if (!(budget >= 4)) return null;
+    var scale = Math.sqrt(budget / (w * h * 4));
+    var cw = Math.max(1, Math.floor(w * scale));
+    var ch = Math.max(1, Math.floor(h * scale));
+    while (cw * ch * 4 > budget && cw > 1) cw -= 1;
+    while (cw * ch * 4 > budget && ch > 1) ch -= 1;
+    if (cw * ch * 4 > budget) return null;
+    return { w: cw, h: ch, full: false };
+  }
+
+  function cropOrigin(imgW, imgH, cropW, cropH, cx, cy) {
+    var x = Math.round(cx - cropW / 2);
+    var y = Math.round(cy - cropH / 2);
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x + cropW > imgW) x = Math.max(0, imgW - cropW);
+    if (y + cropH > imgH) y = Math.max(0, imgH - cropH);
+    return { x: x, y: y };
+  }
+
+  function viewPixel(tile, width, height, u, v) {
+    var u0 = tile.srcX / width;
+    var u1 = (tile.srcX + tile.srcW) / width;
+    var v0 = tile.srcY / height;
+    var v1 = (tile.srcY + tile.srcH) / height;
+    var uu = u;
+    var vv = v;
+    if (uu < u0 || uu > u1) uu = (u0 + u1) / 2;
+    if (vv < v0 || vv > v1) vv = (v0 + v1) / 2;
+    var sx = u1 === u0 ? 0.5 : (uu - u0) / (u1 - u0);
+    var sy = v1 === v0 ? 0.5 : (vv - v0) / (v1 - v0);
+    return {
+      x: (tile.padL || 0) + sx * tile.srcW,
+      y: (tile.padT || 0) + sy * tile.srcH,
+    };
+  }
+
+  function windowFromCrop(tile, cropX, cropY, cropW, cropH) {
+    var uniqueX0 = tile.padL || 0;
+    var uniqueY0 = tile.padT || 0;
+    var uniqueX1 = uniqueX0 + tile.srcW;
+    var uniqueY1 = uniqueY0 + tile.srcH;
+    var ix0 = Math.max(cropX, uniqueX0);
+    var iy0 = Math.max(cropY, uniqueY0);
+    var ix1 = Math.min(cropX + cropW, uniqueX1);
+    var iy1 = Math.min(cropY + cropH, uniqueY1);
+    if (ix1 - ix0 < 1 || iy1 - iy0 < 1) return null;
+    var imgW = tile.texW || (tile.srcW + (tile.padL || 0) + (tile.padR || 0));
+    var imgH = tile.texH || (tile.srcH + (tile.padT || 0) + (tile.padB || 0));
+    return {
+      srcX: tile.srcX + (ix0 - uniqueX0),
+      srcY: tile.srcY + (iy0 - uniqueY0),
+      srcW: ix1 - ix0,
+      srcH: iy1 - iy0,
+      padL: ix0 - cropX,
+      padT: iy0 - cropY,
+      padR: 0,
+      padB: 0,
+      texW: cropW,
+      texH: cropH,
+      cropX: cropX,
+      cropY: cropY,
+      full: cropX === 0 && cropY === 0 && cropW === imgW && cropH === imgH,
+    };
+  }
+
+  function planResidence(tiles, width, height, view, maxEdge, budget) {
+    var order = [];
+    for (var i = 0; i < tiles.length; i++) {
+      var tile = tiles[i];
+      var u0 = tile.srcX / width;
+      var u1 = (tile.srcX + tile.srcW) / width;
+      var v0 = tile.srcY / height;
+      var v1 = (tile.srcY + tile.srcH) / height;
+      var contains = view.u >= u0 && view.u <= u1 && view.v >= v0 && view.v <= v1;
+      var hits = contains || (
+        uOverlap(u0, u1, view.u, view.halfU || 0) &&
+        rangesOverlap(v0, v1, view.v - (view.halfV || 0), view.v + (view.halfV || 0))
+      );
+      var dist = uDist((u0 + u1) / 2, view.u) + Math.abs((v0 + v1) / 2 - view.v);
+      order.push({ index: i, contains: contains, hits: hits, dist: dist });
+    }
+    order.sort(function (a, b) {
+      if (a.contains !== b.contains) return a.contains ? -1 : 1;
+      if (a.hits !== b.hits) return a.hits ? -1 : 1;
+      if (a.dist !== b.dist) return a.dist - b.dist;
+      return a.index - b.index;
+    });
+    var left = budget;
+    var plan = new Array(tiles.length);
+    for (var n = 0; n < order.length; n++) {
+      var item = order[n];
+      var src = tiles[item.index];
+      var imgW = src.texW || (src.srcW + (src.padL || 0) + (src.padR || 0));
+      var imgH = src.texH || (src.srcH + (src.padT || 0) + (src.padB || 0));
+      var fit = fitCrop(imgW, imgH, maxEdge, left);
+      if (!fit || (!item.hits && !fit.full)) {
+        plan[item.index] = { resident: false };
+        continue;
+      }
+      var px = viewPixel(src, width, height, view.u, view.v);
+      var origin = cropOrigin(imgW, imgH, fit.w, fit.h, px.x, px.y);
+      var win = windowFromCrop(src, origin.x, origin.y, fit.w, fit.h);
+      if (!win) {
+        plan[item.index] = { resident: false };
+        continue;
+      }
+      win.full = !!fit.full;
+      win.bytes = fit.w * fit.h * 4;
+      left -= win.bytes;
+      plan[item.index] = { resident: true, window: win };
+    }
+    return plan;
+  }
+
+  function cropSource(img, x, y, w, h) {
+    if (!img || !(w > 0) || !(h > 0)) return null;
+    if (typeof document === "undefined" || !document.createElement) return null;
+    var canvas = document.createElement("canvas");
+    canvas.width = w | 0;
+    canvas.height = h | 0;
+    var ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    ctx.drawImage(img, x, y, w, h, 0, 0, w, h);
+    return canvas;
+  }
 
   function coversSphere(tiles, width, height) {
     if (!(width > 0) || !(height > 0) || !tiles || !tiles.length) return false;
@@ -1506,6 +1992,8 @@
     applyPose: applyPose,
     tileTexCoord: tileTexCoord,
     coversSphere: coversSphere,
+    viewCenterUv: viewCenterUv,
+    planResidence: planResidence,
     create: function (canvas) { return new Player(canvas); },
     createSession: function (hooks) { return new PhotoSession(hooks); },
   };
