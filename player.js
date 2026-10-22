@@ -1,27 +1,22 @@
 /* SPsphere Cast receiver player.
-   Two full yaw turns at the horizon, then a crossfade.
-   One photo keeps turning. Numbers match CastTiming.kt.
+   Two full yaw turns at the horizon, then the next photo.
+   One photo keeps turning. Timing matches CastTiming.kt (9°/s).
    Manual aim is an absolute pose. The TV springs toward it.
    GPano PosePitchDegrees and PoseRollDegrees level the sphere before that
    look, matching ProjectionMath.applyPose. The phone bakes cubemaps to
    equirect JPEGs with the standard face orientation, so this page samples
-   equirects only. */
+   equirects only. A tiled photo is split to the TV's max texture size and
+   drawn as sphere segments. The screen has no counters. */
 (function (root) {
   var ROTATIONS = 2;
   var FULL_TURN = 360;
-  var DEFAULT_DPS = 18;
+  var DEFAULT_DPS = 9;
   var CROSSFADE_MS = 1200;
   var MIN_DPS = 6;
   var MAX_DPS = 72;
   var OMEGA = 40;
   var MIN_FOV = 20;
   var MAX_FOV = 120;
-  // TVs share GPU memory with the system. A 4096x2048 RGBA texture is 32 MB;
-  // 8192x4096 is 128 MB per photo, which a Google TV can refuse silently.
-  var TEX_CAP = 4096;
-  var LAN_TIMEOUT_MS = 10000;
-  var LAN_SOFT_MS = 30000;
-  var CHUNK_STALL_MS = 20000;
 
   function clampSpeed(v) {
     v = Number(v) || DEFAULT_DPS;
@@ -83,15 +78,8 @@
     this._mode = "2d";
     this._tex = [];
     this._loaded = 0;
-    this._hudAt = 0;
-    this._hudText = "";
-    this._errors = {};
-    this._errText = "";
-    this.canFetch = false;
-    this._lanDead = false;
-    this._fetchWait = [];
-    this._xfer = null;
-    this._gen = 0;
+    this._userFov = 75;
+    this._busy = false;
     this._anchored = false;
     this._lastSeq = -1;
     this._tyaw = 0;
@@ -116,6 +104,12 @@
     this._stepVel = 0;
     this._echo = new ArrayBuffer(16);
     this._echoView = new DataView(this._echo);
+    this.entries = [];
+    this._useTiles = false;
+    this._tileDraw = [];
+    this._tileW = 0;
+    this._tileH = 0;
+    this.session = null;
     this._m0 = new Float32Array(16);
     this._m1 = new Float32Array(16);
     this._m2 = new Float32Array(16);
@@ -148,11 +142,10 @@
     this._lastSeq = -1;
     this.pitch = 0;
     this.roll = 0;
-    this.fov = 75;
     this._tyaw = 0;
     this._tpitch = 0;
     this._troll = 0;
-    this._tfov = 75;
+    this._tfov = this._userFov;
     this._vy = 0;
     this._vp = 0;
     this._vr = 0;
@@ -162,221 +155,30 @@
   Player.prototype._loadEntry = function (entry) {
     var self = this;
     var img = new Image();
-    img._id = entry.id;
-    img._via = "lan";
-    if (this.canFetch && (!entry.url || (this._lanDead && !isBlobOrData(entry.url)))) {
-      img._pending = true;
-      this._queueFetch(entry.id, "");
-      return img;
-    }
-    this._watchImage(img, entry.url, function (reason) {
-      // The phone's LAN URL failed. Newer phone apps can send the bytes over
-      // the Cast channel instead; older ones cannot, so say why on screen.
-      if (self.canFetch) {
-        self._lanDead = true;
-        img._pending = true;
-        self._queueFetch(entry.id, reason);
-      } else {
-        self._fail(entry.id, reason);
-      }
-    });
-    return img;
-  };
-
-  /** Ask for every later photo over the Cast channel without trying the LAN URL. */
-  Player.prototype.skipLan = function () { this._lanDead = true; };
-
-  Player.prototype._watchImage = function (img, url, onFail) {
-    var self = this;
-    var settled = false;
-    var gen = this._gen;
-    var timer = 0;
-    function finish(ok, reason) {
-      if (settled) return;
-      settled = true;
-      if (timer) clearTimeout(timer);
-      img.onload = null;
-      img.onerror = null;
-      if (gen !== self._gen) return;
-      if (ok) {
-        img._pending = false;
-        self._loaded += 1;
-        self._upload(img);
-        self.draw();
-      } else {
-        onFail(reason);
-      }
-    }
+    if (needsCors(entry.url)) img.crossOrigin = "anonymous";
     img.onload = function () {
-      if (!img.naturalWidth) finish(false, "the image was empty");
-      else finish(true);
+      self._loaded += 1;
+      self._upload(img);
+      self.draw();
     };
-    img.onerror = function () {
-      finish(false, isBlobOrData(url)
-        ? "the TV couldn't decode the image"
-        : "the TV blocked or couldn't reach the download from the phone (" + hostOf(url) + "). Cast's browser stops secure pages from reading devices on your home network, so the phone has to send the photo over Cast. Update SPSphere on the phone");
-    };
-    if (!isBlobOrData(url)) {
-      var fallback = self.canFetch;
-      var waitMs = fallback ? LAN_TIMEOUT_MS : LAN_SOFT_MS;
-      timer = setTimeout(function () {
-        timer = 0;
-        var why = "the phone didn't deliver it within " + Math.round(waitMs / 1000) + " s (" + hostOf(url) + ")";
-        if (fallback) {
-          finish(false, why);
-          try { img.removeAttribute("src"); } catch (e) {}
-        } else if (!settled && gen === self._gen && img._id != null) {
-          // No other way to get the bytes: keep waiting, but say so. A late
-          // load clears the message and sends "photo" ok to the phone.
-          self._fail(img._id, why);
-        }
-      }, waitMs);
-    }
-    if (needsCors(url)) img.crossOrigin = "anonymous";
     img.referrerPolicy = "no-referrer";
-    img.src = url;
-  };
-
-  Player.prototype._fail = function (id, reason) {
-    id = String(id);
-    var message = "Couldn't load photo: " + reason;
-    this._errors[id] = message;
-    var at = this.ids.indexOf(id);
-    if (at >= 0 && this.images[at]) this.images[at]._pending = false;
-    if (root.__onCastPhoto) root.__onCastPhoto({ id: id, ok: false, message: message });
-    this._showError();
-  };
-
-  Player.prototype._showError = function () {
-    var el = typeof document !== "undefined" ? document.getElementById("err") : null;
-    var id = this.ids[this.index];
-    var text = (id != null && !this._tex[this.index] && this._errors[id]) || "";
-    if (text === this._errText) return;
-    this._errText = text;
-    if (!el) return;
-    el.textContent = text;
-    el.hidden = !text;
-  };
-
-  // Photo bytes over the Cast channel: {type:"fetch", id} to the phone, then
-  // {type:"chunk", id, i, n, data:<base64>} back, one photo at a time.
-  Player.prototype._queueFetch = function (id, reason) {
-    id = String(id);
-    if (this._fetchWait.indexOf(id) < 0 && !(this._xfer && this._xfer.id === id)) {
-      this._fetchWait.push(id);
-      this._fetchWhy = this._fetchWhy || {};
-      this._fetchWhy[id] = reason;
-    }
-    this._pump();
-  };
-
-  Player.prototype._pump = function () {
-    if (this._xfer) return;
-    var self = this;
-    this._fetchWait = this._fetchWait.filter(function (id) { return self.ids.indexOf(id) >= 0; });
-    if (!this._fetchWait.length) return;
-    var count = this.ids.length;
-    var order = [this.index, stepIndex(this.index, count, 1, true), stepIndex(this.index, count, -1, true)];
-    var pick = 0;
-    for (var k = 0; k < order.length; k++) {
-      if (order[k] == null) continue;
-      var w = this._fetchWait.indexOf(this.ids[order[k]]);
-      if (w >= 0) { pick = w; break; }
-    }
-    var id = this._fetchWait.splice(pick, 1)[0];
-    var why = (this._fetchWhy && this._fetchWhy[id]) || "";
-    this._xfer = { id: id, n: 0, got: 0, parts: [], gen: this._gen, timer: 0 };
-    this._armStall();
-    if (root.__requestCastPhoto) root.__requestCastPhoto({ id: id, reason: why });
-  };
-
-  Player.prototype._armStall = function () {
-    var self = this;
-    var x = this._xfer;
-    if (!x) return;
-    if (x.timer) clearTimeout(x.timer);
-    x.timer = setTimeout(function () {
-      if (self._xfer !== x) return;
-      self._xfer = null;
-      self._fail(x.id, x.got ? "the transfer from the phone stalled at " + x.got + " of " + x.n + " parts"
-        : "the phone didn't send the photo over Cast");
-      self._pump();
-    }, CHUNK_STALL_MS);
-  };
-
-  Player.prototype.receiveChunk = function (msg) {
-    var x = this._xfer;
-    if (!x || !msg || String(msg.id) !== x.id) return false;
-    if (msg.type === "fetchError") {
-      clearTimeout(x.timer);
-      this._xfer = null;
-      this._fail(x.id, msg.message || "the phone couldn't send it");
-      this._pump();
-      return true;
-    }
-    var n = msg.n | 0;
-    var i = msg.i | 0;
-    if (n <= 0 || i < 0 || i >= n || typeof msg.data !== "string") return false;
-    if (!x.n) x.n = n;
-    if (!x.parts[i]) {
-      try {
-        x.parts[i] = base64Bytes(msg.data);
-      } catch (e) {
-        clearTimeout(x.timer);
-        this._xfer = null;
-        this._fail(x.id, "a part from the phone was corrupt");
-        this._pump();
-        return true;
-      }
-      x.got += 1;
-    }
-    this._armStall();
-    if (x.got < x.n) return true;
-    clearTimeout(x.timer);
-    this._xfer = null;
-    this._finishFetch(x);
-    this._pump();
-    return true;
-  };
-
-  Player.prototype._finishFetch = function (x) {
-    var self = this;
-    if (x.gen !== this._gen) return;
-    var at = this.ids.indexOf(x.id);
-    if (at < 0) return;
-    var url = URL.createObjectURL(new Blob(x.parts, { type: "image/jpeg" }));
-    var img = new Image();
-    img._id = x.id;
-    img._via = "cast";
-    img._pending = true;
-    this.images[at] = img;
-    this._watchImage(img, url, function (reason) {
-      try { URL.revokeObjectURL(url); } catch (e) {}
-      self._fail(x.id, reason);
-    });
-    img.addEventListener("load", function () {
-      // The decoded image stays usable after the URL is revoked.
-      setTimeout(function () { try { URL.revokeObjectURL(url); } catch (e) {} }, 0);
-    });
+    img.src = entry.url;
+    return img;
   };
 
   Player.prototype.setQueue = function (urls) {
     var entries = normalizeEntries(urls);
     var self = this;
+    if (this.session) this.session.dispose();
+    this._tileDraw = [];
+    this.entries = entries;
+    this._useTiles = entries.some(function (entry) { return entry.tiles && entry.tiles.length; });
     this.ids = entries.map(function (entry) { return entry.id; });
     this.items = entries.map(function (entry) { return entry.url; });
     this.poses = entries.map(poseOf);
     this._loaded = 0;
-    this._gen += 1;
-    this._errors = {};
-    this._fetchWait = [];
-    if (this._xfer) { clearTimeout(this._xfer.timer); this._xfer = null; }
-    this._freeAll();
+    this._releaseUrlTextures();
     this._tex = [];
-    this.images = entries.map(function (entry) {
-      self._tex.push(null);
-      return self._loadEntry(entry);
-    });
     this.index = 0;
     this.fromIndex = 0;
     this.phase = "pan";
@@ -389,7 +191,20 @@
     this._resetAim();
     this.playing = this.items.length > 0;
     this._last = 0;
-    this._preloadAround();
+    if (this._useTiles) {
+      this.images = entries.map(function () { return null; });
+      this._busy = false;
+      this._markBusy();
+      if (this.items.length) this._openCurrent();
+    } else {
+      this._busy = false;
+      this._markBusy();
+      this.images = entries.map(function (entry) {
+        self._tex.push(null);
+        return self._loadEntry(entry);
+      });
+      this._preloadAround();
+    }
     this._mark();
     this.draw();
   };
@@ -397,12 +212,16 @@
   Player.prototype.appendItems = function (urls) {
     var entries = normalizeEntries(urls);
     var self = this;
+    if (!this.entries) this.entries = [];
     entries.forEach(function (entry) {
+      self.entries.push(entry);
       self.ids.push(entry.id);
       self.items.push(entry.url);
       self.poses.push(poseOf(entry));
       self._tex.push(null);
-      self.images.push(self._loadEntry(entry));
+      if (entry.tiles && entry.tiles.length) self._useTiles = true;
+      if (self._useTiles) self.images.push(null);
+      else self.images.push(self._loadEntry(entry));
     });
     this._preloadAround();
   };
@@ -415,11 +234,12 @@
     this.items.splice(at, 1);
     this.images.splice(at, 1);
     this.poses.splice(at, 1);
-    if (this._gl && this._tex[at]) this._gl.deleteTexture(this._tex[at]);
     this._tex.splice(at, 1);
+    if (this.entries) this.entries.splice(at, 1);
     if (current === String(id)) {
       this.index = Math.min(at, this.ids.length - 1);
       this.itemDegrees = 0;
+      if (this._useTiles) this._openCurrent();
     } else {
       this.index = this.ids.indexOf(current);
     }
@@ -447,6 +267,7 @@
     shift(this.images);
     shift(this.poses);
     shift(this._tex);
+    if (this.entries) shift(this.entries);
     this.index = this.ids.indexOf(current);
     this.fromIndex = this.index;
     this.phase = "pan";
@@ -466,6 +287,7 @@
     this.fade = 0;
     this.fadeMs = 0;
     this.itemDegrees = 0;
+    if (this._useTiles) this._openCurrent();
     this._preloadAround();
     this.draw();
     return true;
@@ -480,7 +302,7 @@
     this._anchored = false;
     this._tpitch = 0;
     this._troll = 0;
-    this._tfov = 75;
+    this._tfov = this._userFov;
     if (easeIn) this._panBlend = 0;
     if (this.items.length) this.playing = true;
     this._mark();
@@ -496,7 +318,21 @@
   Player.prototype._mark = function () {
     var icon = document.getElementById("hold");
     if (!icon) return;
-    icon.hidden = !this.held;
+    icon.hidden = true;
+  };
+
+  Player.prototype._markBusy = function () {
+    var el = document.getElementById("busy");
+    if (!el) return;
+    if (this._busy) el.classList.add("on");
+    else el.classList.remove("on");
+  };
+
+  Player.prototype.setFov = function (fov) {
+    var next = clamp(num(fov, this._userFov), 30, 120);
+    this._userFov = next;
+    this._tfov = next;
+    this._kick();
   };
 
   Player.prototype.halt = function () {
@@ -517,7 +353,13 @@
     this.fade = 0;
     this.itemDegrees = 0;
     this.yaw = 0;
+    this._userFov = 75;
+    this.fov = 75;
     this._resetAim();
+    if (this.session) this.session.dispose();
+    this._tileDraw = [];
+    this._busy = false;
+    this._markBusy();
     this.draw();
   };
 
@@ -551,6 +393,7 @@
       this.playing = count > 0;
       this._kick();
     }
+    if (this._useTiles) this._openCurrent();
     this._preloadAround();
     this._mark();
     this.draw();
@@ -559,10 +402,8 @@
   };
 
   Player.prototype._preloadAround = function () {
+    if (this._useTiles) return;
     var count = this.items.length;
-    this._trim();
-    this._pump();
-    this._showError();
     if (count <= 1) return;
     var self = this;
     [-1, 1].forEach(function (delta) {
@@ -593,6 +434,7 @@
   Player.prototype._integrate = function (dtMs) {
     if (!this.playing || !this.items.length || dtMs <= 0 || this.manual) return;
     var before = this.index + ":" + this.phase;
+    var prevIndex = this.index;
     var ramp = 1;
     if (this._panBlend < 1) {
       this._panBlend += dtMs / 1400;
@@ -613,6 +455,7 @@
         this.fromIndex = this.index;
       }
       this._changed(before);
+      if (this._useTiles && this.index !== prevIndex) this._openCurrent();
       return;
     }
     this.fade = 0;
@@ -624,14 +467,15 @@
       this.fadeMs = 0;
       this.fade = 0;
       this.itemDegrees = ROTATIONS * FULL_TURN;
-      this._preloadAround();
     }
     this._changed(before);
+    if (this._useTiles && this.index !== prevIndex) this._openCurrent();
   };
 
   Player.prototype.advance = function (dtMs) {
     if (!this.playing || !this.items.length || dtMs <= 0) return this.snapshot();
     this._integrate(dtMs);
+    if (this.session) this.session.tick(Date.now());
     this.draw();
     return this.snapshot();
   };
@@ -644,8 +488,20 @@
   };
 
   Player.prototype._ease = function (dtMs) {
+    // omega is 40, so one 50ms Euler step overshoots and the clamp pins fov
+    // at 20 or 120. A late TV frame is split into the 16ms steps the spring
+    // was tuned for.
+    var left = dtMs;
+    if (left > 100) left = 100;
+    while (left > 0.5) {
+      var slice = left > 16 ? 16 : left;
+      this._easeSlice(slice);
+      left -= slice;
+    }
+  };
+
+  Player.prototype._easeSlice = function (dtMs) {
     var dt = dtMs / 1000;
-    if (dt > 0.05) dt = 0.05;
     if (dt <= 0) return;
     if (this.manual) {
       this._approach(shortest(this._tyaw - this.yaw), this._vy, dt);
@@ -654,7 +510,7 @@
     } else {
       this._tpitch = 0;
       this._troll = 0;
-      this._tfov = 75;
+      this._tfov = this._userFov;
     }
     this._approach(this._tpitch - this.pitch, this._vp, dt);
     this.pitch = clamp(this.pitch + this._stepDelta, -89, 89);
@@ -701,6 +557,7 @@
     this._tpitch = clamp(pitch, -90, 90);
     this._troll = roll;
     this._tfov = clamp(this._baseFov + (fov - this._oFov), MIN_FOV, MAX_FOV);
+    this._userFov = this._tfov;
     this.manual = true;
     this.playing = false;
     this._kick();
@@ -728,6 +585,7 @@
       if (dt > 100) dt = 100;
       self._ease(dt);
       if (self.playing && !self.manual) self._integrate(dt);
+      if (self.session) self.session.tick(Date.now());
       self.draw();
     };
     this._raf = requestAnimationFrame(loop);
@@ -738,7 +596,7 @@
     if (!gl) return;
     var vs = "attribute vec3 aPos;attribute vec2 aUv;uniform mat4 uMvp;varying vec3 vObj;void main(){vObj=aPos;gl_Position=uMvp*vec4(aPos,1.0);}";
     var fs = [
-      "#ifdef GL_FRAGMENT_PRECISION_HIGH\nprecision highp float;\n#else\nprecision mediump float;\n#endif\n",
+      "precision mediump float;",
       "varying vec3 vObj;",
       "uniform sampler2D uA;uniform sampler2D uB;uniform float uFade;",
       "uniform float uPitchA;uniform float uRollA;uniform float uPitchB;uniform float uRollB;",
@@ -782,6 +640,7 @@
     var mesh = sphere(48, 64);
     this._count = mesh.count;
     var buf = gl.createBuffer();
+    this._buf = buf;
     gl.bindBuffer(gl.ARRAY_BUFFER, buf);
     gl.bufferData(gl.ARRAY_BUFFER, mesh.interleaved, gl.STATIC_DRAW);
     var stride = 20;
@@ -798,52 +657,135 @@
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.indices, gl.STATIC_DRAW);
     gl.disable(gl.CULL_FACE);
     gl.clearColor(0.04, 0.05, 0.07, 1);
+    this._installTileProgram(gl);
     this._blank = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, this._blank);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([20, 24, 32, 255]));
   };
 
   Player.prototype._upload = function (img) {
-    var i = this.images.indexOf(img);
-    if (!img.width || img._pending) return;
-    if (!this._gl) {
-      if (i >= 0) this._reportLoaded(i, img, img.naturalWidth, img.naturalHeight);
-      return;
-    }
+    if (!this._gl || !img.width) return;
     var gl = this._gl;
-    if (i >= 0 && this._tex.length > 3 && !this._keepSet()[i]) {
-      // Far from the current photo: decoded and ready, uploaded when needed.
-      this._reportLoaded(i, img, img.naturalWidth, img.naturalHeight);
-      return;
+    var tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    try {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+    } catch (error) {
+      this._uploadError = String(error);
     }
-    // Photo widths like 5376 or 5760 are not powers of two. WebGL 1 treats a
-    // non-power-of-two texture with REPEAT wrap as incomplete and samples
-    // black, so wrap is CLAMP_TO_EDGE. The shader wraps longitude itself.
-    var cap = Math.min(TEX_CAP, gl.getParameter(gl.MAX_TEXTURE_SIZE) || TEX_CAP);
-    var source = img;
-    var w = img.naturalWidth || img.width;
-    var h = img.naturalHeight || img.height;
-    if (w > cap || h > cap) {
-      var scale = Math.min(cap / w, cap / h);
-      var cw = Math.max(2, Math.floor(w * scale));
-      var ch = Math.max(1, Math.floor(h * scale));
-      try {
-        var c = document.createElement("canvas");
-        c.width = cw;
-        c.height = ch;
-        var g = c.getContext("2d");
-        g.imageSmoothingEnabled = true;
-        g.imageSmoothingQuality = "high";
-        g.drawImage(img, 0, 0, cw, ch);
-        source = c;
-        w = cw;
-        h = ch;
-      } catch (e) {
-        if (i >= 0) this._fail(this.ids[i], "the TV couldn't shrink the " + img.naturalWidth + "x" + img.naturalHeight + " image (" + e + ")");
-        return;
-      }
+    var i = this.images.indexOf(img);
+    if (i >= 0) this._tex[i] = tex;
+  };
+
+  Player.prototype._releaseUrlTextures = function () {
+    if (!this._gl || !this._tex) return;
+    var gl = this._gl;
+    this._tex.forEach(function (tex) {
+      if (tex) gl.deleteTexture(tex);
+    });
+  };
+
+  Player.prototype._deleteTex = function (tex) {
+    if (this._gl && tex) this._gl.deleteTexture(tex);
+  };
+
+  Player.prototype._ensureSession = function () {
+    if (this.session) return;
+    var self = this;
+    this.session = new PhotoSession({
+      request: function (id, token) {
+        if (window.__castSend) window.__castSend({ type: "fetch", id: id, token: token });
+      },
+      materialize: function (payload, done) { materializeJpeg(payload, done); },
+      upload: function (img) { return self._uploadTile(img); },
+      dropImage: function (img) {
+        if (img) img.src = "";
+      },
+      release: function (tex) { self._deleteTex(tex); },
+      onStatus: function (text) {
+        self._busy = text === "busy";
+        if (text) self._tileDraw = [];
+        self._markBusy();
+        self.draw();
+      },
+      onShown: function (state) {
+        var raw = (state.tiles || []).map(function (piece) { return piece.tile || piece; });
+        if (!coversSphere(raw, state.width, state.height)) {
+          self._tileDraw = [];
+          self._busy = false;
+          self._markBusy();
+          return;
+        }
+        self._tileDraw = state.tiles;
+        self._tileW = state.width;
+        self._tileH = state.height;
+        self._busy = false;
+        self._markBusy();
+        if (window.__castSend) window.__castSend({ type: "photo", id: state.id, ok: true });
+        self.draw();
+      },
+      onFail: function () {
+        self._tileDraw = [];
+      },
+      onMemory: function (photoId) {
+        self._tileDraw = [];
+        if (window.__castSend) {
+          window.__castSend({
+            type: "error",
+            id: photoId,
+            message: "The TV ran out of memory at full resolution.",
+          });
+        }
+      },
+    });
+  };
+
+  Player.prototype._openCurrent = function () {
+    if (!this._useTiles) return;
+    var entry = this.entries && this.entries[this.index];
+    if (!entry) return;
+    this._ensureSession();
+    this._tileDraw = [];
+    this.session.open(entry);
+  };
+
+  Player.prototype.noteChunk = function (msg) {
+    if (this.session) this.session.noteChunk(msg);
+  };
+
+  Player.prototype.noteFetchError = function (msg) {
+    if (this.session) this.session.noteFetchError(msg);
+  };
+
+  Player.prototype.retile = function (id, item) {
+    var entry = normalizeEntries([item])[0];
+    if (!entry) return;
+    var at = this.ids.indexOf(String(id));
+    if (at < 0) at = this.ids.indexOf(entry.id);
+    if (at < 0) return;
+    this._useTiles = true;
+    if (!this.entries) this.entries = [];
+    this.entries[at] = entry;
+    this.ids[at] = entry.id;
+    this.items[at] = entry.url;
+    this.poses[at] = poseOf(entry);
+    if (at === this.index) this._openCurrent();
+  };
+
+  Player.prototype._uploadTile = function (img) {
+    var gl = this._gl;
+    if (!gl || !img || !img.width) throw new Error("no image");
+    var maxEdge = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 4096;
+    if (img.width > maxEdge || img.height > maxEdge) {
+      var tooBig = new Error("The TV ran out of memory at full resolution.");
+      tooBig.oom = true;
+      throw tooBig;
     }
-    while (gl.getError() !== gl.NO_ERROR) { /* drain */ }
     var tex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
@@ -851,109 +793,127 @@
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    var failure = "";
-    try {
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
-    } catch (error) {
-      failure = String(error && error.message || error);
-    }
-    var code = gl.getError();
-    if (!failure && code !== gl.NO_ERROR) {
-      failure = code === gl.OUT_OF_MEMORY ? "the TV ran out of graphics memory" : "WebGL error " + code;
-    }
-    if (failure) {
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+    var glErr = gl.getError();
+    if (gl.isContextLost() || glErr === gl.OUT_OF_MEMORY) {
       gl.deleteTexture(tex);
-      this._uploadError = failure;
-      if (i >= 0) this._fail(this.ids[i], failure + " (" + w + "x" + h + ")");
-      return;
+      var oom = new Error("The TV ran out of memory at full resolution.");
+      oom.oom = true;
+      throw oom;
     }
-    if (i >= 0) {
-      if (this._tex[i]) gl.deleteTexture(this._tex[i]);
-      this._tex[i] = tex;
-      this._reportLoaded(i, img, w, h);
-    } else {
-      gl.deleteTexture(tex);
-    }
+    return tex;
   };
 
-  Player.prototype._reportLoaded = function (i, img, w, h) {
-    var id = this.ids[i];
-    if (id == null) return;
-    var had = this._errors[id];
-    delete this._errors[id];
-    this._showError();
-    if (img._reported) return;
-    img._reported = true;
-    if (root.__onCastPhoto) {
-      root.__onCastPhoto({
-        id: id, ok: true, via: img._via || "lan",
-        width: img.naturalWidth, height: img.naturalHeight, texWidth: w, texHeight: h,
-        recovered: !!had,
-      });
-    }
+  Player.prototype._installTileProgram = function (gl) {
+    var vs = "attribute vec3 aPos;uniform mat4 uMvp;varying vec3 vObj;void main(){vObj=aPos;gl_Position=uMvp*vec4(aPos,1.0);}";
+    var fs = [
+      "precision mediump float;",
+      "varying vec3 vObj;",
+      "uniform sampler2D uTex;",
+      "uniform float uPitch;uniform float uRoll;",
+      "uniform float uU0;uniform float uU1;uniform float uV0;uniform float uV1;",
+      "uniform float uPadL;uniform float uPadT;uniform float uSrcW;uniform float uSrcH;uniform float uTexW;uniform float uTexH;",
+      "const float PI=3.141592653589793;const float TWO_PI=6.283185307179586;",
+      "vec3 poseToCamera(vec3 v,float pitch,float roll){",
+      "  vec3 n=vec3(v.x,-v.z,v.y);",
+      "  float cp=cos(pitch);float sp=sin(pitch);float cr=cos(roll);float sr=sin(roll);",
+      "  vec3 p=vec3(n.x,cp*n.y+sp*n.z,-sp*n.y+cp*n.z);",
+      "  vec3 c=vec3(cr*p.x-sr*p.z,p.y,sr*p.x+cr*p.z);",
+      "  return vec3(c.x,c.z,-c.y);",
+      "}",
+      "vec2 equirectUv(vec3 d){",
+      "  float lon=length(d.xz)<1e-5?0.0:atan(d.x,-d.z);",
+      "  float lat=asin(clamp(d.y,-1.0,1.0));",
+      "  return vec2(fract(0.5+lon/TWO_PI),clamp(0.5-lat/PI,0.0,1.0));",
+      "}",
+      "void main(){",
+      "  vec2 uv=equirectUv(poseToCamera(normalize(vObj),uPitch,uRoll));",
+      "  if(uv.x<uU0||uv.x>uU1||uv.y<uV0||uv.y>uV1) discard;",
+      "  float sx=(uv.x-uU0)/max(uU1-uU0,1e-6);",
+      "  float sy=(uv.y-uV0)/max(uV1-uV0,1e-6);",
+      "  vec2 st=vec2((uPadL+sx*uSrcW)/uTexW,(uPadT+sy*uSrcH)/uTexH);",
+      "  gl_FragColor=texture2D(uTex,st);",
+      "}",
+    ].join("");
+    var prog = link(gl, vs, fs);
+    if (!prog || !gl.getProgramParameter(prog, gl.LINK_STATUS)) return;
+    this._tileProg = prog;
+    this._tileLoc = {
+      mvp: gl.getUniformLocation(prog, "uMvp"),
+      tex: gl.getUniformLocation(prog, "uTex"),
+      pitch: gl.getUniformLocation(prog, "uPitch"),
+      roll: gl.getUniformLocation(prog, "uRoll"),
+      u0: gl.getUniformLocation(prog, "uU0"),
+      u1: gl.getUniformLocation(prog, "uU1"),
+      v0: gl.getUniformLocation(prog, "uV0"),
+      v1: gl.getUniformLocation(prog, "uV1"),
+      padL: gl.getUniformLocation(prog, "uPadL"),
+      padT: gl.getUniformLocation(prog, "uPadT"),
+      srcW: gl.getUniformLocation(prog, "uSrcW"),
+      srcH: gl.getUniformLocation(prog, "uSrcH"),
+      texW: gl.getUniformLocation(prog, "uTexW"),
+      texH: gl.getUniformLocation(prog, "uTexH"),
+    };
+    gl.useProgram(this._prog);
   };
 
-  // Keep GPU textures only for the photos near the current one.
-  Player.prototype._keepSet = function () {
-    var count = this._tex.length;
-    var keep = {};
-    keep[this.index] = 1;
-    keep[this.fromIndex] = 1;
-    var n = stepIndex(this.index, count, 1, true);
-    var p = stepIndex(this.index, count, -1, true);
-    if (n != null) keep[n] = 1;
-    if (p != null) keep[p] = 1;
-    return keep;
-  };
-
-  Player.prototype._trim = function () {
+  Player.prototype._drawTiles = function () {
     var gl = this._gl;
-    var count = this._tex.length;
-    if (!gl || count <= 3) return;
-    var keep = this._keepSet();
-    for (var i = 0; i < count; i++) {
-      if (!keep[i] && this._tex[i]) {
-        gl.deleteTexture(this._tex[i]);
-        this._tex[i] = null;
-      }
+    var w = this.canvas.width;
+    var h = this.canvas.height;
+    gl.viewport(0, 0, w, h);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    var tiles = this._tileDraw;
+    if (!this._tileProg || !tiles || !tiles.length) return;
+    gl.useProgram(this._tileProg);
+    var pos = gl.getAttribLocation(this._tileProg, "aPos");
+    if (pos >= 0 && this._buf) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, this._buf);
+      gl.enableVertexAttribArray(pos);
+      gl.vertexAttribPointer(pos, 3, gl.FLOAT, false, 20, 0);
     }
-  };
-
-  Player.prototype._freeAll = function () {
-    var gl = this._gl;
-    if (!gl) return;
-    for (var i = 0; i < this._tex.length; i++) if (this._tex[i]) gl.deleteTexture(this._tex[i]);
-  };
-
-  Player.prototype._ensureTex = function (i) {
-    if (i == null || this._tex[i]) return;
-    var img = this.images[i];
-    if (img && img.complete && img.naturalWidth && !img._pending && !this._errors[this.ids[i]]) this._upload(img);
+    fillPerspective(this._proj, this.fov, w / Math.max(h, 1), 0.05, 20);
+    fillAimView(this._m0, this._m1, this._m2, this._view, this.yaw, this.pitch, this.roll);
+    multiplyInto(this._mvp, this._proj, this._view);
+    var loc = this._tileLoc;
+    gl.uniformMatrix4fv(loc.mvp, false, this._mvp);
+    var pose = this.poses[this.index] || ZERO_POSE;
+    gl.uniform1f(loc.pitch, pose.pitch);
+    gl.uniform1f(loc.roll, pose.roll);
+    var spanW = this._tileW || 1;
+    var spanH = this._tileH || 1;
+    for (var i = 0; i < tiles.length; i++) {
+      var piece = tiles[i];
+      var tile = piece.tile;
+      if (!piece.tex || !tile || tile.srcW < 1 || tile.srcH < 1) continue;
+      gl.uniform1f(loc.u0, tile.srcX / spanW);
+      gl.uniform1f(loc.u1, (tile.srcX + tile.srcW) / spanW);
+      gl.uniform1f(loc.v0, tile.srcY / spanH);
+      gl.uniform1f(loc.v1, (tile.srcY + tile.srcH) / spanH);
+      gl.uniform1f(loc.padL, tile.padL);
+      gl.uniform1f(loc.padT, tile.padT);
+      gl.uniform1f(loc.srcW, tile.srcW);
+      gl.uniform1f(loc.srcH, tile.srcH);
+      gl.uniform1f(loc.texW, tile.texW);
+      gl.uniform1f(loc.texH, tile.texH);
+      gl.uniform1i(loc.tex, 0);
+      bindTex(gl, gl.TEXTURE0, piece.tex);
+      gl.drawElements(gl.TRIANGLES, this._count, gl.UNSIGNED_SHORT, 0);
+    }
+    gl.useProgram(this._prog);
   };
 
   Player.prototype.draw = function () {
     resize(this.canvas);
     if (this._mode === "webgl" && this._gl) this._drawGl();
     else this._draw2d();
-    var now = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
-    if (now - this._hudAt < 200) return;
-    this._hudAt = now;
-    this._showError();
-    var hud = document.getElementById("hud");
-    if (!hud) return;
-    var text = "photo " + (this.index + 1) + " of " + Math.max(this.items.length, 1) +
-      " · " + Math.round(this.yaw) + "° · " + this.phase +
-      (this.items.length <= 1 ? " · looping" : "") +
-      (this.manual ? " · manual" : "") +
-      " · " + this._mode +
-      " · img " + this._loaded + "/" + this.images.length;
-    if (text !== this._hudText) {
-      this._hudText = text;
-      hud.textContent = text;
-    }
   };
 
   Player.prototype._drawGl = function () {
+    if (this._useTiles) {
+      this._drawTiles();
+      return;
+    }
     var gl = this._gl;
     var w = this.canvas.width;
     var h = this.canvas.height;
@@ -965,8 +925,6 @@
     gl.uniformMatrix4fv(this._loc.mvp, false, this._mvp);
     gl.uniform1f(this._loc.fade, this.fade);
     var from = this.phase === "fade" ? this.fromIndex : this.index;
-    this._ensureTex(from);
-    this._ensureTex(this.index);
     var fromPose = this.poses[from] || ZERO_POSE;
     var toPose = this.poses[this.index] || ZERO_POSE;
     gl.uniform1f(this._loc.pitchA, fromPose.pitch);
@@ -987,6 +945,7 @@
     var h = this.canvas.height || 540;
     ctx.fillStyle = "#0b0d10";
     ctx.fillRect(0, 0, w, h);
+    if (this._useTiles) return;
     var from = this.images[this.phase === "fade" ? this.fromIndex : this.index];
     var to = this.images[this.index];
     drawStrip(ctx, from, this.yaw, this.pitch, this.fov, w, h, 1);
@@ -996,6 +955,32 @@
       ctx.globalAlpha = 1;
     }
   };
+
+  function copyTiles(list) {
+    if (!list || !list.length) return null;
+    var out = [];
+    for (var i = 0; i < list.length; i++) {
+      var tile = list[i];
+      if (!tile || tile.id == null) continue;
+      out.push({
+        id: String(tile.id),
+        url: tile.url || "",
+        col: num(tile.col, 0),
+        row: num(tile.row, 0),
+        srcX: num(tile.srcX, 0),
+        srcY: num(tile.srcY, 0),
+        srcW: num(tile.srcW, 0),
+        srcH: num(tile.srcH, 0),
+        padL: num(tile.padL, 0),
+        padR: num(tile.padR, 0),
+        padT: num(tile.padT, 0),
+        padB: num(tile.padB, 0),
+        texW: num(tile.texW, 0),
+        texH: num(tile.texH, 0),
+      });
+    }
+    return out.length ? out : null;
+  }
 
   function normalizeEntries(list) {
     var out = [];
@@ -1009,6 +994,9 @@
           url: item.url,
           posePitch: num(item.posePitch, 0),
           poseRoll: num(item.poseRoll, 0),
+          width: num(item.width, 0),
+          height: num(item.height, 0),
+          tiles: copyTiles(item.tiles),
         });
       }
     }
@@ -1077,21 +1065,6 @@
     var cy = py;
     var cz = sr * nx + cr * pz;
     return [cx, cz, -cy];
-  }
-
-  function isBlobOrData(url) {
-    return /^(blob|data):/i.test(String(url || ""));
-  }
-
-  function hostOf(url) {
-    try { return new URL(url, window.location.href).host || String(url); } catch (e) { return String(url); }
-  }
-
-  function base64Bytes(text) {
-    var bin = atob(text);
-    var out = new Uint8Array(bin.length);
-    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-    return out;
   }
 
   function needsCors(url) {
@@ -1246,16 +1219,294 @@
     }
   }
 
+  function isOom(error) {
+    if (!error) return false;
+    if (error.oom) return true;
+    return /out of memory/i.test(String(error.message || error));
+  }
+
+  function materializeJpeg(payload, done) {
+    try {
+      var binary = atob(payload);
+      var bytes = new Uint8Array(binary.length);
+      for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i) & 255;
+      var blob = new Blob([bytes], { type: "image/jpeg" });
+      var url = URL.createObjectURL(blob);
+      var img = new Image();
+      img.onload = function () {
+        URL.revokeObjectURL(url);
+        done(null, img);
+      };
+      img.onerror = function () {
+        URL.revokeObjectURL(url);
+        done(new Error("Couldn't open this photo"));
+      };
+      img.src = url;
+    } catch (error) {
+      done(error);
+    }
+  }
+
+  function PhotoSession(hooks) {
+    this.hooks = hooks || {};
+    this.generation = 0;
+    this.token = 0;
+    this.live = [];
+    this.loaded = [];
+    this.assemblers = {};
+    this.entry = null;
+    this.tileIndex = 0;
+    this.attempt = 0;
+    this.pending = null;
+    this.waitingShrink = false;
+    this.shown = false;
+    this.timeoutMs = this.hooks.timeoutMs || 45000;
+  }
+
+  PhotoSession.prototype._now = function () {
+    return this.hooks.now ? this.hooks.now() : Date.now();
+  };
+
+  PhotoSession.prototype._releaseAll = function () {
+    var release = this.hooks.release;
+    if (release) this.live.forEach(release);
+    this.live = [];
+  };
+
+  PhotoSession.prototype.dispose = function () {
+    this.generation += 1;
+    this.token += 1;
+    this._releaseAll();
+    this.loaded = [];
+    this.assemblers = {};
+    this.pending = null;
+    this.entry = null;
+    this.waitingShrink = false;
+    this.shown = false;
+  };
+
+  PhotoSession.prototype.open = function (entry) {
+    this.dispose();
+    this.entry = entry;
+    this.tileIndex = 0;
+    this.attempt = 0;
+    this.loaded = [];
+    this.shown = false;
+    if (this.hooks.onStatus) this.hooks.onStatus("busy");
+    if (!entry || !entry.tiles || !entry.tiles.length) {
+      this._failOrRetry("no tiles");
+      return;
+    }
+    this._requestCurrent();
+  };
+
+  PhotoSession.prototype._requestCurrent = function () {
+    var entry = this.entry;
+    if (!entry || !entry.tiles) return;
+    var tile = entry.tiles[this.tileIndex];
+    if (!tile) return;
+    this.token += 1;
+    var token = this.token;
+    this.assemblers[tile.id] = {
+      id: tile.id,
+      gen: this.generation,
+      token: token,
+      n: 0,
+      got: 0,
+      parts: [],
+      tile: tile,
+      photoId: entry.id,
+    };
+    this.pending = { id: tile.id, token: token, started: this._now() };
+    if (this.hooks.request) this.hooks.request(tile.id, token);
+  };
+
+  PhotoSession.prototype.noteChunk = function (msg) {
+    if (!msg || msg.id == null) return;
+    var box = this.assemblers[msg.id];
+    if (!box || box.gen !== this.generation || box.token !== this.token) return;
+    // A chunk that names a token has to be the transfer this tile asked for.
+    // Photo 1's leftover pieces reuse the id when the phone resets its counter,
+    // and a different n leaves this assembler waiting forever.
+    if (msg.token != null && (msg.token | 0) !== box.token) return;
+    var index = msg.i | 0;
+    var count = msg.n | 0;
+    if (count <= 0 || index < 0 || index >= count) return;
+    if (box.n && count !== box.n) return;
+    if (box.parts[index] != null) return;
+    box.n = count;
+    box.parts[index] = String(msg.data || "");
+    box.got += 1;
+    if (box.got < count) return;
+    for (var i = 0; i < count; i++) if (box.parts[i] == null) return;
+    var payload = box.parts.slice(0, count).join("");
+    delete this.assemblers[msg.id];
+    this._materialize(box, payload);
+  };
+
+  PhotoSession.prototype.noteFetchError = function (msg) {
+    if (!msg) return;
+    var box = this.assemblers[msg.id];
+    if (!box || box.gen !== this.generation || box.token !== this.token) return;
+    this._failOrRetry(msg.message || "fetch");
+  };
+
+  PhotoSession.prototype._materialize = function (box, payload) {
+    var self = this;
+    var token = box.token;
+    var gen = box.gen;
+    var finish = function (err, image) {
+      if (gen !== self.generation || token !== self.token) {
+        if (image && self.hooks.dropImage) self.hooks.dropImage(image);
+        return;
+      }
+      if (err || !image) {
+        if (image && self.hooks.dropImage) self.hooks.dropImage(image);
+        self._failOrRetry(err || "load");
+        return;
+      }
+      var tex = null;
+      try {
+        tex = self.hooks.upload(image);
+      } catch (error) {
+        if (self.hooks.dropImage) self.hooks.dropImage(image);
+        if (isOom(error)) self._oom(box.photoId);
+        else self._failOrRetry(error);
+        return;
+      }
+      if (self.hooks.dropImage) self.hooks.dropImage(image);
+      if (!tex || tex.oom) {
+        if (tex && self.hooks.release) self.hooks.release(tex);
+        self._oom(box.photoId);
+        return;
+      }
+      self.live.push(tex);
+      self.loaded.push({ tex: tex, tile: box.tile });
+      self.pending = null;
+      self.tileIndex += 1;
+      if (!self.entry || self.tileIndex >= self.entry.tiles.length) {
+        var covered = self.entry && coversSphere(
+          self.loaded.map(function (piece) { return piece.tile; }),
+          self.entry.width,
+          self.entry.height,
+        );
+        if (!covered) {
+          self.attempt = 1;
+          self._failOrRetry("coverage");
+          return;
+        }
+        self.shown = true;
+        if (self.hooks.onStatus) self.hooks.onStatus("");
+        if (self.hooks.onShown) {
+          self.hooks.onShown({
+            id: self.entry.id,
+            width: self.entry.width,
+            height: self.entry.height,
+            tiles: self.loaded.slice(),
+          });
+        }
+        return;
+      }
+      self._requestCurrent();
+    };
+    if (this.hooks.materialize) this.hooks.materialize(payload, finish);
+    else finish(new Error("no materialize"));
+  };
+
+  PhotoSession.prototype._failOrRetry = function (reason) {
+    if (this.waitingShrink) return;
+    var entry = this.entry;
+    this._releaseAll();
+    this.loaded = [];
+    this.assemblers = {};
+    this.pending = null;
+    this.tileIndex = 0;
+    if (this.attempt < 1 && entry) {
+      this.entry = entry;
+      this.attempt += 1;
+      if (this.hooks.onStatus) this.hooks.onStatus("busy");
+      this._requestCurrent();
+      return;
+    }
+    this.entry = null;
+    if (this.hooks.onStatus) this.hooks.onStatus("error");
+    if (this.hooks.onFail) this.hooks.onFail(reason);
+  };
+
+  PhotoSession.prototype._oom = function (photoId) {
+    this._releaseAll();
+    this.loaded = [];
+    this.assemblers = {};
+    this.tileIndex = 0;
+    this.waitingShrink = true;
+    this.pending = { id: photoId, token: this.token, started: this._now() };
+    if (this.hooks.onStatus) this.hooks.onStatus("busy");
+    if (this.hooks.onMemory) this.hooks.onMemory(photoId);
+  };
+
+  PhotoSession.prototype.tick = function (now) {
+    if (!this.pending) return;
+    if (now - this.pending.started < this.timeoutMs) return;
+    if (this.waitingShrink) {
+      this.pending = null;
+      this.entry = null;
+      if (this.hooks.onStatus) this.hooks.onStatus("error");
+      if (this.hooks.onFail) this.hooks.onFail("timeout");
+      return;
+    }
+    this._failOrRetry("timeout");
+  };
+
+  function coversSphere(tiles, width, height) {
+    if (!(width > 0) || !(height > 0) || !tiles || !tiles.length) return false;
+    var steps = 48;
+    for (var y = 0; y < steps; y++) {
+      var v = (y + 0.5) / steps;
+      for (var x = 0; x < steps; x++) {
+        var u = (x + 0.5) / steps;
+        var hit = false;
+        for (var i = 0; i < tiles.length; i++) {
+          var tile = tiles[i] && tiles[i].tile ? tiles[i].tile : tiles[i];
+          if (tileTexCoord(u, v, tile, width, height)) {
+            hit = true;
+            break;
+          }
+        }
+        if (!hit) return false;
+      }
+    }
+    return true;
+  }
+
+  function tileTexCoord(u, v, tile, width, height) {
+    if (!tile || !(width > 0) || !(height > 0) || !(tile.texW > 0) || !(tile.texH > 0)) return null;
+    var u0 = tile.srcX / width;
+    var u1 = (tile.srcX + tile.srcW) / width;
+    var v0 = tile.srcY / height;
+    var v1 = (tile.srcY + tile.srcH) / height;
+    if (u < u0 || u > u1 || v < v0 || v > v1) return null;
+    var du = u1 - u0;
+    var dv = v1 - v0;
+    var sx = du ? (u - u0) / du : 0;
+    var sy = dv ? (v - v0) / dv : 0;
+    return {
+      x: (tile.padL + sx * tile.srcW) / tile.texW,
+      y: (tile.padT + sy * tile.srcH) / tile.texH,
+    };
+  }
+
   root.SpsphereCast = {
     ROTATIONS: ROTATIONS,
     DEFAULT_DPS: DEFAULT_DPS,
     CROSSFADE_MS: CROSSFADE_MS,
     OMEGA: OMEGA,
-    TEX_CAP: TEX_CAP,
     decodeAim: decodeAim,
     decodeSkip: decodeSkip,
     stepIndex: stepIndex,
     applyPose: applyPose,
+    tileTexCoord: tileTexCoord,
+    coversSphere: coversSphere,
     create: function (canvas) { return new Player(canvas); },
+    createSession: function (hooks) { return new PhotoSession(hooks); },
   };
 })(window);
