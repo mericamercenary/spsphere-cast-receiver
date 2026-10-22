@@ -1,7 +1,9 @@
 /* SPsphere Cast receiver player.
    Two full yaw turns at the horizon, then the next photo.
    One photo keeps turning. Timing matches CastTiming.kt (9°/s).
-   Manual aim is an absolute pose. The TV springs toward it.
+   Manual aim springs toward the phone. Yaw is the heading change since
+   the first sample of that hold. Pitch and roll are gravity. A new
+   anchor on every sample would freeze yaw.
    GPano PosePitchDegrees and PoseRollDegrees level the sphere before that
    look, matching ProjectionMath.applyPose. The phone bakes cubemaps to
    equirect JPEGs with the standard face orientation, so this page samples
@@ -602,38 +604,24 @@
   };
 
   Player.prototype._setup = function () {
-    var gl = this.canvas.getContext("webgl", { antialias: false, preserveDrawingBuffer: true });
+    var attrs = { antialias: true, alpha: false, preserveDrawingBuffer: true };
+    var gl = this.canvas.getContext("webgl2", attrs);
+    this._webgl2 = !!gl;
+    if (!gl) gl = this.canvas.getContext("webgl", attrs);
     if (!gl) return;
-    var vs = "attribute vec3 aPos;attribute vec2 aUv;uniform mat4 uMvp;varying vec3 vObj;void main(){vObj=aPos;gl_Position=uMvp*vec4(aPos,1.0);}";
-    var fs = [
-      "precision mediump float;",
-      "varying vec3 vObj;",
-      "uniform sampler2D uA;uniform sampler2D uB;uniform float uFade;",
-      "uniform float uPitchA;uniform float uRollA;uniform float uPitchB;uniform float uRollB;",
-      "const float PI=3.141592653589793;const float TWO_PI=6.283185307179586;",
-      "vec3 poseToCamera(vec3 v,float pitch,float roll){",
-      "  vec3 n=vec3(v.x,-v.z,v.y);",
-      "  float cp=cos(pitch);float sp=sin(pitch);float cr=cos(roll);float sr=sin(roll);",
-      "  vec3 p=vec3(n.x,cp*n.y+sp*n.z,-sp*n.y+cp*n.z);",
-      "  vec3 c=vec3(cr*p.x-sr*p.z,p.y,sr*p.x+cr*p.z);",
-      "  return vec3(c.x,c.z,-c.y);",
-      "}",
-      "vec2 equirectUv(vec3 d){",
-      "  float lon=length(d.xz)<1e-5?0.0:atan(d.x,-d.z);",
-      "  float lat=asin(clamp(d.y,-1.0,1.0));",
-      "  return vec2(fract(0.5+lon/TWO_PI),clamp(0.5-lat/PI,0.0,1.0));",
-      "}",
-      "void main(){",
-      "  vec3 dir=normalize(vObj);",
-      "  vec4 a=texture2D(uA,equirectUv(poseToCamera(dir,uPitchA,uRollA)));",
-      "  vec4 b=texture2D(uB,equirectUv(poseToCamera(dir,uPitchB,uRollB)));",
-      "  gl_FragColor=mix(a,b,uFade);",
-      "  if(gl_FragColor.a<0.05)gl_FragColor=vec4(0.04,0.05,0.07,1.0);",
-      "}",
-    ].join("");
-    var prog = link(gl, vs, fs);
-    if (!prog || !gl.getProgramParameter(prog, gl.LINK_STATUS)) return;
+    var prec = this._webgl2 ? "highp" : fragmentPrecision(gl);
+    var sources = glSources(this._webgl2, prec);
+    var prog = compileProgram(gl, sources.vs, sources.fs);
+    if (!prog && prec !== "mediump" && !this._webgl2) {
+      prec = "mediump";
+      sources = glSources(false, prec);
+      prog = compileProgram(gl, sources.vs, sources.fs);
+    }
+    if (!prog) return;
+    this._prec = prec;
+    this._sources = sources;
     this._gl = gl;
+    this._glLost = false;
     this._mode = "webgl";
     gl.useProgram(prog);
     this._prog = prog;
@@ -647,24 +635,19 @@
       pitchB: gl.getUniformLocation(prog, "uPitchB"),
       rollB: gl.getUniformLocation(prog, "uRollB"),
     };
-    var mesh = sphere(48, 64);
+    var wide = this._webgl2 || !!gl.getExtension("OES_element_index_uint");
+    var mesh = wide ? sphere(128, 256, true) : sphere(128, 64, false);
     this._count = mesh.count;
+    this._indexType = wide ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
     var buf = gl.createBuffer();
     this._buf = buf;
     gl.bindBuffer(gl.ARRAY_BUFFER, buf);
     gl.bufferData(gl.ARRAY_BUFFER, mesh.interleaved, gl.STATIC_DRAW);
-    var stride = 20;
-    var p = gl.getAttribLocation(prog, "aPos");
-    var u = gl.getAttribLocation(prog, "aUv");
-    gl.enableVertexAttribArray(p);
-    gl.vertexAttribPointer(p, 3, gl.FLOAT, false, stride, 0);
-    if (u >= 0) {
-      gl.enableVertexAttribArray(u);
-      gl.vertexAttribPointer(u, 2, gl.FLOAT, false, stride, 12);
-    }
     var ib = gl.createBuffer();
+    this._indexBuf = ib;
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.indices, gl.STATIC_DRAW);
+    this._bindMesh(gl, prog);
     gl.disable(gl.CULL_FACE);
     gl.clearColor(0.04, 0.05, 0.07, 1);
     if (!this._glHooks && this.canvas.addEventListener) {
@@ -704,8 +687,11 @@
   };
 
   Player.prototype._upload = function (img) {
+    if (this._glLost || !this._gl) this._setup();
     if (!this._gl || !img.width) return;
     var gl = this._gl;
+    if (gl.isContextLost && gl.isContextLost()) return;
+    clearGlErrors(gl);
     var tex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
@@ -717,7 +703,10 @@
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
     } catch (error) {
       this._uploadError = String(error);
+      gl.deleteTexture(tex);
+      return;
     }
+    this._finishSampler(gl, tex, img.width, img.height, null);
     var i = this.images.indexOf(img);
     if (i >= 0) this._tex[i] = tex;
   };
@@ -883,6 +872,7 @@
   };
 
   Player.prototype._texImage = function (gl, source) {
+    clearGlErrors(gl);
     var tex = gl.createTexture();
     if (!tex) return null;
     gl.bindTexture(gl.TEXTURE_2D, tex);
@@ -891,7 +881,6 @@
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    if (gl.getError) gl.getError();
     try {
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
     } catch (error) {
@@ -909,10 +898,80 @@
       warn("texture upload failed", String(glErr));
       return null;
     }
+    var w = source.width || 0;
+    var h = source.height || 0;
+    this._finishSampler(gl, tex, w, h, source);
     return tex;
   };
 
+  Player.prototype._finishSampler = function (gl, tex, width, height, source) {
+    var uploadW = width;
+    var uploadH = height;
+    var pot = isPow2(width) && isPow2(height);
+    if (!this._webgl2 && !pot && source) {
+      var padded = potPadSource(source);
+      if (padded && padded.width && (padded.width !== width || padded.height !== height)) {
+        clearGlErrors(gl);
+        try {
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, padded);
+          uploadW = padded.width;
+          uploadH = padded.height;
+          pot = isPow2(uploadW) && isPow2(uploadH);
+        } catch (error) {
+          warn("texture pad failed", error && error.message);
+        }
+        var padErr = gl.getError ? gl.getError() : 0;
+        if (padErr) {
+          warn("texture pad failed", String(padErr));
+          pot = isPow2(width) && isPow2(height);
+          uploadW = width;
+          uploadH = height;
+        }
+      }
+    }
+    var min = gl.LINEAR;
+    var aniso = 1;
+    if (this._webgl2 || pot) {
+      clearGlErrors(gl);
+      var mipOk = true;
+      try {
+        gl.generateMipmap(gl.TEXTURE_2D);
+      } catch (error) {
+        mipOk = false;
+        warn("mipmap skipped", error && error.message);
+      }
+      var mipErr = gl.getError ? gl.getError() : 0;
+      if (mipOk && !mipErr) {
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+        min = gl.LINEAR_MIPMAP_LINEAR;
+        aniso = this._setAniso(gl);
+      } else if (mipErr) {
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        warn("mipmap skipped", String(mipErr));
+      }
+    }
+    this._minFilter = min;
+    this._aniso = aniso;
+    tex._uploadW = uploadW;
+    tex._uploadH = uploadH;
+  };
+
+  Player.prototype._setAniso = function (gl) {
+    if (this._anisoExt === undefined) {
+      this._anisoExt = gl.getExtension("EXT_texture_filter_anisotropic") ||
+        gl.getExtension("WEBKIT_EXT_texture_filter_anisotropic") ||
+        gl.getExtension("MOZ_EXT_texture_filter_anisotropic") ||
+        null;
+    }
+    var ext = this._anisoExt;
+    if (!ext) return 1;
+    var max = gl.getParameter(ext.MAX_TEXTURE_MAX_ANISOTROPY_EXT) || 1;
+    if (max > 1) gl.texParameterf(gl.TEXTURE_2D, ext.TEXTURE_MAX_ANISOTROPY_EXT, max);
+    return max;
+  };
+
   Player.prototype._uploadTile = function (img, tile) {
+    if (this._glLost || !this._gl) this._setup();
     var gl = this._gl;
     if (!gl || (gl.isContextLost && gl.isContextLost())) {
       warn("webgl context lost");
@@ -985,6 +1044,7 @@
       if (!this._evictDistant(view)) break;
     }
     if (!tex) return this._deferred(img, tile);
+    if (tex._uploadW && tex._uploadH) bytes = tex._uploadW * tex._uploadH * 4;
     tex._bytes = bytes;
     tex._window = win && !win.full ? win : null;
     tex._spsPayload = img._spsPayload || null;
@@ -1048,39 +1108,31 @@
     });
   };
 
+  Player.prototype._bindMesh = function (gl, program) {
+    if (!gl || !this._buf || !program) return;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this._buf);
+    var pos = gl.getAttribLocation(program, "aPos");
+    if (pos >= 0) {
+      gl.enableVertexAttribArray(pos);
+      gl.vertexAttribPointer(pos, 3, gl.FLOAT, false, 20, 0);
+    }
+    var uv = gl.getAttribLocation(program, "aUv");
+    if (uv >= 0) {
+      gl.enableVertexAttribArray(uv);
+      gl.vertexAttribPointer(uv, 2, gl.FLOAT, false, 20, 12);
+    }
+    if (this._indexBuf) gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this._indexBuf);
+  };
+
+  Player.prototype._drawMesh = function (gl) {
+    this._bindMesh(gl, gl.getParameter(gl.CURRENT_PROGRAM));
+    gl.drawElements(gl.TRIANGLES, this._count, this._indexType || gl.UNSIGNED_SHORT, 0);
+  };
+
   Player.prototype._installTileProgram = function (gl) {
-    var vs = "attribute vec3 aPos;uniform mat4 uMvp;varying vec3 vObj;void main(){vObj=aPos;gl_Position=uMvp*vec4(aPos,1.0);}";
-    var fs = [
-      "precision mediump float;",
-      "varying vec3 vObj;",
-      "uniform sampler2D uTex;",
-      "uniform float uPitch;uniform float uRoll;",
-      "uniform float uU0;uniform float uU1;uniform float uV0;uniform float uV1;",
-      "uniform float uPadL;uniform float uPadT;uniform float uSrcW;uniform float uSrcH;uniform float uTexW;uniform float uTexH;",
-      "const float PI=3.141592653589793;const float TWO_PI=6.283185307179586;",
-      "vec3 poseToCamera(vec3 v,float pitch,float roll){",
-      "  vec3 n=vec3(v.x,-v.z,v.y);",
-      "  float cp=cos(pitch);float sp=sin(pitch);float cr=cos(roll);float sr=sin(roll);",
-      "  vec3 p=vec3(n.x,cp*n.y+sp*n.z,-sp*n.y+cp*n.z);",
-      "  vec3 c=vec3(cr*p.x-sr*p.z,p.y,sr*p.x+cr*p.z);",
-      "  return vec3(c.x,c.z,-c.y);",
-      "}",
-      "vec2 equirectUv(vec3 d){",
-      "  float lon=length(d.xz)<1e-5?0.0:atan(d.x,-d.z);",
-      "  float lat=asin(clamp(d.y,-1.0,1.0));",
-      "  return vec2(fract(0.5+lon/TWO_PI),clamp(0.5-lat/PI,0.0,1.0));",
-      "}",
-      "void main(){",
-      "  vec2 uv=equirectUv(poseToCamera(normalize(vObj),uPitch,uRoll));",
-      "  if(uv.x<uU0||uv.x>uU1||uv.y<uV0||uv.y>uV1) discard;",
-      "  float sx=(uv.x-uU0)/max(uU1-uU0,1e-6);",
-      "  float sy=(uv.y-uV0)/max(uV1-uV0,1e-6);",
-      "  vec2 st=vec2((uPadL+sx*uSrcW)/uTexW,(uPadT+sy*uSrcH)/uTexH);",
-      "  gl_FragColor=texture2D(uTex,st);",
-      "}",
-    ].join("");
-    var prog = link(gl, vs, fs);
-    if (!prog || !gl.getProgramParameter(prog, gl.LINK_STATUS)) return;
+    var sources = this._sources || glSources(this._webgl2, this._prec || "highp");
+    var prog = compileProgram(gl, sources.tileVs, sources.tileFs);
+    if (!prog) return;
     this._tileProg = prog;
     this._tileLoc = {
       mvp: gl.getUniformLocation(prog, "uMvp"),
@@ -1125,12 +1177,7 @@
     }
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.useProgram(this._tileProg);
-    var pos = gl.getAttribLocation(this._tileProg, "aPos");
-    if (pos >= 0 && this._buf) {
-      gl.bindBuffer(gl.ARRAY_BUFFER, this._buf);
-      gl.enableVertexAttribArray(pos);
-      gl.vertexAttribPointer(pos, 3, gl.FLOAT, false, 20, 0);
-    }
+    this._bindMesh(gl, this._tileProg);
     fillPerspective(this._proj, this.fov, w / Math.max(h, 1), 0.05, 20);
     fillAimView(this._m0, this._m1, this._m2, this._view, this.yaw, this.pitch, this.roll);
     multiplyInto(this._mvp, this._proj, this._view);
@@ -1151,11 +1198,11 @@
       gl.uniform1f(loc.padT, tile.padT || 0);
       gl.uniform1f(loc.srcW, tile.srcW);
       gl.uniform1f(loc.srcH, tile.srcH);
-      gl.uniform1f(loc.texW, tile.texW);
-      gl.uniform1f(loc.texH, tile.texH);
+      gl.uniform1f(loc.texW, drawable[i].tex._uploadW || tile.texW);
+      gl.uniform1f(loc.texH, drawable[i].tex._uploadH || tile.texH);
       gl.uniform1i(loc.tex, 0);
       bindTex(gl, gl.TEXTURE0, drawable[i].tex);
-      gl.drawElements(gl.TRIANGLES, this._count, gl.UNSIGNED_SHORT, 0);
+      this._drawMesh(gl);
     }
     this._presented = true;
     gl.useProgram(this._prog);
@@ -1175,6 +1222,7 @@
     var gl = this._gl;
     var w = this.canvas.width;
     var h = this.canvas.height;
+    gl.useProgram(this._prog);
     gl.viewport(0, 0, w, h);
     gl.clear(gl.COLOR_BUFFER_BIT);
     fillPerspective(this._proj, this.fov, w / Math.max(h, 1), 0.05, 20);
@@ -1193,7 +1241,7 @@
     gl.uniform1i(this._loc.b, 1);
     bindTex(gl, gl.TEXTURE0, this._tex[from] || this._blank);
     bindTex(gl, gl.TEXTURE1, this._tex[this.index] || this._blank);
-    gl.drawElements(gl.TRIANGLES, this._count, gl.UNSIGNED_SHORT, 0);
+    this._drawMesh(gl);
   };
 
   Player.prototype._draw2d = function () {
@@ -1364,12 +1412,27 @@
   }
 
   function resize(canvas) {
-    var w = Math.max(2, canvas.clientWidth || 960);
-    var h = Math.max(2, canvas.clientHeight || 540);
-    if (canvas.width !== w || canvas.height !== h) {
-      canvas.width = w;
-      canvas.height = h;
+    var dpr = (root.devicePixelRatio || 1);
+    var screenW = root.screen && root.screen.width;
+    var screenH = root.screen && root.screen.height;
+    var size = backingStoreSize(canvas.clientWidth, canvas.clientHeight, dpr, screenW, screenH);
+    if (canvas.width !== size.width || canvas.height !== size.height) {
+      canvas.width = size.width;
+      canvas.height = size.height;
     }
+  }
+
+  function backingStoreSize(clientW, clientH, dpr, screenW, screenH) {
+    var density = Number(dpr) || 1;
+    if (density < 1) density = 1;
+    var w = Math.max(clientW || 0, screenW || 0);
+    var h = Math.max(clientH || 0, screenH || 0);
+    if (w < 2) w = 1920;
+    if (h < 2) h = 1080;
+    return {
+      width: Math.max(2, Math.round(w * density)),
+      height: Math.max(2, Math.round(h * density)),
+    };
   }
 
   function bindTex(gl, unit, tex) {
@@ -1377,7 +1440,7 @@
     gl.bindTexture(gl.TEXTURE_2D, tex);
   }
 
-  function sphere(latBands, lonBands) {
+  function sphere(latBands, lonBands, useUint32) {
     var pos = [];
     var ind = [];
     for (var lat = 0; lat <= latBands; lat++) {
@@ -1399,8 +1462,113 @@
     }
     return {
       interleaved: new Float32Array(pos),
-      indices: new Uint16Array(ind),
+      indices: useUint32 ? new Uint32Array(ind) : new Uint16Array(ind),
       count: ind.length,
+    };
+  }
+
+  function isPow2(n) {
+    n = n | 0;
+    return n > 0 && (n & (n - 1)) === 0;
+  }
+
+  function nextPow2(n) {
+    n = Math.max(1, n | 0);
+    var v = 1;
+    while (v < n && v > 0) v <<= 1;
+    return v > 0 ? v : n;
+  }
+
+  function potSize(w, h) {
+    return { w: nextPow2(w), h: nextPow2(h) };
+  }
+
+  function potPadSource(source) {
+    if (!source || !source.width || !source.height) return null;
+    var w = source.width;
+    var h = source.height;
+    var pw = nextPow2(w);
+    var ph = nextPow2(h);
+    if (pw === w && ph === h) return source;
+    if (typeof document === "undefined" || !document.createElement) return null;
+    var canvas = document.createElement("canvas");
+    canvas.width = pw;
+    canvas.height = ph;
+    var ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(source, 0, 0, w, h, 0, 0, w, h);
+    if (pw > w) ctx.drawImage(source, w - 1, 0, 1, h, w, 0, pw - w, h);
+    if (ph > h) ctx.drawImage(canvas, 0, h - 1, pw, 1, 0, h, pw, ph - h);
+    return canvas;
+  }
+
+  function clearGlErrors(gl) {
+    if (!gl || !gl.getError) return;
+    for (var i = 0; i < 8; i++) {
+      if (gl.getError() === (gl.NO_ERROR || 0)) return;
+    }
+  }
+
+  function fragmentPrecision(gl) {
+    if (!gl.getShaderPrecisionFormat) return "highp";
+    var fmt = gl.getShaderPrecisionFormat(gl.FRAGMENT_SHADER, gl.HIGH_FLOAT);
+    if (fmt && fmt.precision > 0) return "highp";
+    return "mediump";
+  }
+
+  function glSources(webgl2, precision) {
+    var prec = precision === "mediump" ? "mediump" : "highp";
+    var sample = webgl2 ? "texture" : "texture2D";
+    var vary = webgl2 ? "in" : "varying";
+    var head = webgl2 ? "#version 300 es\nprecision highp float;\n" : "precision " + prec + " float;\n";
+    var outDecl = webgl2 ? "out vec4 fragColor;\n" : "";
+    var color = webgl2 ? "fragColor" : "gl_FragColor";
+    var pose = [
+      "vec3 poseToCamera(vec3 v,float pitch,float roll){",
+      "  vec3 n=vec3(v.x,-v.z,v.y);",
+      "  float cp=cos(pitch);float sp=sin(pitch);float cr=cos(roll);float sr=sin(roll);",
+      "  vec3 p=vec3(n.x,cp*n.y+sp*n.z,-sp*n.y+cp*n.z);",
+      "  vec3 c=vec3(cr*p.x-sr*p.z,p.y,sr*p.x+cr*p.z);",
+      "  return vec3(c.x,c.z,-c.y);",
+      "}",
+      "vec2 equirectUv(vec3 d){",
+      "  float lon=length(d.xz)<1e-5?0.0:atan(d.x,-d.z);",
+      "  float lat=asin(clamp(d.y,-1.0,1.0));",
+      "  return vec2(fract(0.5+lon/TWO_PI),clamp(0.5-lat/PI,0.0,1.0));",
+      "}",
+    ].join("\n");
+    var vsIn = webgl2 ? "in" : "attribute";
+    var vsOut = webgl2 ? "out" : "varying";
+    var version = webgl2 ? "#version 300 es\n" : "";
+    return {
+      vs: version + vsIn + " vec3 aPos;" + vsIn + " vec2 aUv;uniform mat4 uMvp;" + vsOut + " vec3 vObj;void main(){vObj=aPos;gl_Position=uMvp*vec4(aPos,1.0);}",
+      fs: head + vary + " vec3 vObj;\n" + outDecl +
+        "uniform sampler2D uA;uniform sampler2D uB;uniform float uFade;\n" +
+        "uniform float uPitchA;uniform float uRollA;uniform float uPitchB;uniform float uRollB;\n" +
+        "const float PI=3.141592653589793;const float TWO_PI=6.283185307179586;\n" +
+        pose + "\nvoid main(){\n" +
+        "  vec3 dir=normalize(vObj);\n" +
+        "  vec4 a=" + sample + "(uA,equirectUv(poseToCamera(dir,uPitchA,uRollA)));\n" +
+        "  vec4 b=" + sample + "(uB,equirectUv(poseToCamera(dir,uPitchB,uRollB)));\n" +
+        "  " + color + "=mix(a,b,uFade);\n" +
+        "  if(" + color + ".a<0.05)" + color + "=vec4(0.04,0.05,0.07,1.0);\n" +
+        "}",
+      tileVs: version + vsIn + " vec3 aPos;uniform mat4 uMvp;" + vsOut + " vec3 vObj;void main(){vObj=aPos;gl_Position=uMvp*vec4(aPos,1.0);}",
+      tileFs: head + vary + " vec3 vObj;\n" + outDecl +
+        "uniform sampler2D uTex;\n" +
+        "uniform float uPitch;uniform float uRoll;\n" +
+        "uniform float uU0;uniform float uU1;uniform float uV0;uniform float uV1;\n" +
+        "uniform float uPadL;uniform float uPadT;uniform float uSrcW;uniform float uSrcH;uniform float uTexW;uniform float uTexH;\n" +
+        "const float PI=3.141592653589793;const float TWO_PI=6.283185307179586;\n" +
+        pose + "\nvoid main(){\n" +
+        "  vec2 uv=equirectUv(poseToCamera(normalize(vObj),uPitch,uRoll));\n" +
+        "  if(uv.x<uU0||uv.x>uU1||uv.y<uV0||uv.y>uV1) discard;\n" +
+        "  float sx=(uv.x-uU0)/max(uU1-uU0,1e-6);\n" +
+        "  float sy=(uv.y-uV0)/max(uV1-uV0,1e-6);\n" +
+        "  vec2 st=vec2((uPadL+sx*uSrcW)/uTexW,(uPadT+sy*uSrcH)/uTexH);\n" +
+        "  " + color + "=" + sample + "(uTex,st);\n" +
+        "}",
     };
   }
 
@@ -1409,6 +1577,7 @@
       var s = gl.createShader(type);
       gl.shaderSource(s, src);
       gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) warn("shader", gl.getShaderInfoLog(s));
       return s;
     }
     var p = gl.createProgram();
@@ -1416,6 +1585,18 @@
     gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fsSrc));
     gl.linkProgram(p);
     return p;
+  }
+
+  function compileProgram(gl, vsSrc, fsSrc) {
+    var prog = link(gl, vsSrc, fsSrc);
+    if (!prog || !gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      if (prog) {
+        warn("shader link", gl.getProgramInfoLog(prog));
+        gl.deleteProgram(prog);
+      }
+      return null;
+    }
+    return prog;
   }
 
   function fillPerspective(out, fovDeg, aspect, near, far) {
@@ -1939,6 +2120,7 @@
     canvas.height = h | 0;
     var ctx = canvas.getContext("2d");
     if (!ctx) return null;
+    ctx.imageSmoothingEnabled = false;
     ctx.drawImage(img, x, y, w, h, 0, 0, w, h);
     return canvas;
   }
@@ -1994,6 +2176,9 @@
     coversSphere: coversSphere,
     viewCenterUv: viewCenterUv,
     planResidence: planResidence,
+    backingStoreSize: backingStoreSize,
+    potSize: potSize,
+    sphere: sphere,
     create: function (canvas) { return new Player(canvas); },
     createSession: function (hooks) { return new PhotoSession(hooks); },
   };
