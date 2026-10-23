@@ -16,6 +16,9 @@
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
   var CROSSFADE_MS = 1200;
+  var TILE_FADE_MS = 300;
+  var GPU_CAP = 192 * 1024 * 1024;
+  var IDLE_HEARTBEAT_MS = 15000;
   var MIN_DPS = 6;
   var MAX_DPS = 72;
   var OMEGA = 40;
@@ -182,6 +185,9 @@
     var entries = normalizeEntries(urls);
     var self = this;
     if (this.session) this.session.dispose();
+    this._dropStandby();
+    this._fading = false;
+    this._fadeFrom = null;
     this._tileDraw = [];
     this.entries = entries;
     this._useTiles = entries.some(function (entry) { return entry.tiles && entry.tiles.length; });
@@ -369,6 +375,9 @@
     this.fov = 75;
     this._resetAim();
     if (this.session) this.session.dispose();
+    this._dropStandby();
+    this._fading = false;
+    this._fadeFrom = null;
     this._tileDraw = [];
     this._busy = false;
     this._markBusy();
@@ -595,6 +604,10 @@
       var dt = t - self._last;
       self._last = t;
       if (dt > 100) dt = 100;
+      if (self._fading) {
+        self._fadeMs = (self._fadeMs || 0) + dt;
+        if (self._fadeMs >= TILE_FADE_MS) self._endFade();
+      }
       self._ease(dt);
       if (self.playing && !self.manual) self._integrate(dt);
       if (self.session) self.session.tick(Date.now());
@@ -610,11 +623,16 @@
     if (!gl) gl = this.canvas.getContext("webgl", attrs);
     if (!gl) return;
     var prec = this._webgl2 ? "highp" : fragmentPrecision(gl);
-    var sources = glSources(this._webgl2, prec);
+    var grad = !!this._webgl2;
+    if (!grad) {
+      grad = !!(gl.getExtension("OES_standard_derivatives") && gl.getExtension("EXT_shader_texture_lod"));
+    }
+    this._grad = grad;
+    var sources = glSources(this._webgl2, prec, grad);
     var prog = compileProgram(gl, sources.vs, sources.fs);
     if (!prog && prec !== "mediump" && !this._webgl2) {
       prec = "mediump";
-      sources = glSources(false, prec);
+      sources = glSources(false, prec, grad);
       prog = compileProgram(gl, sources.vs, sources.fs);
     }
     if (!prog) return;
@@ -782,22 +800,29 @@
     };
   };
 
-  Player.prototype._ensureSession = function () {
-    if (this.session) return;
+  Player.prototype._newSession = function () {
     var self = this;
-    this.session = new PhotoSession({
+    var session;
+    session = new PhotoSession({
       request: function (id, token) {
         if (window.__castSend) window.__castSend({ type: "fetch", id: id, token: token });
       },
       materialize: function (payload, done) {
+        if (self._injectImage) {
+          var injected = self._injectImage(payload);
+          if (injected) {
+            if (!injected._spsPayload) injected._spsPayload = payload;
+            done(null, injected);
+            return;
+          }
+        }
         materializeJpeg(payload, function (err, img) {
           if (img) img._spsPayload = payload;
           done(err, img);
         });
       },
-      upload: function (img, tile) { return self._uploadTile(img, tile); },
-      // Clearing src after a successful decode fires onerror in Chrome. Drop
-      // the handlers first so that error cannot finish the load a second time.
+      view: function () { return self._lodView(); },
+      upload: function (img, tile) { return self._uploadTile(img, tile, !!session.standby); },
       dropImage: function (img) {
         if (!img) return;
         img.onload = null;
@@ -808,33 +833,101 @@
       },
       release: function (tex) { self._deleteTex(tex); },
       onStatus: function (text) {
-        self._busy = text === "busy";
-        if (text) self._tileDraw = [];
+        if (session.standby) return;
+        self._busy = text === "busy" && !(self._tileDraw && self._tileDraw.length);
         self._markBusy();
-        self.draw();
+        if (!self._busy) self.draw();
       },
       onShown: function (state) {
-        var raw = (state.tiles || []).map(function (piece) { return piece.tile || piece; });
-        if (!coversSphere(raw, state.width, state.height)) {
-          warn("photo does not cover the sphere", state && state.id);
-          self._busy = false;
-          self._markBusy();
+        if (session.standby) {
+          self._preloadBack();
           return;
         }
-        self._tileDraw = state.tiles;
-        self._tileW = state.width;
-        self._tileH = state.height;
-        self._busy = false;
-        self._markBusy();
-        if (window.__castSend) window.__castSend({ type: "photo", id: state.id, ok: true });
-        self.draw();
+        self._presentShown(state);
       },
-      onFail: function () {
-      },
+      onFail: function () {},
       onMemory: function (photoId) {
         warn("full-resolution tile did not upload", photoId);
       },
     });
+    return session;
+  };
+
+  Player.prototype._ensureSession = function () {
+    if (!this.session) this.session = this._newSession();
+  };
+
+  Player.prototype._dropStandby = function () {
+    if (this._standby) this._standby.dispose();
+    if (this._back) this._back.dispose();
+    this._standby = null;
+    this._back = null;
+  };
+
+  Player.prototype._presentShown = function (state) {
+    var resident = (state.tiles || []).filter(function (piece) {
+      return piece.tex && !piece.tex.deferred && !piece.tex._evicted;
+    });
+    if (!resident.length) {
+      this._busy = false;
+      this._markBusy();
+      return;
+    }
+    var covered = coversSphere(
+      resident.map(function (piece) { return piece.tile; }),
+      state.width,
+      state.height,
+    );
+    this._armFade();
+    this._tileDraw = resident;
+    this._tileW = state.width;
+    this._tileH = state.height;
+    this._busy = false;
+    this._markBusy();
+    if (covered && this._awaitingSwap) {
+      this._fullFrameMs = nowMs() - this._switchTick;
+      this._awaitingSwap = false;
+    }
+    if (covered && window.__castSend) window.__castSend({ type: "photo", id: state.id, ok: true });
+    this.draw();
+    if (covered) this._preloadNeighbors();
+  };
+
+  Player.prototype._armFade = function () {
+    if (!this._tileDraw || !this._tileDraw.length) return;
+    this._fadeFrom = this._tileDraw.slice();
+    this._fadeW = this._tileW;
+    this._fadeH = this._tileH;
+    this._fadeMs = 0;
+    this._fading = true;
+    this._kick();
+  };
+
+  Player.prototype._endFade = function () {
+    this._fading = false;
+    this._fadeMs = TILE_FADE_MS;
+    if (this._fadeRelease && this._fadeFrom) {
+      for (var i = 0; i < this._fadeFrom.length; i++) {
+        var tex = this._fadeFrom[i] && this._fadeFrom[i].tex;
+        if (tex) this._deleteTex(tex);
+      }
+    }
+    this._fadeFrom = null;
+    this._fadeRelease = false;
+    if (this.session && this.session.budgetFull) this.session.resume();
+    this._preloadBack();
+  };
+
+  Player.prototype._readySession = function (entry) {
+    var pools = [this._standby, this._back];
+    for (var i = 0; i < pools.length; i++) {
+      var pool = pools[i];
+      if (!pool || !pool.entry || pool.entry.id !== entry.id || !pool.loaded.length) continue;
+      if (i === 0) this._standby = null;
+      else this._back = null;
+      return pool;
+    }
+    return null;
   };
 
   Player.prototype._openCurrent = function () {
@@ -842,17 +935,97 @@
     var entry = this.entries && this.entries[this.index];
     if (!entry) return;
     this._ensureSession();
-    this._tileDraw = [];
     this._lodHold = null;
     this._promoting = false;
+    this._switchTick = nowMs();
+    var ready = this._readySession(entry);
+    if (ready) {
+      this._awaitingSwap = true;
+      var previous = this.session;
+      ready.standby = false;
+      this.session = ready;
+      if (previous && previous !== ready) {
+        this._armFade();
+        var fit = (this._gpuBytes || 0) <= GPU_CAP;
+        previous.standby = true;
+        previous.quietStop();
+        if (fit && previous.loaded && previous.loaded.length) {
+          this._back = previous;
+          this._fadeRelease = false;
+        } else {
+          previous.live = [];
+          this._fadeRelease = true;
+        }
+      }
+      this._presentShown({
+        id: entry.id,
+        width: entry.width,
+        height: entry.height,
+        tiles: ready.loaded.slice(),
+      });
+      if (ready.budgetFull || !ready.shown) ready.resume();
+      return;
+    }
+    this._awaitingSwap = false;
+    this._armFade();
+    if (this._fadeFrom && this._fadeFrom.length && this.session) {
+      this.session.live = [];
+      this._fadeRelease = true;
+    }
     this.session.open(entry);
   };
 
+  Player.prototype._preloadNeighbors = function () {
+    if (!this._useTiles || !this.entries || this.entries.length < 2) return;
+    var nextAt = stepIndex(this.index, this.entries.length, 1, true);
+    if (nextAt == null) return;
+    var entry = this.entries[nextAt];
+    if (!entry || !entry.tiles || !entry.tiles.length) return;
+    if (this.session && this.session.entry && this.session.entry.id === entry.id) return;
+    if (this._back && this._back.entry && this._back.entry.id === entry.id) return;
+    if (!this._standby) this._standby = this._newSession();
+    this._standby.preload(entry);
+  };
+
+  Player.prototype._preloadBack = function () {
+    if (!this._useTiles || !this.entries || this.entries.length < 2) return;
+    var prevAt = stepIndex(this.index, this.entries.length, -1, true);
+    var nextAt = stepIndex(this.index, this.entries.length, 1, true);
+    if (prevAt == null || prevAt === nextAt) return;
+    var entry = this.entries[prevAt];
+    if (!entry || !entry.tiles) return;
+    if (this._back && this._back.entry && this._back.entry.id === entry.id) return;
+    if (this.session && this.session.entry && this.session.entry.id === entry.id) return;
+    var room = Math.max(0, GPU_CAP - (this._gpuBytes || 0));
+    var one = 0;
+    var tile = entry.tiles[0];
+    if (tile) one = (tile.texW || tile.srcW || 1) * (tile.texH || tile.srcH || 1) * 4;
+    if (room < one) return;
+    if (!this._back) this._back = this._newSession();
+    this._back.preload(entry);
+  };
+
   Player.prototype.noteChunk = function (msg) {
+    if (this._standby && this._standby.accepts(msg)) {
+      this._standby.noteChunk(msg);
+      return;
+    }
+    if (this._back && this._back.accepts(msg)) {
+      this._back.noteChunk(msg);
+      return;
+    }
     if (this.session) this.session.noteChunk(msg);
   };
 
   Player.prototype.noteFetchError = function (msg) {
+    if (this._standby && this._standby.accepts(msg)) {
+      this._standby.noteFetchError(msg);
+      return;
+    }
+    if (this._back && this._back.accepts(msg)) {
+      this._back.noteFetchError(msg);
+      return;
+    }
     if (this.session) this.session.noteFetchError(msg);
   };
 
@@ -970,7 +1143,7 @@
     return max;
   };
 
-  Player.prototype._uploadTile = function (img, tile) {
+  Player.prototype._uploadTile = function (img, tile, standby) {
     if (this._glLost || !this._gl) this._setup();
     var gl = this._gl;
     if (!gl || (gl.isContextLost && gl.isContextLost())) {
@@ -980,6 +1153,12 @@
     if (!img) throw new Error("no image");
     var maxEdge = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 4096;
     var budget = this._gpuBudget == null ? Infinity : this._gpuBudget;
+    if (standby) {
+      if ((this._gpuBytes || 0) + ((img.width || (tile && tile.texW) || 1) * (img.height || (tile && tile.texH) || 1) * 4) > GPU_CAP) {
+        return this._deferred(img, tile);
+      }
+      budget = Infinity;
+    }
     var entry = this.session && this.session.entry;
     var view = this._lodView();
     var slot = null;
@@ -1130,7 +1309,7 @@
   };
 
   Player.prototype._installTileProgram = function (gl) {
-    var sources = this._sources || glSources(this._webgl2, this._prec || "highp");
+    var sources = this._sources || glSources(this._webgl2, this._prec || "highp", this._grad !== false);
     var prog = compileProgram(gl, sources.tileVs, sources.tileFs);
     if (!prog) return;
     this._tileProg = prog;
@@ -1149,6 +1328,7 @@
       srcH: gl.getUniformLocation(prog, "uSrcH"),
       texW: gl.getUniformLocation(prog, "uTexW"),
       texH: gl.getUniformLocation(prog, "uTexH"),
+      alpha: gl.getUniformLocation(prog, "uAlpha"),
     };
     gl.useProgram(this._prog);
   };
@@ -1186,23 +1366,39 @@
     var pose = this.poses[this.index] || ZERO_POSE;
     gl.uniform1f(loc.pitch, pose.pitch);
     gl.uniform1f(loc.roll, pose.roll);
-    var spanW = this._tileW || 1;
-    var spanH = this._tileH || 1;
-    for (var i = 0; i < drawable.length; i++) {
-      var tile = drawable[i].spec;
-      gl.uniform1f(loc.u0, tile.srcX / spanW);
-      gl.uniform1f(loc.u1, (tile.srcX + tile.srcW) / spanW);
-      gl.uniform1f(loc.v0, tile.srcY / spanH);
-      gl.uniform1f(loc.v1, (tile.srcY + tile.srcH) / spanH);
-      gl.uniform1f(loc.padL, tile.padL || 0);
-      gl.uniform1f(loc.padT, tile.padT || 0);
-      gl.uniform1f(loc.srcW, tile.srcW);
-      gl.uniform1f(loc.srcH, tile.srcH);
-      gl.uniform1f(loc.texW, drawable[i].tex._uploadW || tile.texW);
-      gl.uniform1f(loc.texH, drawable[i].tex._uploadH || tile.texH);
-      gl.uniform1i(loc.tex, 0);
-      bindTex(gl, gl.TEXTURE0, drawable[i].tex);
-      this._drawMesh(gl);
+    var self = this;
+    function paint(list, spanW, spanH, alpha) {
+      if (loc.alpha) gl.uniform1f(loc.alpha, alpha);
+      for (var i = 0; i < list.length; i++) {
+        var piece = list[i];
+        var tex = piece.tex;
+        var tile = piece.spec || piece.tile;
+        if (!tex || tex.deferred || tex._evicted || !tile) continue;
+        gl.uniform1f(loc.u0, tile.srcX / spanW);
+        gl.uniform1f(loc.u1, (tile.srcX + tile.srcW) / spanW);
+        gl.uniform1f(loc.v0, tile.srcY / spanH);
+        gl.uniform1f(loc.v1, (tile.srcY + tile.srcH) / spanH);
+        gl.uniform1f(loc.padL, tile.padL || 0);
+        gl.uniform1f(loc.padT, tile.padT || 0);
+        gl.uniform1f(loc.srcW, tile.srcW);
+        gl.uniform1f(loc.srcH, tile.srcH);
+        gl.uniform1f(loc.texW, tex._uploadW || tile.texW);
+        gl.uniform1f(loc.texH, tex._uploadH || tile.texH);
+        gl.uniform1i(loc.tex, 0);
+        bindTex(gl, gl.TEXTURE0, tex);
+        self._drawMesh(gl);
+      }
+    }
+    gl.disable(gl.BLEND);
+    paint(drawable, this._tileW || 1, this._tileH || 1, 1);
+    if (this._fading && this._fadeFrom && this._fadeFrom.length) {
+      var cover = 1 - Math.max(0, Math.min(1, (this._fadeMs || 0) / TILE_FADE_MS));
+      if (cover > 0.001) {
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        paint(this._fadeFrom, this._fadeW || this._tileW || 1, this._fadeH || this._tileH || 1, cover);
+        gl.disable(gl.BLEND);
+      }
     }
     this._presented = true;
     gl.useProgram(this._prog);
@@ -1517,7 +1713,77 @@
     return "mediump";
   }
 
-  function glSources(webgl2, precision) {
+  function tileFragment(webgl2, precision, grad, vary, outDecl, color, pose) {
+    var prec = precision === "mediump" ? "mediump" : "highp";
+    var head = webgl2 ? "#version 300 es\nprecision highp float;\n" : "precision " + prec + " float;\n";
+    var useGrad = webgl2 || grad;
+    if (!webgl2 && grad) {
+      head = "#extension GL_OES_standard_derivatives : enable\n" +
+        "#extension GL_EXT_shader_texture_lod : enable\n" + head;
+    }
+    var sampleExpr = webgl2 ? "textureGrad(uTex,st,dstDx,dstDy)" : "texture2DGradEXT(uTex,st,dstDx,dstDy)";
+    var body = useGrad
+      ? "  vec3 dir=poseToCamera(normalize(vObj),uPitch,uRoll);\n" +
+        "  float lon=length(dir.xz)<1e-5?0.0:atan(dir.x,-dir.z);\n" +
+        "  float lat=asin(clamp(dir.y,-1.0,1.0));\n" +
+        "  float u=fract(0.5+lon/TWO_PI);\n" +
+        "  float v=clamp(0.5-lat/PI,0.0,1.0);\n" +
+        "  float spanU=max(uU1-uU0,1e-6);\n" +
+        "  float spanV=max(uV1-uV0,1e-6);\n" +
+        "  float sx=(u-uU0)/spanU;\n" +
+        "  float sy=(v-uV0)/spanV;\n" +
+        "  float dLonX=dFdx(lon);float dLonY=dFdy(lon);\n" +
+        "  dLonX=mod(dLonX+PI,TWO_PI)-PI;\n" +
+        "  dLonY=mod(dLonY+PI,TWO_PI)-PI;\n" +
+        "  float dLatX=dFdx(lat);float dLatY=dFdy(lat);\n" +
+        "  float kx=(uSrcW/max(uTexW,1.0))/spanU/TWO_PI;\n" +
+        "  float ky=-(uSrcH/max(uTexH,1.0))/spanV/PI;\n" +
+        "  vec2 dstDx=vec2(kx*dLonX,ky*dLatX);\n" +
+        "  vec2 dstDy=vec2(kx*dLonY,ky*dLatY);\n" +
+        "  vec2 st=vec2((uPadL+sx*uSrcW)/max(uTexW,1.0),(uPadT+sy*uSrcH)/max(uTexH,1.0));\n" +
+        "  float padR=max(uTexW-uPadL-uSrcW,0.0);\n" +
+        "  float padB=max(uTexH-uPadT-uSrcH,0.0);\n" +
+        "  float roomX=max(min(uPadL,padR),0.5);\n" +
+        "  float roomY=max(min(uPadT,padB),0.5);\n" +
+        "  float texelX=st.x*uTexW;float texelY=st.y*uTexH;\n" +
+        "  roomX=min(roomX,max(min(texelX,uTexW-texelX),0.5));\n" +
+        "  roomY=min(roomY,max(min(texelY,uTexH-texelY),0.5));\n" +
+        "  vec2 tdx=dstDx*vec2(uTexW,uTexH);\n" +
+        "  vec2 tdy=dstDy*vec2(uTexW,uTexH);\n" +
+        "  float extX=max(abs(tdx.x),abs(tdy.x));\n" +
+        "  float extY=max(abs(tdx.y),abs(tdy.y));\n" +
+        "  float lim=min(extX>roomX?roomX/max(extX,1e-6):1.0,extY>roomY?roomY/max(extY,1e-6):1.0);\n" +
+        "  dstDx*=lim;dstDy*=lim;\n" +
+        "  vec2 halfTex=vec2(0.5/max(uTexW,1.0),0.5/max(uTexH,1.0));\n" +
+        "  st=clamp(st,halfTex,vec2(1.0)-halfTex);\n" +
+        "  " + color + "=" + sampleExpr + ";\n" +
+        "  " + color + ".a*=uAlpha;\n" +
+        "  float slopU=0.5*spanU/max(uSrcW,1.0);\n" +
+        "  float slopV=0.5*spanV/max(uSrcH,1.0);\n" +
+        "  if(u<uU0-slopU||u>uU1+slopU||v<uV0-slopV||v>uV1+slopV) discard;\n"
+      : "  vec2 uv=equirectUv(poseToCamera(normalize(vObj),uPitch,uRoll));\n" +
+        "  float spanU=max(uU1-uU0,1e-6);\n" +
+        "  float spanV=max(uV1-uV0,1e-6);\n" +
+        "  float sx=(uv.x-uU0)/spanU;\n" +
+        "  float sy=(uv.y-uV0)/spanV;\n" +
+        "  vec2 st=vec2((uPadL+sx*uSrcW)/max(uTexW,1.0),(uPadT+sy*uSrcH)/max(uTexH,1.0));\n" +
+        "  vec2 halfTex=vec2(0.5/max(uTexW,1.0),0.5/max(uTexH,1.0));\n" +
+        "  st=clamp(st,halfTex,vec2(1.0)-halfTex);\n" +
+        "  " + color + "=" + (webgl2 ? "texture" : "texture2D") + "(uTex,st);\n" +
+        "  " + color + ".a*=uAlpha;\n" +
+        "  float slopU=0.5*spanU/max(uSrcW,1.0);\n" +
+        "  float slopV=0.5*spanV/max(uSrcH,1.0);\n" +
+        "  if(uv.x<uU0-slopU||uv.x>uU1+slopU||uv.y<uV0-slopV||uv.y>uV1+slopV) discard;\n";
+    return head + vary + " vec3 vObj;\n" + outDecl +
+      "uniform sampler2D uTex;\n" +
+      "uniform float uPitch;uniform float uRoll;uniform float uAlpha;\n" +
+      "uniform float uU0;uniform float uU1;uniform float uV0;uniform float uV1;\n" +
+      "uniform float uPadL;uniform float uPadT;uniform float uSrcW;uniform float uSrcH;uniform float uTexW;uniform float uTexH;\n" +
+      "const float PI=3.141592653589793;const float TWO_PI=6.283185307179586;\n" +
+      pose + "\nvoid main(){\n" + body + "}";
+  }
+
+  function glSources(webgl2, precision, grad) {
     var prec = precision === "mediump" ? "mediump" : "highp";
     var sample = webgl2 ? "texture" : "texture2D";
     var vary = webgl2 ? "in" : "varying";
@@ -1555,20 +1821,7 @@
         "  if(" + color + ".a<0.05)" + color + "=vec4(0.04,0.05,0.07,1.0);\n" +
         "}",
       tileVs: version + vsIn + " vec3 aPos;uniform mat4 uMvp;" + vsOut + " vec3 vObj;void main(){vObj=aPos;gl_Position=uMvp*vec4(aPos,1.0);}",
-      tileFs: head + vary + " vec3 vObj;\n" + outDecl +
-        "uniform sampler2D uTex;\n" +
-        "uniform float uPitch;uniform float uRoll;\n" +
-        "uniform float uU0;uniform float uU1;uniform float uV0;uniform float uV1;\n" +
-        "uniform float uPadL;uniform float uPadT;uniform float uSrcW;uniform float uSrcH;uniform float uTexW;uniform float uTexH;\n" +
-        "const float PI=3.141592653589793;const float TWO_PI=6.283185307179586;\n" +
-        pose + "\nvoid main(){\n" +
-        "  vec2 uv=equirectUv(poseToCamera(normalize(vObj),uPitch,uRoll));\n" +
-        "  if(uv.x<uU0||uv.x>uU1||uv.y<uV0||uv.y>uV1) discard;\n" +
-        "  float sx=(uv.x-uU0)/max(uU1-uU0,1e-6);\n" +
-        "  float sy=(uv.y-uV0)/max(uV1-uV0,1e-6);\n" +
-        "  vec2 st=vec2((uPadL+sx*uSrcW)/uTexW,(uPadT+sy*uSrcH)/uTexH);\n" +
-        "  " + color + "=" + sample + "(uTex,st);\n" +
-        "}",
+      tileFs: tileFragment(webgl2, precision, grad, vary, outDecl, color, pose),
     };
   }
 
@@ -1740,6 +1993,10 @@
 
   PhotoSession.prototype.open = function (entry) {
     this.dispose();
+    this.standby = false;
+    this.budgetFull = false;
+    this.tileOrder = null;
+    this.orderPos = 0;
     this.entry = entry;
     this.tileIndex = 0;
     this.attempt = 0;
@@ -1753,11 +2010,62 @@
     this._requestCurrent();
   };
 
+  PhotoSession.prototype.preload = function (entry) {
+    if (!entry || !entry.tiles || !entry.tiles.length) return;
+    if (this.entry && this.entry.id === entry.id && (this.loaded.length || this.pending)) return;
+    this.dispose();
+    this.standby = true;
+    this.budgetFull = false;
+    this.entry = entry;
+    this.tileIndex = 0;
+    this.orderPos = 0;
+    this.attempt = 1;
+    this.loaded = [];
+    this.shown = false;
+    var view = this.hooks.view ? this.hooks.view() : { u: 0.5, v: 0.5, halfU: 0.2, halfV: 0.2 };
+    this.tileOrder = tileLoadOrder(entry.tiles, entry.width, entry.height, view);
+    this._requestCurrent();
+  };
+
+  PhotoSession.prototype.accepts = function (msg) {
+    if (!msg || msg.id == null) return false;
+    var box = this.assemblers[msg.id];
+    if (!box || box.gen !== this.generation) return false;
+    if (msg.token == null) return true;
+    return (msg.token | 0) === box.token;
+  };
+
+  PhotoSession.prototype.quietStop = function () {
+    this.generation += 1;
+    this.token += 1;
+    this.pending = null;
+    this.assemblers = {};
+    this.budgetFull = false;
+  };
+
+  PhotoSession.prototype.resume = function () {
+    if (!this.entry || this.pending) return;
+    if (!this.budgetFull && this.shown) return;
+    this.budgetFull = false;
+    this.standby = false;
+    var done = this.tileOrder ? this.orderPos >= this.tileOrder.length : this.tileIndex >= this.entry.tiles.length;
+    if (done) return;
+    this._requestCurrent();
+  };
+
   PhotoSession.prototype._requestCurrent = function () {
     var entry = this.entry;
-    if (!entry || !entry.tiles) return;
-    var tile = entry.tiles[this.tileIndex];
+    if (!entry || !entry.tiles || this.budgetFull) return;
+    var index = this.tileOrder ? this.tileOrder[this.orderPos] : this.tileIndex;
+    if (index == null || index < 0) return;
+    var tile = entry.tiles[index];
     if (!tile) return;
+    if (this.loaded.some(function (piece) { return piece.tile && piece.tile.id === tile.id && piece.tex && !piece.tex.deferred; })) {
+      if (this.tileOrder) this.orderPos += 1;
+      else this.tileIndex += 1;
+      this._requestCurrent();
+      return;
+    }
     this.token += 1;
     var token = this.token;
     this.assemblers[tile.id] = {
@@ -1777,10 +2085,10 @@
   PhotoSession.prototype.noteChunk = function (msg) {
     if (!msg || msg.id == null) return;
     var box = this.assemblers[msg.id];
-    if (!box || box.gen !== this.generation || box.token !== this.token) return;
-    // A chunk that names a token has to be the transfer this tile asked for.
-    // Photo 1's leftover pieces reuse the id when the phone resets its counter,
-    // and a different n leaves this assembler waiting forever.
+    if (!box || box.gen !== this.generation) return;
+    // The token is the one this tile asked for. It is not "whatever the
+    // showing photo requested last": a neighbor preloaded in the background
+    // keeps its own token, and those chunks are not a stale transfer.
     if (msg.token != null && (msg.token | 0) !== box.token) return;
     var index = msg.i | 0;
     var count = msg.n | 0;
@@ -1800,7 +2108,8 @@
   PhotoSession.prototype.noteFetchError = function (msg) {
     if (!msg) return;
     var box = this.assemblers[msg.id];
-    if (!box || box.gen !== this.generation || box.token !== this.token) return;
+    if (!box || box.gen !== this.generation) return;
+    if (msg.token != null && (msg.token | 0) !== box.token) return;
     this._failOrRetry(msg.message || "fetch");
   };
 
@@ -1843,20 +2152,36 @@
       self.live.push(tex);
       self.loaded.push({ tex: tex, tile: box.tile, payload: image._spsPayload || null });
       self.pending = null;
-      self.tileIndex += 1;
-      if (!self.entry || self.tileIndex >= self.entry.tiles.length) {
+      if (self.tileOrder) self.orderPos += 1;
+      else self.tileIndex += 1;
+      var deferred = !!(tex.deferred || tex._evicted);
+      if (deferred && self.standby) {
+        self.budgetFull = true;
+        return;
+      }
+      var finished = !self.entry || (self.tileOrder
+        ? self.orderPos >= self.tileOrder.length
+        : self.tileIndex >= self.entry.tiles.length);
+      if (finished) {
+        var resident = self.loaded.filter(function (piece) {
+          return piece.tex && !piece.tex.deferred && !piece.tex._evicted;
+        });
         var covered = self.entry && coversSphere(
-          self.loaded.map(function (piece) { return piece.tile; }),
+          resident.map(function (piece) { return piece.tile; }),
           self.entry.width,
           self.entry.height,
         );
         if (!covered) {
+          if (self.standby) {
+            self.budgetFull = true;
+            return;
+          }
           self.attempt = 1;
           self._failOrRetry("coverage");
           return;
         }
         self.shown = true;
-        if (self.hooks.onStatus) self.hooks.onStatus("");
+        if (self.hooks.onStatus && !self.standby) self.hooks.onStatus("");
         if (self.hooks.onShown) {
           self.hooks.onShown({
             id: self.entry.id,
@@ -2163,11 +2488,102 @@
     };
   }
 
+  function nowMs() {
+    if (root.performance && root.performance.now) return root.performance.now();
+    return Date.now();
+  }
+
+  function tileLoadOrder(tiles, width, height, view) {
+    var order = [];
+    for (var i = 0; i < tiles.length; i++) {
+      var tile = tiles[i];
+      var u0 = tile.srcX / width;
+      var u1 = (tile.srcX + tile.srcW) / width;
+      var v0 = tile.srcY / height;
+      var v1 = (tile.srcY + tile.srcH) / height;
+      var contains = view.u >= u0 && view.u <= u1 && view.v >= v0 && view.v <= v1;
+      var dist = uDist((u0 + u1) / 2, view.u) + Math.abs((v0 + v1) / 2 - view.v);
+      order.push({ index: i, contains: contains, dist: dist });
+    }
+    order.sort(function (a, b) {
+      if (a.contains !== b.contains) return a.contains ? -1 : 1;
+      if (a.dist !== b.dist) return a.dist - b.dist;
+      return a.index - b.index;
+    });
+    return order.map(function (item) { return item.index; });
+  }
+
+  function standbyAllowance(cap, used) {
+    return Math.max(0, cap - (used || 0));
+  }
+
+  function receiverStartup() {
+    return {
+      disableIdleTimeout: true,
+      maxInactivity: 86400,
+      skipMplLoad: false,
+      streamType: "LIVE",
+      heartbeatMs: IDLE_HEARTBEAT_MS,
+      contentId: "spsphere-show",
+    };
+  }
+
+  function IdleGuard(clock) {
+    this.clock = clock || function () { return Date.now(); };
+    this.state = "IDLE";
+    this.shown = false;
+    this.paused = false;
+    this.lastStatus = 0;
+    this.sent = 0;
+  }
+
+  IdleGuard.prototype.show = function () {
+    this.shown = true;
+    this.state = this.paused ? "PAUSED" : "PLAYING";
+    this.lastStatus = this.clock();
+  };
+
+  IdleGuard.prototype.play = function () {
+    this.paused = false;
+    if (this.shown) this.state = "PLAYING";
+  };
+
+  IdleGuard.prototype.pause = function () {
+    this.paused = true;
+    if (this.shown) this.state = "PAUSED";
+  };
+
+  IdleGuard.prototype.stop = function () {
+    this.shown = false;
+    this.state = "IDLE";
+  };
+
+  IdleGuard.prototype.touch = function () {
+    this.lastStatus = this.clock();
+    if (this.shown) this.state = this.paused ? "PAUSED" : "PLAYING";
+  };
+
+  IdleGuard.prototype.tick = function () {
+    if (!this.shown) return false;
+    var t = this.clock();
+    if (t - this.lastStatus < IDLE_HEARTBEAT_MS) return false;
+    this.lastStatus = t;
+    this.state = this.paused ? "PAUSED" : "PLAYING";
+    this.sent += 1;
+    return true;
+  };
+
   root.SpsphereCast = {
     ROTATIONS: ROTATIONS,
     DEFAULT_DPS: DEFAULT_DPS,
     CROSSFADE_MS: CROSSFADE_MS,
+    TILE_FADE_MS: TILE_FADE_MS,
+    GPU_CAP: GPU_CAP,
     OMEGA: OMEGA,
+    tileLoadOrder: tileLoadOrder,
+    standbyAllowance: standbyAllowance,
+    receiverStartup: receiverStartup,
+    IdleGuard: IdleGuard,
     decodeAim: decodeAim,
     decodeSkip: decodeSkip,
     stepIndex: stepIndex,

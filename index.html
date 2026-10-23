@@ -107,14 +107,25 @@
         player.gotoId(msg.id);
       } else if (msg.type === "play") {
         player.play();
+        try { if (window.__playerManager) window.__playerManager.play(); } catch (e) {}
+        if (window.__idle) { window.__idle.play(); window.__idle.show(); }
       } else if (msg.type === "pause") {
         player.pause(!!msg.held);
+        try { if (window.__playerManager) window.__playerManager.pause(); } catch (e) {}
+        if (window.__idle) { window.__idle.pause(); window.__idle.show(); }
       } else if (msg.type === "next") {
         player.next();
       } else if (msg.type === "previous") {
         player.previous();
       } else if (msg.type === "stop") {
         player.stop();
+        if (window.__idle) window.__idle.stop();
+      } else if (msg.type === "heartbeat") {
+        if (window.__idle) {
+          if (!window.__idle.shown && player.items && player.items.length) window.__idle.show();
+          window.__idle.touch();
+        }
+        window.__castSend({ type: "heartbeat", state: window.__idle ? window.__idle.state : "PLAYING" });
       } else if (msg.type === "speed") {
         player.setSpeed(msg.speed);
       } else if (msg.type === "aim") {
@@ -162,14 +173,42 @@
     function onCastMessage(event) {
       try { handle(event && event.data); } catch (e) {}
     }
+    var startup = SpsphereCast.receiverStartup();
     var options = new cast.framework.CastReceiverOptions();
-    options.disableIdleTimeout = true;
-    options.maxInactivity = 21600;
+    options.disableIdleTimeout = startup.disableIdleTimeout;
+    options.maxInactivity = startup.maxInactivity;
     options.customNamespaces = {};
     options.customNamespaces[NAMESPACE] = cast.framework.system.MessageType.JSON;
-    options.skipMplLoad = true;
+    options.skipMplLoad = startup.skipMplLoad;
     context.addCustomMessageListener(NAMESPACE, onCastMessage);
     context.start(options);
+    try {
+      var playerManager = context.getPlayerManager();
+      window.__playerManager = playerManager;
+      var messages = cast.framework.messages;
+      var media = new messages.MediaInformation();
+      media.contentId = startup.contentId;
+      media.contentType = "application/vnd.spsphere.show";
+      media.streamType = messages.StreamType[startup.streamType];
+      var loadRequest = new messages.LoadRequestData();
+      loadRequest.media = media;
+      loadRequest.autoplay = true;
+      playerManager.load(loadRequest);
+    } catch (e) {}
+    window.__idle = new SpsphereCast.IdleGuard(function () { return Date.now(); });
+    setInterval(function () {
+      var guard = window.__idle;
+      if (!guard) return;
+      if (!player.items || !player.items.length) {
+        guard.stop();
+        return;
+      }
+      if (!guard.shown) guard.show();
+      if (player.playing) guard.play();
+      else guard.pause();
+      if (!guard.tick()) return;
+      window.__castSend({ type: "heartbeat", state: guard.state });
+    }, 1000);
     sendLimits();
   </script>
 </body>
