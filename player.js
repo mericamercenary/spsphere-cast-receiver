@@ -1760,6 +1760,8 @@
     this.items[at] = entry.url;
     this.poses[at] = poseOf(entry);
     if (at === this.index) this._openCurrent();
+    else if (this._awaitingSwap && this._awaitIndex === at) this._requestIndex(at);
+    else this._preloadNeighbors();
   };
 
   Player.prototype._texImage = function (gl, source) {
