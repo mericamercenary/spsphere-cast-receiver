@@ -197,7 +197,17 @@
       context.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, function () {
         var senders = [];
         try { senders = context.getSenders() || []; } catch (e) {}
-        if (!senders.length) player.onSenderGone("sender-disconnected");
+        if (senders.length) {
+          player._disconnectGrace = 0;
+          return;
+        }
+        // Backgrounding the phone can drop the sender for a moment while Cast
+        // hands the session to the reconnection service. The show stays up
+        // until the silence window, and a heartbeat cancels this.
+        if (!player._disconnectGrace) {
+          player._disconnectGrace = Date.now();
+          if (player._logSwitch) player._logSwitch("sender-disconnect", "grace");
+        }
       });
     } catch (e) {}
     context.start(options);
@@ -225,6 +235,10 @@
       if (!guard.shown) guard.show();
       if (player.playing) guard.play();
       else guard.pause();
+      if (player._disconnectGrace && Date.now() - player._disconnectGrace > SpsphereCast.SENDER_TIMEOUT_MS) {
+        player.onSenderGone("sender-disconnected");
+        return;
+      }
       if (player.senderTimedOut(Date.now())) {
         player.onSenderGone("heartbeat-timeout");
         return;
