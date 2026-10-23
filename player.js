@@ -122,6 +122,16 @@
     this._resident = [];
     this._lodHold = null;
     this._promoting = false;
+    this._frameDts = [];
+    this._maxUploadsPerFrame = 0;
+    this._uploadsThisFrame = 0;
+    this._uploadQueue = [];
+    this._decodeQueue = [];
+    this._decodeBusy = false;
+    this._timeoutAcc = 0;
+    this._holdFrame = false;
+    this._awaitingSwap = false;
+    this._awaitIndex = null;
     this._glLost = false;
     this._glHooks = false;
     this.session = null;
@@ -186,8 +196,13 @@
     var self = this;
     if (this.session) this.session.dispose();
     this._dropStandby();
+    this._clearQueues();
     this._fading = false;
     this._fadeFrom = null;
+    this._fadeRelease = false;
+    this._holdFrame = false;
+    this._awaitingSwap = false;
+    this._awaitIndex = null;
     this._tileDraw = [];
     this.entries = entries;
     this._useTiles = entries.some(function (entry) { return entry.tiles && entry.tiles.length; });
@@ -299,6 +314,13 @@
   Player.prototype.gotoId = function (id) {
     var at = this.ids.indexOf(String(id));
     if (at < 0) return false;
+    if (this._useTiles && at !== this.index) {
+      this._jumpReset = "keep";
+      var moved = this._requestIndex(at);
+      this._preloadAround();
+      if (!this._holdFrame) this.draw();
+      return moved;
+    }
     this.index = at;
     this.fromIndex = at;
     this.phase = "pan";
@@ -376,8 +398,13 @@
     this._resetAim();
     if (this.session) this.session.dispose();
     this._dropStandby();
+    this._clearQueues();
     this._fading = false;
     this._fadeFrom = null;
+    this._fadeRelease = false;
+    this._holdFrame = false;
+    this._awaitingSwap = false;
+    this._awaitIndex = null;
     this._tileDraw = [];
     this._busy = false;
     this._markBusy();
@@ -392,6 +419,15 @@
     var count = this.items.length;
     var at = stepIndex(this.index, count, delta, count > 1);
     if (at == null) return false;
+    if (this._useTiles) {
+      this._jumpReset = this.manual ? "keep" : "zero";
+      var moved = this._requestIndex(at);
+      this._preloadAround();
+      this._mark();
+      if (!this._holdFrame) this.draw();
+      if (window.__onCastStatus) window.__onCastStatus(this.snapshot());
+      return moved;
+    }
     this.index = at;
     this.fromIndex = at;
     this.phase = "pan";
@@ -482,6 +518,12 @@
     this.fade = 0;
     this.itemDegrees += step;
     if (this.items.length >= 2 && this.itemDegrees >= ROTATIONS * FULL_TURN) {
+      if (this._useTiles) {
+        var nextAt = (this.index + 1) % this.items.length;
+        this._requestIndex(nextAt);
+        this._changed(before);
+        return;
+      }
       this.fromIndex = this.index;
       this.index = (this.index + 1) % this.items.length;
       this.phase = "fade";
@@ -528,6 +570,11 @@
       this._approach(shortest(this._tyaw - this.yaw), this._vy, dt);
       this.yaw = wrap360(this.yaw + this._stepDelta);
       this._vy = this._stepVel;
+    } else if (springSettled(this.pitch, 0, this._vp) &&
+        springSettled(this.roll, 0, this._vr) &&
+        springSettled(this.fov, this._userFov, this._vf)) {
+      // Auto-pan owns yaw. A resting spring must not touch the view.
+      return;
     } else {
       this._tpitch = 0;
       this._troll = 0;
@@ -598,22 +645,87 @@
   Player.prototype._kick = function () {
     var self = this;
     if (this._raf) return;
+    if (typeof requestAnimationFrame !== "function") return;
     var loop = function (t) {
       self._raf = requestAnimationFrame(loop);
       if (!self._last) self._last = t;
       var dt = t - self._last;
       self._last = t;
-      if (dt > 100) dt = 100;
-      if (self._fading) {
-        self._fadeMs = (self._fadeMs || 0) + dt;
-        if (self._fadeMs >= TILE_FADE_MS) self._endFade();
-      }
-      self._ease(dt);
-      if (self.playing && !self.manual) self._integrate(dt);
-      if (self.session) self.session.tick(Date.now());
-      self.draw();
+      self._pumpFrame(dt);
     };
     this._raf = requestAnimationFrame(loop);
+  };
+
+  Player.prototype._pumpFrame = function (dt) {
+    if (dt > 100) dt = 100;
+    if (!(dt > 0)) dt = 0;
+    this._uploadsThisFrame = 0;
+    if (dt > 0) {
+      this._frameDts.push(dt);
+      if (this._frameDts.length > 240) this._frameDts.shift();
+    }
+    if (!this._holdFrame && this._fading) this._fadeMs = (this._fadeMs || 0) + dt;
+    if (this._holdFrame) {
+      if (this.playing && !this.manual && dt > 0) this._integrate(dt);
+    } else {
+      this._ease(dt);
+      if (this.playing && !this.manual) this._integrate(dt);
+    }
+    this._timeoutAcc = (this._timeoutAcc || 0) + dt;
+    if (this._timeoutAcc >= 1000) {
+      this._timeoutAcc -= 1000;
+      var now = Date.now();
+      if (this.session) this.session.tick(now);
+      if (this._standby) this._standby.tick(now);
+      if (this._back) this._back.tick(now);
+    }
+    if (!this._holdFrame) this.draw();
+    if (this._fading && this._fadeMs >= TILE_FADE_MS) this._endFade();
+    this._pumpGpu();
+  };
+
+  Player.prototype._clearQueues = function () {
+    this._uploadQueue = [];
+    this._decodeQueue = [];
+    this._decodeBusy = false;
+  };
+
+  Player.prototype._enqueueUpload = function (img, tile, standby, done) {
+    if (!this._uploadQueue) this._uploadQueue = [];
+    this._uploadQueue.push({ img: img, tile: tile, standby: !!standby, done: done });
+    this._kick();
+  };
+
+  Player.prototype._enqueueDecode = function (payload, done) {
+    if (!this._decodeQueue) this._decodeQueue = [];
+    this._decodeQueue.push({ payload: payload, done: done });
+    this._kick();
+  };
+
+  Player.prototype._pumpGpu = function () {
+    // One main-thread stall per frame. A tile upload and a JPEG decode
+    // both hitch the pan, so a frame does not do both.
+    if (this._uploadQueue && this._uploadQueue.length) {
+      var job = this._uploadQueue.shift();
+      this._uploadsThisFrame = 1;
+      if (this._uploadsThisFrame > this._maxUploadsPerFrame) this._maxUploadsPerFrame = this._uploadsThisFrame;
+      var tex = null;
+      try {
+        tex = this._uploadTile(job.img, job.tile, job.standby);
+      } catch (error) {
+        warn("texture upload failed", error && error.message);
+      }
+      if (job.done) job.done(tex);
+      return;
+    }
+    if (this._decodeBusy || !this._decodeQueue || !this._decodeQueue.length) return;
+    var decode = this._decodeQueue.shift();
+    this._decodeBusy = true;
+    var self = this;
+    materializeJpeg(decode.payload, function (err, img) {
+      self._decodeBusy = false;
+      if (decode.done) decode.done(err, img);
+    });
   };
 
   Player.prototype._setup = function () {
@@ -816,17 +928,26 @@
             return;
           }
         }
-        materializeJpeg(payload, function (err, img) {
-          if (img) img._spsPayload = payload;
+        self._enqueueDecode(payload, function (err, img) {
+          if (img && !img._spsPayload) img._spsPayload = payload;
           done(err, img);
         });
       },
       view: function () { return self._lodView(); },
-      upload: function (img, tile) { return self._uploadTile(img, tile, !!session.standby); },
+      upload: function (img, tile, done) {
+        if (isGpuSource(img)) {
+          self._enqueueUpload(img, tile, !!session.standby, done);
+          return;
+        }
+        return self._uploadTile(img, tile, !!session.standby);
+      },
       dropImage: function (img) {
         if (!img) return;
         img.onload = null;
         img.onerror = null;
+        try {
+          if (typeof img.close === "function") img.close();
+        } catch (error) {}
         try {
           if (typeof img.src === "string" && img.src) img.src = "";
         } catch (error) {}
@@ -839,7 +960,12 @@
         if (!self._busy) self.draw();
       },
       onShown: function (state) {
-        if (session.standby) {
+        var want = self._awaitingSwap && self.entries ? self.entries[self._awaitIndex] : null;
+        if (want && state && state.id === want.id && sessionReady(session)) {
+          self._commitIndex(self._awaitIndex, session);
+          return;
+        }
+        if (session.standby || session === self._standby || session === self._back) {
           self._preloadBack();
           return;
         }
@@ -866,7 +992,7 @@
 
   Player.prototype._presentShown = function (state) {
     var resident = (state.tiles || []).filter(function (piece) {
-      return piece.tex && !piece.tex.deferred && !piece.tex._evicted;
+      return piece.tex && !piece.tex.deferred && !piece.tex._evicted && !piece.tex.oom;
     });
     if (!resident.length) {
       this._busy = false;
@@ -878,19 +1004,28 @@
       state.width,
       state.height,
     );
-    this._armFade();
+    var replacing = this._tileDraw && this._tileDraw.length;
+    if (!covered || (replacing && !resident.every(function (piece) { return piece.tex && piece.tex._mip === true; }))) {
+      // A partial set, or a set whose mipmaps are not resident yet, stays off
+      // the sphere. The photo already on screen keeps drawing.
+      this._busy = false;
+      this._markBusy();
+      return;
+    }
+    if (replacing && state.tiles && resident.length !== state.tiles.length) return;
+    if (!replacing) {
+      // The first photo has nothing to crossfade from.
+    } else {
+      this._armFade();
+    }
     this._tileDraw = resident;
     this._tileW = state.width;
     this._tileH = state.height;
     this._busy = false;
     this._markBusy();
-    if (covered && this._awaitingSwap) {
-      this._fullFrameMs = nowMs() - this._switchTick;
-      this._awaitingSwap = false;
-    }
-    if (covered && window.__castSend) window.__castSend({ type: "photo", id: state.id, ok: true });
-    this.draw();
-    if (covered) this._preloadNeighbors();
+    if (window.__castSend) window.__castSend({ type: "photo", id: state.id, ok: true });
+    if (!this._holdFrame) this.draw();
+    this._preloadNeighbors();
   };
 
   Player.prototype._armFade = function () {
@@ -918,61 +1053,228 @@
     this._preloadBack();
   };
 
-  Player.prototype._readySession = function (entry) {
+  Player.prototype._readyPool = function (id) {
+    var pools = [this._standby, this._back, this.session];
+    for (var i = 0; i < pools.length; i++) {
+      var pool = pools[i];
+      if (!pool || !pool.entry || pool.entry.id !== id) continue;
+      if (sessionReady(pool)) return pool;
+    }
+    return null;
+  };
+
+  Player.prototype._incomingPool = function (id) {
     var pools = [this._standby, this._back];
     for (var i = 0; i < pools.length; i++) {
       var pool = pools[i];
-      if (!pool || !pool.entry || pool.entry.id !== entry.id || !pool.loaded.length) continue;
-      if (i === 0) this._standby = null;
-      else this._back = null;
-      return pool;
+      if (!pool || !pool.entry || pool.entry.id !== id) continue;
+      if (!sessionReady(pool)) return pool;
     }
     return null;
+  };
+
+  Player.prototype._ensureIncoming = function (entry) {
+    if (!entry) return;
+    if (this._readyPool(entry.id) || this._incomingPool(entry.id)) return;
+    if (this.session && this.session.entry === entry) return;
+    var standby = this._standby;
+    if (!standby || !standby.entry || (!standby.pending && !(standby.loaded && standby.loaded.length))) {
+      if (standby) standby.dispose();
+      this._standby = this._newSession();
+      this._standby.preload(entry);
+      return;
+    }
+    if (standby.entry.id === entry.id) return;
+    if (!this._back || !this._back.entry || (!this._back.pending && !(this._back.loaded && this._back.loaded.length))) {
+      if (this._back) this._back.dispose();
+      this._back = this._newSession();
+      this._back.preload(entry);
+      return;
+    }
+    if (this._back.entry.id === entry.id) return;
+    this._back.dispose();
+    this._back = this._newSession();
+    this._back.preload(entry);
+  };
+
+  Player.prototype._requestIndex = function (at) {
+    if (at == null || at < 0 || at >= this.items.length) return false;
+    var entry = this.entries && this.entries[at];
+    if (!entry || !this._useTiles) return false;
+    if (at === this.index && !this._awaitingSwap) return false;
+    if (this._awaitingSwap && this._awaitIndex === at) {
+      var readyNow = this._readyPool(entry.id);
+      if (!readyNow) {
+        if (this.playing && !this.manual) this.itemDegrees = ROTATIONS * FULL_TURN;
+        var waiting = this._incomingPool(entry.id);
+        if (!waiting) this._ensureIncoming(entry);
+        else if (waiting.budgetFull && !this._holdFrame) this._considerHold(waiting);
+        else if (!waiting.pending && !waiting.budgetFull) waiting._requestCurrent();
+        return true;
+      }
+    }
+    var pool = this._readyPool(entry.id);
+    this._awaitingSwap = true;
+    this._awaitIndex = at;
+    this._switchTick = nowMs();
+    if (pool) {
+      this._commitIndex(at, pool);
+      return true;
+    }
+    if (this.playing && !this.manual) this.itemDegrees = ROTATIONS * FULL_TURN;
+    this._ensureIncoming(entry);
+    var incoming = this._incomingPool(entry.id);
+    if (incoming && incoming.budgetFull) this._considerHold(incoming);
+    return true;
+  };
+
+  Player.prototype._commitIndex = function (at, pool) {
+    var resetYaw = this._jumpReset === "zero";
+    this._jumpReset = null;
+    this.index = at;
+    this.fromIndex = at;
+    this.phase = "pan";
+    this.fadeMs = 0;
+    this.fade = 0;
+    this.itemDegrees = 0;
+    if (resetYaw) {
+      this.yaw = 0;
+      this._panBlend = 1;
+      this._resetAim();
+    }
+    if (!this.manual && this.items.length) {
+      this.playing = true;
+      this._kick();
+    }
+    this._adoptPool(pool);
+    this._mark();
+    if (window.__onCastStatus) window.__onCastStatus(this.snapshot());
+  };
+
+  Player.prototype._adoptPool = function (pool) {
+    if (!pool || !pool.entry) return;
+    var entry = pool.entry;
+    var held = !!this._holdFrame;
+    this._holdFrame = false;
+    pool.standby = false;
+    pool.budgetFull = false;
+    if (pool === this._standby) this._standby = null;
+    if (pool === this._back) this._back = null;
+    var previous = this.session;
+    this.session = pool;
+    if (!held && this._tileDraw && this._tileDraw.length && previous && previous !== pool) {
+      this._armFade();
+    } else if (held) {
+      this._fading = false;
+      this._fadeFrom = null;
+    }
+    if (previous && previous !== pool) {
+      previous.quietStop();
+      var fit = !held && (this._gpuBytes || 0) <= GPU_CAP && previous.loaded && previous.loaded.length;
+      if (fit) {
+        if (this._back && this._back !== previous) this._back.dispose();
+        previous.standby = true;
+        this._back = previous;
+        this._fadeRelease = false;
+      } else {
+        previous.live = [];
+        this._fadeRelease = !held && !!(this._fadeFrom && this._fadeFrom.length);
+      }
+    } else {
+      this._fadeRelease = false;
+    }
+    var resident = [];
+    var loaded = pool.loaded || [];
+    for (var i = 0; i < loaded.length; i++) {
+      if (pieceReady(loaded[i])) resident.push(loaded[i]);
+    }
+    this._tileDraw = resident;
+    this._tileW = entry.width;
+    this._tileH = entry.height;
+    this._busy = false;
+    this._markBusy();
+    if (this._awaitingSwap) {
+      this._fullFrameMs = nowMs() - (this._switchTick || nowMs());
+      this._awaitingSwap = false;
+      this._awaitIndex = null;
+    }
+    if (!this._holdFrame) this.draw();
+    if (resident.length && window.__castSend) window.__castSend({ type: "photo", id: entry.id, ok: true });
+    this._preloadNeighbors();
+  };
+
+  Player.prototype._considerHold = function (pool) {
+    if (!pool || !pool.budgetFull || sessionReady(pool) || this._holdFrame) return;
+    if ((this._gpuBytes || 0) <= 0) {
+      pool.standby = false;
+      pool.resume();
+      return;
+    }
+    // The last presented frame stays in the drawing buffer. Skip every clear
+    // until the incoming photo is complete, and free the showing textures so
+    // the rest of that photo can upload.
+    this._holdFrame = true;
+    this._releaseShownGpu();
+    pool.standby = false;
+    pool.resume();
+  };
+
+  Player.prototype._releaseShownGpu = function () {
+    var self = this;
+    function dropList(list) {
+      if (!list) return;
+      for (var i = 0; i < list.length; i++) {
+        var tex = list[i] && list[i].tex;
+        if (tex) self._deleteTex(tex);
+      }
+    }
+    dropList(this._tileDraw);
+    dropList(this._fadeFrom);
+    this._tileDraw = [];
+    this._fadeFrom = null;
+    this._fading = false;
+    this._fadeRelease = false;
+    if (this.session) {
+      this.session.live = [];
+      if (this.session.loaded) {
+        this.session.loaded.forEach(function (piece) {
+          if (piece.tex) {
+            piece.tex._evicted = true;
+            piece.tex.deferred = true;
+          }
+        });
+      }
+    }
   };
 
   Player.prototype._openCurrent = function () {
     if (!this._useTiles) return;
     var entry = this.entries && this.entries[this.index];
     if (!entry) return;
-    this._ensureSession();
     this._lodHold = null;
     this._promoting = false;
-    this._switchTick = nowMs();
-    var ready = this._readySession(entry);
-    if (ready) {
-      this._awaitingSwap = true;
-      var previous = this.session;
-      ready.standby = false;
-      this.session = ready;
-      if (previous && previous !== ready) {
-        this._armFade();
-        var fit = (this._gpuBytes || 0) <= GPU_CAP;
-        previous.standby = true;
-        previous.quietStop();
-        if (fit && previous.loaded && previous.loaded.length) {
-          this._back = previous;
-          this._fadeRelease = false;
-        } else {
-          previous.live = [];
-          this._fadeRelease = true;
-        }
-      }
-      this._presentShown({
-        id: entry.id,
-        width: entry.width,
-        height: entry.height,
-        tiles: ready.loaded.slice(),
-      });
-      if (ready.budgetFull || !ready.shown) ready.resume();
+    if (!(this._tileDraw && this._tileDraw.length)) {
+      this._awaitingSwap = false;
+      this._awaitIndex = null;
+      this._ensureSession();
+      this.session.open(entry);
       return;
     }
-    this._awaitingSwap = false;
-    this._armFade();
-    if (this._fadeFrom && this._fadeFrom.length && this.session) {
-      this.session.live = [];
-      this._fadeRelease = true;
+    var ready = this._readyPool(entry.id);
+    if (ready && ready !== this.session) {
+      this._switchTick = nowMs();
+      this._awaitingSwap = true;
+      this._awaitIndex = this.index;
+      this._adoptPool(ready);
+      return;
     }
-    this.session.open(entry);
+    if (this.session && this.session.entry === entry && (this.session.shown || this.session.pending)) return;
+    this._awaitingSwap = true;
+    this._awaitIndex = this.index;
+    this._switchTick = this._switchTick || nowMs();
+    this._ensureIncoming(entry);
+    var incoming = this._incomingPool(entry.id);
+    if (incoming && incoming.budgetFull) this._considerHold(incoming);
   };
 
   Player.prototype._preloadNeighbors = function () {
@@ -1118,6 +1420,7 @@
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
         min = gl.LINEAR_MIPMAP_LINEAR;
         aniso = this._setAniso(gl);
+        tex._mip = true;
       } else if (mipErr) {
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
         warn("mipmap skipped", String(mipErr));
@@ -1127,6 +1430,7 @@
     this._aniso = aniso;
     tex._uploadW = uploadW;
     tex._uploadH = uploadH;
+    if (tex._mip !== true) tex._mip = false;
   };
 
   Player.prototype._setAniso = function (gl) {
@@ -1262,27 +1566,29 @@
     if (!jobs.length) return;
     this._promoting = true;
     var left = jobs.length;
+    function finished() {
+      left -= 1;
+      if (left <= 0) self._promoting = false;
+    }
     jobs.forEach(function (job) {
-      materializeJpeg(job.payload, function (err, img) {
-        left -= 1;
-        if (!err && img && self.session && self.session.entry === entry) {
-          img._spsPayload = job.payload;
-          try {
-            var tex = self._uploadTile(img, job.piece.tile);
-            if (tex && !tex.deferred) {
-              job.piece.tex = tex;
-              job.piece.payload = job.payload;
-              self.session.live.push(tex);
-              self.draw();
-            }
-          } catch (error) {
-            warn("texture upload failed", error && error.message);
-          }
-          if (self.session.hooks.dropImage) self.session.hooks.dropImage(img);
-        } else if (err) {
-          warn("could not reopen a tile", err && err.message);
+      self._enqueueDecode(job.payload, function (err, img) {
+        if (err || !img || !self.session || self.session.entry !== entry) {
+          if (err) warn("could not reopen a tile", err && err.message);
+          if (img && self.session && self.session.hooks.dropImage) self.session.hooks.dropImage(img);
+          finished();
+          return;
         }
-        if (left <= 0) self._promoting = false;
+        img._spsPayload = job.payload;
+        self._enqueueUpload(img, job.piece.tile, false, function (tex) {
+          if (tex && !tex.deferred && self.session && self.session.entry === entry) {
+            job.piece.tex = tex;
+            job.piece.payload = job.payload;
+            self.session.live.push(tex);
+            if (!self._holdFrame) self.draw();
+          }
+          if (self.session && self.session.hooks.dropImage) self.session.hooks.dropImage(img);
+          finished();
+        });
       });
     });
   };
@@ -1340,22 +1646,29 @@
     var w = this.canvas.width;
     var h = this.canvas.height;
     gl.viewport(0, 0, w, h);
-    var tiles = this._tileDraw || [];
-    var drawable = [];
-    for (var n = 0; n < tiles.length; n++) {
-      var piece = tiles[n];
-      if (!piece || !piece.tex || piece.tex.deferred || piece.tex._evicted) continue;
-      var spec = piece.tex._window || piece.tile;
-      if (!spec || spec.srcW < 1 || spec.srcH < 1) continue;
-      drawable.push({ tex: piece.tex, spec: spec });
+    var self = this;
+    function collect(list) {
+      var out = [];
+      if (!list) return out;
+      for (var n = 0; n < list.length; n++) {
+        var piece = list[n];
+        if (!piece || !piece.tex || piece.tex.deferred || piece.tex._evicted) continue;
+        var spec = piece.tex._window || piece.tile;
+        if (!spec || spec.srcW < 1 || spec.srcH < 1) continue;
+        out.push({ tex: piece.tex, spec: spec });
+      }
+      return out;
     }
+    var drawable = collect(this._tileDraw);
+    var oldDrawable = this._fading ? collect(this._fadeFrom) : [];
+    var alphas = compositeAlphas(this._fadeMs, oldDrawable.length > 0, drawable.length > 0);
     // An empty list used to clear the color buffer, so a late load error
     // turned a frame that had already drawn into the background color.
-    if (!this._tileProg || !drawable.length) {
+    if (!this._tileProg || (!drawable.length && !oldDrawable.length)) {
       if (!this._presented) gl.clear(gl.COLOR_BUFFER_BIT);
       return;
     }
-    gl.clear(gl.COLOR_BUFFER_BIT);
+    if (alphas.clear) gl.clear(gl.COLOR_BUFFER_BIT);
     gl.useProgram(this._tileProg);
     this._bindMesh(gl, this._tileProg);
     fillPerspective(this._proj, this.fov, w / Math.max(h, 1), 0.05, 20);
@@ -1366,7 +1679,6 @@
     var pose = this.poses[this.index] || ZERO_POSE;
     gl.uniform1f(loc.pitch, pose.pitch);
     gl.uniform1f(loc.roll, pose.roll);
-    var self = this;
     function paint(list, spanW, spanH, alpha) {
       if (loc.alpha) gl.uniform1f(loc.alpha, alpha);
       for (var i = 0; i < list.length; i++) {
@@ -1390,21 +1702,23 @@
       }
     }
     gl.disable(gl.BLEND);
-    paint(drawable, this._tileW || 1, this._tileH || 1, 1);
-    if (this._fading && this._fadeFrom && this._fadeFrom.length) {
-      var cover = 1 - Math.max(0, Math.min(1, (this._fadeMs || 0) / TILE_FADE_MS));
-      if (cover > 0.001) {
+    if (oldDrawable.length && alphas.oldAlpha > 0) {
+      paint(oldDrawable, this._fadeW || this._tileW || 1, this._fadeH || this._tileH || 1, alphas.oldAlpha);
+    }
+    if (drawable.length && alphas.newAlpha > 0.001) {
+      if (alphas.newAlpha < 0.999) {
         gl.enable(gl.BLEND);
         gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-        paint(this._fadeFrom, this._fadeW || this._tileW || 1, this._fadeH || this._tileH || 1, cover);
-        gl.disable(gl.BLEND);
       }
+      paint(drawable, this._tileW || 1, this._tileH || 1, alphas.newAlpha);
+      gl.disable(gl.BLEND);
     }
     this._presented = true;
     gl.useProgram(this._prog);
   };
 
   Player.prototype.draw = function () {
+    if (this._holdFrame) return;
     resize(this.canvas);
     if (this._mode === "webgl" && this._gl) this._drawGl();
     else this._draw2d();
@@ -1928,22 +2242,36 @@
       }
       done(err, img);
     }
+    var bytes;
     try {
       var binary = atob(payload);
-      var bytes = new Uint8Array(binary.length);
+      bytes = new Uint8Array(binary.length);
       for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i) & 255;
-      var blob = new Blob([bytes], { type: "image/jpeg" });
+    } catch (error) {
+      finish(error);
+      return;
+    }
+    var blob = new Blob([bytes], { type: "image/jpeg" });
+    if (typeof createImageBitmap === "function") {
+      createImageBitmap(blob).then(function (bitmap) {
+        finish(null, bitmap);
+      }).catch(function () {
+        loadImageElement(blob, finish);
+      });
+      return;
+    }
+    loadImageElement(blob, finish);
+  }
+
+  function loadImageElement(blob, finish) {
+    try {
       var url = URL.createObjectURL(blob);
       var img = new Image();
       img.onload = function () {
-        img.onload = null;
-        img.onerror = null;
         URL.revokeObjectURL(url);
         finish(null, img);
       };
       img.onerror = function () {
-        img.onload = null;
-        img.onerror = null;
         URL.revokeObjectURL(url);
         finish(new Error("Couldn't open this photo"));
       };
@@ -2047,7 +2375,6 @@
     if (!this.entry || this.pending) return;
     if (!this.budgetFull && this.shown) return;
     this.budgetFull = false;
-    this.standby = false;
     var done = this.tileOrder ? this.orderPos >= this.tileOrder.length : this.tileIndex >= this.entry.tiles.length;
     if (done) return;
     this._requestCurrent();
@@ -2117,82 +2444,100 @@
     var self = this;
     var token = box.token;
     var gen = box.gen;
+    var accepted = false;
     var settled = false;
     var finish = function (err, image) {
       // Chrome fires onerror when the decoded image's src is cleared. That
       // second callback used to release the textures just drawn and clear
-      // the frame. The first result owns this tile.
-      if (settled) return;
-      settled = true;
+      // the frame. The first result owns this tile. settled waits until the
+      // upload is applied, so an async upload can still land.
+      if (accepted || settled) return;
+      accepted = true;
       if (gen !== self.generation || token !== self.token) {
+        settled = true;
         if (image && self.hooks.dropImage) self.hooks.dropImage(image);
         return;
       }
       if (err || !image) {
+        settled = true;
         if (image && self.hooks.dropImage) self.hooks.dropImage(image);
         self._failOrRetry(err || "load");
         return;
       }
-      var tex = null;
+      function apply(tex) {
+        if (settled) return;
+        settled = true;
+        if (gen !== self.generation || token !== self.token) {
+          if (image && self.hooks.dropImage) self.hooks.dropImage(image);
+          if (tex && self.hooks.release) self.hooks.release(tex);
+          return;
+        }
+        if (image && self.hooks.dropImage) self.hooks.dropImage(image);
+        if (!tex || tex.oom) {
+          if (tex && self.hooks.release) self.hooks.release(tex);
+          self._oom(box.photoId);
+          return;
+        }
+        var deferred = !!(tex.deferred || tex._evicted);
+        self.pending = null;
+        if (deferred && self.standby) {
+          // The cursor stays on this tile. resume() asks for it again
+          // instead of skipping a placeholder that was never uploaded.
+          if (self.hooks.release) self.hooks.release(tex);
+          self.budgetFull = true;
+          return;
+        }
+        if (image._spsPayload && !tex._spsPayload) tex._spsPayload = image._spsPayload;
+        self.live.push(tex);
+        self.loaded.push({ tex: tex, tile: box.tile, payload: image._spsPayload || null });
+        if (self.tileOrder) self.orderPos += 1;
+        else self.tileIndex += 1;
+        var finished = !self.entry || (self.tileOrder
+          ? self.orderPos >= self.tileOrder.length
+          : self.tileIndex >= self.entry.tiles.length);
+        if (finished) {
+          var resident = self.loaded.filter(function (piece) {
+            return piece.tex && !piece.tex.deferred && !piece.tex._evicted;
+          });
+          var covered = self.entry && coversSphere(
+            resident.map(function (piece) { return piece.tile; }),
+            self.entry.width,
+            self.entry.height,
+          );
+          if (!covered) {
+            if (self.standby) {
+              self.budgetFull = true;
+              return;
+            }
+            self.attempt = 1;
+            self._failOrRetry("coverage");
+            return;
+          }
+          self.shown = true;
+          if (self.hooks.onStatus && !self.standby) self.hooks.onStatus("");
+          if (self.hooks.onShown) {
+            self.hooks.onShown({
+              id: self.entry.id,
+              width: self.entry.width,
+              height: self.entry.height,
+              tiles: self.loaded.slice(),
+            });
+          }
+          return;
+        }
+        self._requestCurrent();
+      }
+      var returned;
       try {
-        tex = self.hooks.upload(image, box.tile);
+        returned = self.hooks.upload ? self.hooks.upload(image, box.tile, apply) : null;
       } catch (error) {
+        settled = true;
         if (self.hooks.dropImage) self.hooks.dropImage(image);
         if (isOom(error)) self._oom(box.photoId);
         else self._failOrRetry(error);
         return;
       }
-      if (self.hooks.dropImage) self.hooks.dropImage(image);
-      if (!tex || tex.oom) {
-        if (tex && self.hooks.release) self.hooks.release(tex);
-        self._oom(box.photoId);
-        return;
-      }
-      if (image._spsPayload && !tex._spsPayload) tex._spsPayload = image._spsPayload;
-      self.live.push(tex);
-      self.loaded.push({ tex: tex, tile: box.tile, payload: image._spsPayload || null });
-      self.pending = null;
-      if (self.tileOrder) self.orderPos += 1;
-      else self.tileIndex += 1;
-      var deferred = !!(tex.deferred || tex._evicted);
-      if (deferred && self.standby) {
-        self.budgetFull = true;
-        return;
-      }
-      var finished = !self.entry || (self.tileOrder
-        ? self.orderPos >= self.tileOrder.length
-        : self.tileIndex >= self.entry.tiles.length);
-      if (finished) {
-        var resident = self.loaded.filter(function (piece) {
-          return piece.tex && !piece.tex.deferred && !piece.tex._evicted;
-        });
-        var covered = self.entry && coversSphere(
-          resident.map(function (piece) { return piece.tile; }),
-          self.entry.width,
-          self.entry.height,
-        );
-        if (!covered) {
-          if (self.standby) {
-            self.budgetFull = true;
-            return;
-          }
-          self.attempt = 1;
-          self._failOrRetry("coverage");
-          return;
-        }
-        self.shown = true;
-        if (self.hooks.onStatus && !self.standby) self.hooks.onStatus("");
-        if (self.hooks.onShown) {
-          self.hooks.onShown({
-            id: self.entry.id,
-            width: self.entry.width,
-            height: self.entry.height,
-            tiles: self.loaded.slice(),
-          });
-        }
-        return;
-      }
-      self._requestCurrent();
+      if (returned !== undefined) apply(returned);
     };
     if (this.hooks.materialize) this.hooks.materialize(payload, finish);
     else finish(new Error("no materialize"));
@@ -2573,6 +2918,53 @@
     return true;
   };
 
+  function springSettled(value, target, vel) {
+    return Math.abs(value - target) < 1e-3 && Math.abs(vel || 0) < 1e-3;
+  }
+
+  function isGpuSource(img) {
+    if (!img || typeof img !== "object") return false;
+    if (img._deferUpload) return true;
+    if (typeof HTMLCanvasElement !== "undefined" && img instanceof HTMLCanvasElement) return true;
+    if (typeof HTMLImageElement !== "undefined" && img instanceof HTMLImageElement) return true;
+    if (typeof ImageBitmap !== "undefined" && img instanceof ImageBitmap) return true;
+    if (typeof OffscreenCanvas !== "undefined" && img instanceof OffscreenCanvas) return true;
+    return false;
+  }
+
+  function pieceReady(piece) {
+    if (!piece || !piece.tex || !piece.tile) return false;
+    var tex = piece.tex;
+    if (tex.deferred || tex._evicted || tex.oom) return false;
+    if (tex._window && tex._window.full === false) return false;
+    if (tex._mip !== true) return false;
+    return true;
+  }
+
+  function sessionReady(session) {
+    if (!session || !session.entry || !session.entry.tiles || !session.entry.tiles.length) return false;
+    var tiles = session.entry.tiles;
+    var loaded = session.loaded || [];
+    for (var i = 0; i < tiles.length; i++) {
+      var found = null;
+      for (var j = 0; j < loaded.length; j++) {
+        if (loaded[j] && loaded[j].tile && loaded[j].tile.id === tiles[i].id) {
+          found = loaded[j];
+          break;
+        }
+      }
+      if (!pieceReady(found)) return false;
+    }
+    return coversSphere(tiles, session.entry.width, session.entry.height);
+  }
+
+  function compositeAlphas(fadeMs, haveOld, haveNew) {
+    if (!haveOld && !haveNew) return { clear: false, oldAlpha: 0, newAlpha: 0 };
+    if (!haveOld) return { clear: true, oldAlpha: 0, newAlpha: 1 };
+    var t = haveNew ? Math.max(0, Math.min(1, (fadeMs || 0) / TILE_FADE_MS)) : 0;
+    return { clear: true, oldAlpha: 1, newAlpha: t };
+  }
+
   root.SpsphereCast = {
     ROTATIONS: ROTATIONS,
     DEFAULT_DPS: DEFAULT_DPS,
@@ -2590,6 +2982,8 @@
     applyPose: applyPose,
     tileTexCoord: tileTexCoord,
     coversSphere: coversSphere,
+    sessionReady: sessionReady,
+    compositeAlphas: compositeAlphas,
     viewCenterUv: viewCenterUv,
     planResidence: planResidence,
     backingStoreSize: backingStoreSize,
