@@ -17,6 +17,13 @@
   var DEFAULT_DPS = 9;
   var CROSSFADE_MS = 1200;
   var TILE_FADE_MS = 300;
+  var SNAP_FADE_MS = 1200;
+  var SNAP_W = 1920;
+  var SNAP_H = 1080;
+  var OUTPUT_W = 1920;
+  var OUTPUT_H = 1080;
+  var SENDER_TIMEOUT_MS = 45000;
+  var UPLOAD_BUDGET_MS = 4;
   var GPU_CAP = 192 * 1024 * 1024;
   var IDLE_HEARTBEAT_MS = 15000;
   var MIN_DPS = 6;
@@ -130,6 +137,29 @@
     this._decodeBusy = false;
     this._timeoutAcc = 0;
     this._holdFrame = false;
+    this._snapFadeMs = SNAP_FADE_MS;
+    this._snapOn = false;
+    this._snapMs = 0;
+    this._snapReveal = false;
+    this._snapHave = false;
+    this._snapYaw = 0;
+    this._snapCopies = 0;
+    this._switchLog = [];
+    this._dtEma = 0;
+    this._dtDebt = 0;
+    this._dtRing = new Float64Array(240);
+    this._dtRingAt = 0;
+    this._dtRingN = 0;
+    this._drawKeep = [];
+    this._patchCache = {};
+    this._strip = null;
+    this._preloadDepth = 0;
+    this._uploadMsPerMb = 8;
+    this._lastSender = 0;
+    this._senderSeen = false;
+    this._memoryBefore = null;
+    this._memoryAfter = null;
+    this._ignoredAim = 0;
     this._awaitingSwap = false;
     this._awaitIndex = null;
     this._glLost = false;
@@ -201,6 +231,9 @@
     this._fadeFrom = null;
     this._fadeRelease = false;
     this._holdFrame = false;
+    this._snapOn = false;
+    this._snapReveal = false;
+    this._snapMs = 0;
     this._awaitingSwap = false;
     this._awaitIndex = null;
     this._tileDraw = [];
@@ -406,9 +439,144 @@
     this._awaitingSwap = false;
     this._awaitIndex = null;
     this._tileDraw = [];
+    this._freeGpu();
     this._busy = false;
     this._markBusy();
     this.draw();
+  };
+
+  Player.prototype.memoryUsage = function () {
+    return {
+      gpuBytes: (this._gpuBytes || 0) + (this._snapBytes || 0),
+      snapBytes: this._snapBytes || 0,
+      textures: this._resident ? this._resident.length : 0,
+      objectUrls: trackedUrlCount(),
+      pendingUploads: this._uploadQueue ? this._uploadQueue.length : 0,
+      pendingDecodes: this._decodeQueue ? this._decodeQueue.length : 0,
+      snap: !!(this._snapTex || this._snapOn),
+    };
+  };
+
+  Player.prototype._freeGpu = function () {
+    this._releaseShownGpu();
+    this._releaseUrlTextures();
+    if (this._gl && this._snapTex) {
+      this._gl.deleteTexture(this._snapTex);
+    }
+    this._snapTex = null;
+    this._snapBytes = 0;
+    this._snapOn = false;
+    this._snapReveal = false;
+    this._snapHave = false;
+    this._strip = null;
+    if (this._gl && this._patchCache) {
+      for (var patchKey in this._patchCache) {
+        var patch = this._patchCache[patchKey];
+        if (patch && patch.buf) this._gl.deleteBuffer(patch.buf);
+        if (patch && patch.ib) this._gl.deleteBuffer(patch.ib);
+      }
+    }
+    this._patchCache = {};
+    revokeTrackedUrls();
+    this._gpuBytes = 0;
+    if (this._resident) this._resident.length = 0;
+  };
+
+  Player.prototype.noteSender = function () {
+    this._senderSeen = true;
+    this._lastSender = Date.now();
+  };
+
+  Player.prototype.senderTimedOut = function (now) {
+    if (!this._senderSeen || !this._lastSender) return false;
+    return (now || Date.now()) - this._lastSender > SENDER_TIMEOUT_MS;
+  };
+
+  Player.prototype.onSenderGone = function (reason) {
+    if (this._releasing) return;
+    this._releasing = true;
+    this._memoryBefore = this.memoryUsage();
+    this._logSwitch("release", reason || "sender-gone");
+    this._senderSeen = false;
+    this.stop();
+    this._memoryAfter = this.memoryUsage();
+    this._releasing = false;
+    if (typeof console !== "undefined" && console.info) {
+      console.info("spsphere cast memory", reason || "sender-gone", JSON.stringify(this._memoryBefore), JSON.stringify(this._memoryAfter));
+    }
+  };
+
+  Player.prototype.setSnapFadeMs = function (ms) {
+    var next = Number(ms);
+    if (!(next > 0)) return;
+    if (next < 200) next = 200;
+    if (next > 5000) next = 5000;
+    this._snapFadeMs = next;
+  };
+
+  Player.prototype.frameTimes = function () {
+    var ring = this._dtRing;
+    if (!ring) return [];
+    var n = this._dtRingN || 0;
+    var out = new Array(n);
+    var start = n < ring.length ? 0 : this._dtRingAt;
+    for (var i = 0; i < n; i++) out[i] = ring[(start + i) % ring.length];
+    return out;
+  };
+
+  Player.prototype.setPace = function (preload) {
+    var n = preload | 0;
+    this._preloadDepth = n > 0 ? n : 0;
+  };
+
+  Player.prototype.deviceReport = function () {
+    var gl = this._gl;
+    var maxTexture = 4096;
+    var renderer = "";
+    var webgl2 = !!this._webgl2;
+    if (gl && !(gl.isContextLost && gl.isContextLost())) {
+      var reported = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+      if (reported >= 512) maxTexture = reported;
+      var info = gl.getExtension && gl.getExtension("WEBGL_debug_renderer_info");
+      if (info) renderer = String(gl.getParameter(info.UNMASKED_RENDERER_WEBGL) || "");
+    }
+    var memory = 0;
+    if (root.navigator && root.navigator.deviceMemory) memory = Number(root.navigator.deviceMemory) || 0;
+    return {
+      deviceMemory: memory,
+      maxTexture: maxTexture,
+      renderer: renderer,
+      uploadMsPerMb: this._uploadMsPerMb || 0,
+      webgl2: webgl2,
+    };
+  };
+
+  Player.prototype._logSwitch = function (path, reason) {
+    if (!this._switchLog) this._switchLog = [];
+    this._switchLog.push({ path: path, reason: reason || "" });
+    if (this._switchLog.length > 40) this._switchLog.shift();
+    if (typeof console !== "undefined" && console.info) {
+      console.info("spsphere cast switch", path, reason || "");
+    }
+  };
+
+  Player.prototype._beginSnapshot = function (reason) {
+    if (this._snapOn) return;
+    if (!this._snapHave && !(this._tileDraw && this._tileDraw.length)) {
+      this._logSwitch("cut", reason || "switch");
+      return;
+    }
+    this._snapOn = true;
+    this._snapMs = 0;
+    this._snapReveal = false;
+    this._snapYaw = this.yaw;
+    this._logSwitch("snapshot", reason || "switch");
+  };
+
+  Player.prototype._endSnap = function () {
+    this._snapOn = false;
+    this._snapReveal = false;
+    this._snapMs = this._snapFadeMs || SNAP_FADE_MS;
   };
 
   Player.prototype.next = function () { return this._jump(1); };
@@ -420,7 +588,7 @@
     var at = stepIndex(this.index, count, delta, count > 1);
     if (at == null) return false;
     if (this._useTiles) {
-      this._jumpReset = this.manual ? "keep" : "zero";
+      this._jumpReset = "keep";
       var moved = this._requestIndex(at);
       this._preloadAround();
       this._mark();
@@ -597,6 +765,11 @@
 
   Player.prototype.applyAim = function (msg) {
     if (!msg) return false;
+    var autoPan = !!(this.playing && !this.manual);
+    if (autoPan && !msg.anchor) {
+      this._ignoredAim = (this._ignoredAim || 0) + 1;
+      return false;
+    }
     var seq = num(msg.seq, 0) >>> 0;
     if (!isNewer(seq, this._lastSeq)) return false;
     this._lastSeq = seq;
@@ -657,30 +830,34 @@
   };
 
   Player.prototype._pumpFrame = function (dt) {
-    if (dt > 100) dt = 100;
-    if (!(dt > 0)) dt = 0;
+    var raw = dt > 0 ? dt : 0;
     this._uploadsThisFrame = 0;
-    if (dt > 0) {
-      this._frameDts.push(dt);
-      if (this._frameDts.length > 240) this._frameDts.shift();
+    if (raw > 0) {
+      if (!this._dtRing) this._dtRing = new Float64Array(240);
+      this._dtRing[this._dtRingAt] = raw;
+      this._dtRingAt = (this._dtRingAt + 1) % this._dtRing.length;
+      if (this._dtRingN < this._dtRing.length) this._dtRingN += 1;
     }
-    if (!this._holdFrame && this._fading) this._fadeMs = (this._fadeMs || 0) + dt;
-    if (this._holdFrame) {
-      if (this.playing && !this.manual && dt > 0) this._integrate(dt);
-    } else {
-      this._ease(dt);
-      if (this.playing && !this.manual) this._integrate(dt);
-    }
-    this._timeoutAcc = (this._timeoutAcc || 0) + dt;
+    var paced = paceDt(this._dtEma, this._dtDebt, raw);
+    this._dtEma = paced.ema;
+    this._dtDebt = paced.debt;
+    var step = paced.step;
+    if (this._snapOn && this._snapReveal) this._snapMs = (this._snapMs || 0) + raw;
+    if (!this._holdFrame && this._fading) this._fadeMs = (this._fadeMs || 0) + raw;
+    if (this.playing && !this.manual && step > 0) this._integrate(step);
+    if (!this._snapOn) this._ease(step);
+    this._timeoutAcc = (this._timeoutAcc || 0) + raw;
     if (this._timeoutAcc >= 1000) {
       this._timeoutAcc -= 1000;
       var now = Date.now();
       if (this.session) this.session.tick(now);
       if (this._standby) this._standby.tick(now);
       if (this._back) this._back.tick(now);
+      if (this.senderTimedOut(now)) this.onSenderGone("heartbeat-timeout");
     }
-    if (!this._holdFrame) this.draw();
+    if (!this._holdFrame || this._snapOn) this.draw();
     if (this._fading && this._fadeMs >= TILE_FADE_MS) this._endFade();
+    if (this._snapOn && this._snapReveal && this._snapMs >= (this._snapFadeMs || SNAP_FADE_MS)) this._endSnap();
     this._pumpGpu();
   };
 
@@ -704,7 +881,14 @@
 
   Player.prototype._pumpGpu = function () {
     // One main-thread stall per frame. A tile upload and a JPEG decode
-    // both hitch the pan, so a frame does not do both.
+    // both hitch the pan, so a frame does not do both. A large tile is
+    // split into texSubImage2D strips that stay inside the upload budget.
+    if (this._strip) {
+      this._uploadsThisFrame = 1;
+      if (this._uploadsThisFrame > this._maxUploadsPerFrame) this._maxUploadsPerFrame = this._uploadsThisFrame;
+      this._uploadStripSlice();
+      return;
+    }
     if (this._uploadQueue && this._uploadQueue.length) {
       var job = this._uploadQueue.shift();
       this._uploadsThisFrame = 1;
@@ -714,6 +898,10 @@
         tex = this._uploadTile(job.img, job.tile, job.standby);
       } catch (error) {
         warn("texture upload failed", error && error.message);
+      }
+      if (this._strip) {
+        this._strip.done = job.done;
+        return;
       }
       if (job.done) job.done(tex);
       return;
@@ -729,7 +917,7 @@
   };
 
   Player.prototype._setup = function () {
-    var attrs = { antialias: true, alpha: false, preserveDrawingBuffer: true };
+    var attrs = { antialias: false, alpha: false, preserveDrawingBuffer: false };
     var gl = this.canvas.getContext("webgl2", attrs);
     this._webgl2 = !!gl;
     if (!gl) gl = this.canvas.getContext("webgl", attrs);
@@ -814,6 +1002,8 @@
     this._blank = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, this._blank);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([20, 24, 32, 255]));
+    this._installQuad(gl);
+    this._measureUpload(gl);
   };
 
   Player.prototype._upload = function (img) {
@@ -821,7 +1011,6 @@
     if (!this._gl || !img.width) return;
     var gl = this._gl;
     if (gl.isContextLost && gl.isContextLost()) return;
-    clearGlErrors(gl);
     var tex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
@@ -890,17 +1079,18 @@
   };
 
   Player.prototype._lodView = function () {
+    if (!this._viewScratch) this._viewScratch = { u: 0.5, v: 0.5, halfU: 0.2, halfV: 0.2, yaw: 0, pitch: 0 };
     var center = viewCenterUv(this.yaw, this.pitch);
     var aspect = this.canvas.width / Math.max(this.canvas.height, 1);
     var ext = viewExtents(this.fov, aspect);
-    return {
-      u: center.u,
-      v: center.v,
-      halfU: ext.halfU,
-      halfV: ext.halfV,
-      yaw: this.yaw,
-      pitch: this.pitch,
-    };
+    var slot = this._viewScratch;
+    slot.u = center.u;
+    slot.v = center.v;
+    slot.halfU = ext.halfU;
+    slot.halfV = ext.halfV;
+    slot.yaw = this.yaw;
+    slot.pitch = this.pitch;
+    return slot;
   };
 
   Player.prototype._deferred = function (img, tile) {
@@ -919,6 +1109,7 @@
       request: function (id, token) {
         if (window.__castSend) window.__castSend({ type: "fetch", id: id, token: token });
       },
+      preloadLimit: function () { return self._preloadDepth || 0; },
       materialize: function (payload, done) {
         if (self._injectImage) {
           var injected = self._injectImage(payload);
@@ -1108,8 +1299,8 @@
         if (this.playing && !this.manual) this.itemDegrees = ROTATIONS * FULL_TURN;
         var waiting = this._incomingPool(entry.id);
         if (!waiting) this._ensureIncoming(entry);
-        else if (waiting.budgetFull && !this._holdFrame) this._considerHold(waiting);
-        else if (!waiting.pending && !waiting.budgetFull) waiting._requestCurrent();
+        else if ((waiting.budgetFull || waiting.preloadCapped) && !this._holdFrame) this._considerHold(waiting);
+        else if (!waiting.pending && !waiting.budgetFull && !waiting.preloadCapped) waiting._requestCurrent();
         return true;
       }
     }
@@ -1124,7 +1315,7 @@
     if (this.playing && !this.manual) this.itemDegrees = ROTATIONS * FULL_TURN;
     this._ensureIncoming(entry);
     var incoming = this._incomingPool(entry.id);
-    if (incoming && incoming.budgetFull) this._considerHold(incoming);
+    if (incoming && (incoming.budgetFull || incoming.preloadCapped)) this._considerHold(incoming);
     return true;
   };
 
@@ -1158,30 +1349,24 @@
     this._holdFrame = false;
     pool.standby = false;
     pool.budgetFull = false;
+    pool.preloadCapped = false;
     if (pool === this._standby) this._standby = null;
     if (pool === this._back) this._back = null;
     var previous = this.session;
     this.session = pool;
-    if (!held && this._tileDraw && this._tileDraw.length && previous && previous !== pool) {
-      this._armFade();
-    } else if (held) {
-      this._fading = false;
-      this._fadeFrom = null;
-    }
+    var hadFrame = !!(this._tileDraw && this._tileDraw.length);
+    if (!held && hadFrame && previous && previous !== pool) this._beginSnapshot("switch");
+    this._fading = false;
+    this._fadeFrom = null;
+    this._fadeRelease = false;
     if (previous && previous !== pool) {
       previous.quietStop();
-      var fit = !held && (this._gpuBytes || 0) <= GPU_CAP && previous.loaded && previous.loaded.length;
-      if (fit) {
-        if (this._back && this._back !== previous) this._back.dispose();
-        previous.standby = true;
-        this._back = previous;
-        this._fadeRelease = false;
-      } else {
-        previous.live = [];
-        this._fadeRelease = !held && !!(this._fadeFrom && this._fadeFrom.length);
+      var oldLoaded = previous.loaded || [];
+      for (var p = 0; p < oldLoaded.length; p++) {
+        if (oldLoaded[p] && oldLoaded[p].tex) this._deleteTex(oldLoaded[p].tex);
       }
-    } else {
-      this._fadeRelease = false;
+      previous.live = [];
+      previous.loaded = [];
     }
     var resident = [];
     var loaded = pool.loaded || [];
@@ -1198,24 +1383,28 @@
       this._awaitingSwap = false;
       this._awaitIndex = null;
     }
+    if (this._snapOn && resident.length) this._snapReveal = true;
     if (!this._holdFrame) this.draw();
     if (resident.length && window.__castSend) window.__castSend({ type: "photo", id: entry.id, ok: true });
     this._preloadNeighbors();
   };
 
   Player.prototype._considerHold = function (pool) {
-    if (!pool || !pool.budgetFull || sessionReady(pool) || this._holdFrame) return;
-    if ((this._gpuBytes || 0) <= 0) {
+    if (!pool || sessionReady(pool) || this._holdFrame) return;
+    if (!pool.budgetFull && !pool.preloadCapped) return;
+    if ((this._gpuBytes || 0) <= 0 && !pool.preloadCapped) {
       pool.standby = false;
       pool.resume();
       return;
     }
-    // The last presented frame stays in the drawing buffer. Skip every clear
-    // until the incoming photo is complete, and free the showing textures so
-    // the rest of that photo can upload.
+    // The snapshot is a 1920x1080 copy of the last frame. The old tiles can
+    // go immediately, and the fade runs once the next photo is complete.
+    this._beginSnapshot(pool.preloadCapped ? "preload-cap" : "gpu-cap");
     this._holdFrame = true;
     this._releaseShownGpu();
     pool.standby = false;
+    pool.preloadCapped = false;
+    pool.budgetFull = false;
     pool.resume();
   };
 
@@ -1274,7 +1463,7 @@
     this._switchTick = this._switchTick || nowMs();
     this._ensureIncoming(entry);
     var incoming = this._incomingPool(entry.id);
-    if (incoming && incoming.budgetFull) this._considerHold(incoming);
+    if (incoming && (incoming.budgetFull || incoming.preloadCapped)) this._considerHold(incoming);
   };
 
   Player.prototype._preloadNeighbors = function () {
@@ -1347,7 +1536,6 @@
   };
 
   Player.prototype._texImage = function (gl, source) {
-    clearGlErrors(gl);
     var tex = gl.createTexture();
     if (!tex) return null;
     gl.bindTexture(gl.TEXTURE_2D, tex);
@@ -1356,6 +1544,7 @@
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    if (this._beginStrip(gl, tex, source)) return tex;
     try {
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
     } catch (error) {
@@ -1365,12 +1554,6 @@
     }
     if (gl.isContextLost && gl.isContextLost()) {
       warn("webgl context lost");
-      return null;
-    }
-    var glErr = gl.getError ? gl.getError() : 0;
-    if (glErr === gl.OUT_OF_MEMORY || glErr === gl.INVALID_VALUE || glErr === gl.INVALID_OPERATION) {
-      gl.deleteTexture(tex);
-      warn("texture upload failed", String(glErr));
       return null;
     }
     var w = source.width || 0;
@@ -1386,7 +1569,6 @@
     if (!this._webgl2 && !pot && source) {
       var padded = potPadSource(source);
       if (padded && padded.width && (padded.width !== width || padded.height !== height)) {
-        clearGlErrors(gl);
         try {
           gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, padded);
           uploadW = padded.width;
@@ -1394,10 +1576,6 @@
           pot = isPow2(uploadW) && isPow2(uploadH);
         } catch (error) {
           warn("texture pad failed", error && error.message);
-        }
-        var padErr = gl.getError ? gl.getError() : 0;
-        if (padErr) {
-          warn("texture pad failed", String(padErr));
           pot = isPow2(width) && isPow2(height);
           uploadW = width;
           uploadH = height;
@@ -1406,8 +1584,15 @@
     }
     var min = gl.LINEAR;
     var aniso = 1;
-    if (this._webgl2 || pot) {
-      clearGlErrors(gl);
+    if (source && source._levels && source._levels.length > 1) {
+      if (this._uploadExplicitMips(gl, source._levels)) {
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+        min = gl.LINEAR_MIPMAP_LINEAR;
+        aniso = this._setAniso(gl);
+        tex._mip = true;
+        tex._explicitMips = true;
+      }
+    } else if (this._webgl2 || pot) {
       var mipOk = true;
       try {
         gl.generateMipmap(gl.TEXTURE_2D);
@@ -1415,15 +1600,11 @@
         mipOk = false;
         warn("mipmap skipped", error && error.message);
       }
-      var mipErr = gl.getError ? gl.getError() : 0;
-      if (mipOk && !mipErr) {
+      if (mipOk) {
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
         min = gl.LINEAR_MIPMAP_LINEAR;
         aniso = this._setAniso(gl);
         tex._mip = true;
-      } else if (mipErr) {
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-        warn("mipmap skipped", String(mipErr));
       }
     }
     this._minFilter = min;
@@ -1647,30 +1828,47 @@
     var h = this.canvas.height;
     gl.viewport(0, 0, w, h);
     var self = this;
-    function collect(list) {
-      var out = [];
+    var view = this._lodView();
+    if (!this._drawKeep) this._drawKeep = [];
+    if (!this._oldKeep) this._oldKeep = [];
+    function collect(list, out, spanW, spanH) {
+      out.length = 0;
       if (!list) return out;
+      var seen = 0;
+      var kept = 0;
       for (var n = 0; n < list.length; n++) {
         var piece = list[n];
         if (!piece || !piece.tex || piece.tex.deferred || piece.tex._evicted) continue;
         var spec = piece.tex._window || piece.tile;
         if (!spec || spec.srcW < 1 || spec.srcH < 1) continue;
-        out.push({ tex: piece.tex, spec: spec });
+        seen += 1;
+        if (!tileInView(spec, spanW, spanH, view)) continue;
+        out.push(piece);
+        kept += 1;
+      }
+      if (seen && !kept) {
+        for (var k = 0; k < list.length; k++) {
+          var fallback = list[k];
+          if (!fallback || !fallback.tex || fallback.tex.deferred || fallback.tex._evicted) continue;
+          out.push(fallback);
+        }
       }
       return out;
     }
-    var drawable = collect(this._tileDraw);
-    var oldDrawable = this._fading ? collect(this._fadeFrom) : [];
+    var drawable = collect(this._tileDraw, this._drawKeep, this._tileW || 1, this._tileH || 1);
+    var oldDrawable = this._fading ? collect(this._fadeFrom, this._oldKeep, this._fadeW || 1, this._fadeH || 1) : this._oldKeep;
+    if (!this._fading && this._oldKeep) this._oldKeep.length = 0;
     var alphas = compositeAlphas(this._fadeMs, oldDrawable.length > 0, drawable.length > 0);
-    // An empty list used to clear the color buffer, so a late load error
-    // turned a frame that had already drawn into the background color.
     if (!this._tileProg || (!drawable.length && !oldDrawable.length)) {
+      if (this._snapOn) {
+        this._drawSnap(gl, 1);
+        return;
+      }
       if (!this._presented) gl.clear(gl.COLOR_BUFFER_BIT);
       return;
     }
     if (alphas.clear) gl.clear(gl.COLOR_BUFFER_BIT);
     gl.useProgram(this._tileProg);
-    this._bindMesh(gl, this._tileProg);
     fillPerspective(this._proj, this.fov, w / Math.max(h, 1), 0.05, 20);
     fillAimView(this._m0, this._m1, this._m2, this._view, this.yaw, this.pitch, this.roll);
     multiplyInto(this._mvp, this._proj, this._view);
@@ -1684,7 +1882,7 @@
       for (var i = 0; i < list.length; i++) {
         var piece = list[i];
         var tex = piece.tex;
-        var tile = piece.spec || piece.tile;
+        var tile = piece.spec || piece.tile || (tex && tex._window);
         if (!tex || tex.deferred || tex._evicted || !tile) continue;
         gl.uniform1f(loc.u0, tile.srcX / spanW);
         gl.uniform1f(loc.u1, (tile.srcX + tile.srcW) / spanW);
@@ -1698,7 +1896,7 @@
         gl.uniform1f(loc.texH, tex._uploadH || tile.texH);
         gl.uniform1i(loc.tex, 0);
         bindTex(gl, gl.TEXTURE0, tex);
-        self._drawMesh(gl);
+        self._drawPatch(gl, tile, spanW, spanH);
       }
     }
     gl.disable(gl.BLEND);
@@ -1713,15 +1911,25 @@
       paint(drawable, this._tileW || 1, this._tileH || 1, alphas.newAlpha);
       gl.disable(gl.BLEND);
     }
+    if (this._snapOn && this._snapTex) {
+      var cover = snapAlphas(this._snapMs, this._snapFadeMs || SNAP_FADE_MS, !!(this._snapReveal && drawable.length));
+      if (cover.snapAlpha > 0.001) this._drawSnap(gl, cover.snapAlpha);
+    } else if (this._presented || drawable.length) {
+      this._copySnapshot();
+    }
     this._presented = true;
     gl.useProgram(this._prog);
   };
 
   Player.prototype.draw = function () {
-    if (this._holdFrame) return;
+    if (this._holdFrame && !this._snapOn) return;
     resize(this.canvas);
     if (this._mode === "webgl" && this._gl) this._drawGl();
     else this._draw2d();
+    if (!this._snapOn && this._tileDraw && this._tileDraw.length) {
+      this._snapHave = true;
+      this._snapYaw = this.yaw;
+    }
   };
 
   Player.prototype._drawGl = function () {
@@ -1772,6 +1980,209 @@
     }
   };
 
+  Player.prototype._drawPatch = function (gl, tile, spanW, spanH) {
+    if (!gl || !tile) {
+      this._drawMesh(gl);
+      return;
+    }
+    if (!this._patchCache) this._patchCache = {};
+    var key = tile._patchKey;
+    if (!key || tile._patchSpan !== spanW) {
+      key = String(tile.id || tile.srcX) + ":" + tile.srcX + ":" + tile.srcY + ":" + spanW + ":" + spanH;
+      tile._patchKey = key;
+      tile._patchSpan = spanW;
+    }
+    var cached = this._patchCache[key];
+    if (!cached) {
+      var mesh = tilePatch(tile, spanW, spanH);
+      var buf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.bufferData(gl.ARRAY_BUFFER, mesh.interleaved, gl.STATIC_DRAW);
+      var ib = gl.createBuffer();
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.indices, gl.STATIC_DRAW);
+      cached = { buf: buf, ib: ib, count: mesh.count };
+      this._patchCache[key] = cached;
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, cached.buf);
+    var prog = this._tileProg;
+    var pos = gl.getAttribLocation(prog, "aPos");
+    if (pos >= 0) {
+      gl.enableVertexAttribArray(pos);
+      gl.vertexAttribPointer(pos, 3, gl.FLOAT, false, 20, 0);
+    }
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, cached.ib);
+    gl.drawElements(gl.TRIANGLES, cached.count, gl.UNSIGNED_SHORT, 0);
+  };
+
+  Player.prototype._stripRows = function (width) {
+    var ms = this._uploadMsPerMb || 8;
+    var bytes = UPLOAD_BUDGET_MS / Math.max(ms, 0.05) * 1024 * 1024;
+    var rows = Math.floor(bytes / Math.max((width || 1) * 4, 1));
+    if (rows < 8) rows = 8;
+    if (rows > 64) rows = 64;
+    return rows;
+  };
+
+  Player.prototype._beginStrip = function (gl, tex, source) {
+    if (!gl || !tex || !source || !source.width || !source.height) return false;
+    if (!gl.texSubImage2D || typeof document === "undefined") return false;
+    var rows = this._stripRows(source.width);
+    if (source.height <= rows) return false;
+    try {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, source.width, source.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    } catch (error) {
+      return false;
+    }
+    tex._uploadW = source.width;
+    tex._uploadH = source.height;
+    tex._mip = false;
+    this._strip = { gl: gl, tex: tex, source: source, y: 0, rows: rows, w: source.width, h: source.height };
+    this._uploadStripSlice();
+    return !!this._strip || tex._mip === true;
+  };
+
+  Player.prototype._uploadStripSlice = function () {
+    var job = this._strip;
+    if (!job) return;
+    var rows = Math.min(job.rows, job.h - job.y);
+    if (!this._stripCanvas) this._stripCanvas = document.createElement("canvas");
+    if (this._stripCanvas.width !== job.w) this._stripCanvas.width = job.w;
+    if (this._stripCanvas.height !== rows) this._stripCanvas.height = rows;
+    var ctx = this._stripCanvas.getContext("2d");
+    if (!ctx) {
+      this._strip = null;
+      return;
+    }
+    ctx.drawImage(job.source, 0, job.y, job.w, rows, 0, 0, job.w, rows);
+    job.gl.bindTexture(job.gl.TEXTURE_2D, job.tex);
+    job.gl.texSubImage2D(job.gl.TEXTURE_2D, 0, 0, job.y, job.gl.RGBA, job.gl.UNSIGNED_BYTE, this._stripCanvas);
+    job.y += rows;
+    if (job.y < job.h) return;
+    var tex = job.tex;
+    var source = job.source;
+    var done = job.done;
+    this._strip = null;
+    this._finishSampler(job.gl, tex, job.w, job.h, source);
+    if (done) done(tex);
+  };
+
+  Player.prototype._uploadExplicitMips = function (gl, levels) {
+    if (!gl || !levels || levels.length < 2) return false;
+    for (var level = 1; level < levels.length; level++) {
+      var mip = levels[level];
+      if (!mip || !mip.width || !mip.height) return false;
+      try {
+        gl.texImage2D(gl.TEXTURE_2D, level, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, mip);
+      } catch (error) {
+        warn("mip upload skipped", error && error.message);
+        return false;
+      }
+    }
+    return true;
+  };
+
+  Player.prototype._installQuad = function (gl) {
+    var vs = this._webgl2
+      ? "#version 300 es\nin vec2 aPos;in vec2 aUv;out vec2 vUv;void main(){vUv=aUv;gl_Position=vec4(aPos,0.0,1.0);}"
+      : "attribute vec2 aPos;attribute vec2 aUv;varying vec2 vUv;void main(){vUv=aUv;gl_Position=vec4(aPos,0.0,1.0);}";
+    var fs = this._webgl2
+      ? "#version 300 es\nprecision mediump float;uniform sampler2D uTex;uniform float uAlpha;in vec2 vUv;out vec4 o;void main(){o=texture(uTex,vUv);o.a*=uAlpha;}"
+      : "precision mediump float;uniform sampler2D uTex;uniform float uAlpha;varying vec2 vUv;void main(){gl_FragColor=texture2D(uTex,vUv);gl_FragColor.a*=uAlpha;}";
+    var prog = compileProgram(gl, vs, fs);
+    if (!prog) return;
+    this._quadProg = prog;
+    this._quadLoc = {
+      tex: gl.getUniformLocation(prog, "uTex"),
+      alpha: gl.getUniformLocation(prog, "uAlpha"),
+    };
+    this._quadBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this._quadBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      -1, -1, 0, 0,
+      1, -1, 1, 0,
+      -1, 1, 0, 1,
+      1, 1, 1, 1,
+    ]), gl.STATIC_DRAW);
+  };
+
+  Player.prototype._drawSnap = function (gl, alpha) {
+    if (!gl || !this._quadProg || !this._snapTex || !(alpha > 0)) return;
+    gl.useProgram(this._quadProg);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this._quadBuf);
+    var pos = gl.getAttribLocation(this._quadProg, "aPos");
+    var uv = gl.getAttribLocation(this._quadProg, "aUv");
+    if (pos >= 0) {
+      gl.enableVertexAttribArray(pos);
+      gl.vertexAttribPointer(pos, 2, gl.FLOAT, false, 16, 0);
+    }
+    if (uv >= 0) {
+      gl.enableVertexAttribArray(uv);
+      gl.vertexAttribPointer(uv, 2, gl.FLOAT, false, 16, 8);
+    }
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.uniform1f(this._quadLoc.alpha, alpha);
+    gl.uniform1i(this._quadLoc.tex, 0);
+    bindTex(gl, gl.TEXTURE0, this._snapTex);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.disable(gl.BLEND);
+  };
+
+  Player.prototype._copySnapshot = function () {
+    var gl = this._gl;
+    if (!gl) {
+      this._snapHave = true;
+      return;
+    }
+    var w = Math.min(gl.drawingBufferWidth || this.canvas.width || SNAP_W, SNAP_W);
+    var h = Math.min(gl.drawingBufferHeight || this.canvas.height || SNAP_H, SNAP_H);
+    if (w < 2 || h < 2) return;
+    if (!this._snapTex || this._snapW !== w || this._snapH !== h) {
+      if (this._snapTex) gl.deleteTexture(this._snapTex);
+      this._snapTex = gl.createTexture();
+      this._snapW = w;
+      this._snapH = h;
+      gl.bindTexture(gl.TEXTURE_2D, this._snapTex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    } else {
+      gl.bindTexture(gl.TEXTURE_2D, this._snapTex);
+    }
+    try {
+      gl.copyTexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 0, 0, w, h, 0);
+      this._snapBytes = w * h * 4;
+      this._snapCopies = (this._snapCopies || 0) + 1;
+      this._snapHave = true;
+      this._snapYaw = this.yaw;
+    } catch (error) {
+      this._snapHave = true;
+    }
+  };
+
+  Player.prototype._measureUpload = function (gl) {
+    if (!gl) return;
+    var w = 64;
+    var h = 64;
+    var pixels = new Uint8Array(w * h * 4);
+    var tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    var t0 = nowMs();
+    try {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+      if (gl.finish) gl.finish();
+    } catch (error) {
+      gl.deleteTexture(tex);
+      return;
+    }
+    var ms = Math.max(0.01, nowMs() - t0);
+    var mb = (w * h * 4) / (1024 * 1024);
+    this._uploadMsPerMb = ms / mb;
+    gl.deleteTexture(tex);
+  };
+
   function copyTiles(list) {
     if (!list || !list.length) return null;
     var out = [];
@@ -1793,6 +2204,7 @@
         padB: num(tile.padB, 0),
         texW: num(tile.texW, 0),
         texH: num(tile.texH, 0),
+        mipCount: num(tile.mipCount, 0),
       });
     }
     return out.length ? out : null;
@@ -1935,14 +2347,15 @@
   function backingStoreSize(clientW, clientH, dpr, screenW, screenH) {
     var density = Number(dpr) || 1;
     if (density < 1) density = 1;
-    var w = Math.max(clientW || 0, screenW || 0);
-    var h = Math.max(clientH || 0, screenH || 0);
-    if (w < 2) w = 1920;
-    if (h < 2) h = 1080;
-    return {
-      width: Math.max(2, Math.round(w * density)),
-      height: Math.max(2, Math.round(h * density)),
-    };
+    var w = clientW > 1 ? clientW : (screenW > 1 ? screenW : OUTPUT_W);
+    var h = clientH > 1 ? clientH : (screenH > 1 ? screenH : OUTPUT_H);
+    var bw = Math.round(w * (clientW > 1 ? density : 1));
+    var bh = Math.round(h * (clientH > 1 ? density : 1));
+    if (bw > OUTPUT_W) bw = OUTPUT_W;
+    if (bh > OUTPUT_H) bh = OUTPUT_H;
+    if (bw < 2) bw = OUTPUT_W;
+    if (bh < 2) bh = OUTPUT_H;
+    return { width: bw, height: bh };
   }
 
   function bindTex(gl, unit, tex) {
@@ -2013,13 +2426,6 @@
     return canvas;
   }
 
-  function clearGlErrors(gl) {
-    if (!gl || !gl.getError) return;
-    for (var i = 0; i < 8; i++) {
-      if (gl.getError() === (gl.NO_ERROR || 0)) return;
-    }
-  }
-
   function fragmentPrecision(gl) {
     if (!gl.getShaderPrecisionFormat) return "highp";
     var fmt = gl.getShaderPrecisionFormat(gl.FRAGMENT_SHADER, gl.HIGH_FLOAT);
@@ -2070,7 +2476,9 @@
         "  dstDx*=lim;dstDy*=lim;\n" +
         "  vec2 halfTex=vec2(0.5/max(uTexW,1.0),0.5/max(uTexH,1.0));\n" +
         "  st=clamp(st,halfTex,vec2(1.0)-halfTex);\n" +
-        "  " + color + "=" + sampleExpr + ";\n" +
+        "  float edgePx=min(min(sx,1.0-sx)*uSrcW,min(sy,1.0-sy)*uSrcH);\n" +
+        "  if(edgePx<3.0) " + color + "=" + sampleExpr + ";\n" +
+        "  else " + color + "=" + (webgl2 ? "texture" : "texture2D") + "(uTex,st);\n" +
         "  " + color + ".a*=uAlpha;\n" +
         "  float slopU=0.5*spanU/max(uSrcW,1.0);\n" +
         "  float slopV=0.5*spanV/max(uSrcH,1.0);\n" +
@@ -2266,13 +2674,14 @@
   function loadImageElement(blob, finish) {
     try {
       var url = URL.createObjectURL(blob);
+      trackUrl(url);
       var img = new Image();
       img.onload = function () {
-        URL.revokeObjectURL(url);
+        revokeUrl(url);
         finish(null, img);
       };
       img.onerror = function () {
-        URL.revokeObjectURL(url);
+        revokeUrl(url);
         finish(new Error("Couldn't open this photo"));
       };
       img.src = url;
@@ -2383,6 +2792,10 @@
   PhotoSession.prototype._requestCurrent = function () {
     var entry = this.entry;
     if (!entry || !entry.tiles || this.budgetFull) return;
+    if (this._preloadCapped()) {
+      this.preloadCapped = true;
+      return;
+    }
     var index = this.tileOrder ? this.tileOrder[this.orderPos] : this.tileIndex;
     if (index == null || index < 0) return;
     var tile = entry.tiles[index];
@@ -2404,6 +2817,11 @@
       parts: [],
       tile: tile,
       photoId: entry.id,
+      mipCount: tile.mipCount | 0,
+      mipParts: [],
+      mipGot: [],
+      mipN: [],
+      mipPayload: [],
     };
     this.pending = { id: tile.id, token: token, started: this._now() };
     if (this.hooks.request) this.hooks.request(tile.id, token);
@@ -2417,6 +2835,11 @@
     // showing photo requested last": a neighbor preloaded in the background
     // keeps its own token, and those chunks are not a stale transfer.
     if (msg.token != null && (msg.token | 0) !== box.token) return;
+    var level = msg.level | 0;
+    if (level > 0) {
+      this._noteLevel(box, level, msg);
+      return;
+    }
     var index = msg.i | 0;
     var count = msg.n | 0;
     if (count <= 0 || index < 0 || index >= count) return;
@@ -2428,8 +2851,43 @@
     if (box.got < count) return;
     for (var i = 0; i < count; i++) if (box.parts[i] == null) return;
     var payload = box.parts.slice(0, count).join("");
+    if ((box.mipCount | 0) > 0 && !mipsReady(box)) {
+      box.level0 = payload;
+      return;
+    }
     delete this.assemblers[msg.id];
     this._materialize(box, payload);
+  };
+
+  PhotoSession.prototype._noteLevel = function (box, level, msg) {
+    var index = msg.i | 0;
+    var count = msg.n | 0;
+    if (count <= 0 || index < 0 || index >= count) return;
+    if (!box.mipParts[level]) box.mipParts[level] = [];
+    if (box.mipN[level] && count !== box.mipN[level]) return;
+    if (box.mipParts[level][index] != null) return;
+    box.mipN[level] = count;
+    box.mipParts[level][index] = String(msg.data || "");
+    box.mipGot[level] = (box.mipGot[level] || 0) + 1;
+    if (box.mipGot[level] < count) return;
+    for (var i = 0; i < count; i++) if (box.mipParts[level][i] == null) return;
+    box.mipPayload[level] = box.mipParts[level].slice(0, count).join("");
+    if (!box.level0 || !mipsReady(box)) return;
+    delete this.assemblers[box.id];
+    this._materialize(box, box.level0);
+  };
+
+  PhotoSession.prototype._preloadCapped = function () {
+    if (!this.standby) return false;
+    var limit = this.hooks.preloadLimit ? (this.hooks.preloadLimit() | 0) : 0;
+    if (!(limit > 0)) return false;
+    var got = 0;
+    var loaded = this.loaded || [];
+    for (var i = 0; i < loaded.length; i++) {
+      var tex = loaded[i] && loaded[i].tex;
+      if (tex && !tex.deferred && !tex._evicted) got += 1;
+    }
+    return got >= limit;
   };
 
   PhotoSession.prototype.noteFetchError = function (msg) {
@@ -2527,17 +2985,39 @@
         }
         self._requestCurrent();
       }
-      var returned;
-      try {
-        returned = self.hooks.upload ? self.hooks.upload(image, box.tile, apply) : null;
-      } catch (error) {
-        settled = true;
-        if (self.hooks.dropImage) self.hooks.dropImage(image);
-        if (isOom(error)) self._oom(box.photoId);
-        else self._failOrRetry(error);
-        return;
+      function startUpload() {
+        var returned;
+        try {
+          returned = self.hooks.upload ? self.hooks.upload(image, box.tile, apply) : null;
+        } catch (error) {
+          settled = true;
+          if (self.hooks.dropImage) self.hooks.dropImage(image);
+          if (isOom(error)) self._oom(box.photoId);
+          else self._failOrRetry(error);
+          return;
+        }
+        if (returned !== undefined) apply(returned);
       }
-      if (returned !== undefined) apply(returned);
+      var mipPayloads = [];
+      if (box.mipPayload) {
+        for (var lv = 1; lv < box.mipPayload.length; lv++) {
+          if (box.mipPayload[lv]) mipPayloads.push(box.mipPayload[lv]);
+        }
+      }
+      if (!mipPayloads.length || !self.hooks.materialize) {
+        startUpload();
+      } else {
+        image._levels = new Array(mipPayloads.length + 1);
+        image._levels[0] = image;
+        var leftMips = mipPayloads.length;
+        mipPayloads.forEach(function (mipPayload, mipIndex) {
+          self.hooks.materialize(mipPayload, function (mipErr, mipImg) {
+            if (!mipErr && mipImg) image._levels[mipIndex + 1] = mipImg;
+            leftMips -= 1;
+            if (leftMips <= 0) startUpload();
+          });
+        });
+      }
     };
     if (this.hooks.materialize) this.hooks.materialize(payload, finish);
     else finish(new Error("no materialize"));
@@ -2621,12 +3101,15 @@
     return d;
   }
 
+  var scratchYaw = new Float32Array(16);
+  var scratchPitch = new Float32Array(16);
+  var scratchRoll = new Float32Array(16);
+  var scratchView = new Float32Array(16);
+  var scratchUv = { u: 0.5, v: 0.5 };
+
   function viewCenterUv(yawDeg, pitchDeg) {
-    var yawM = new Float32Array(16);
-    var pitchM = new Float32Array(16);
-    var rollM = new Float32Array(16);
-    var view = new Float32Array(16);
-    fillAimView(yawM, pitchM, rollM, view, yawDeg || 0, pitchDeg || 0, 0);
+    fillAimView(scratchYaw, scratchPitch, scratchRoll, scratchView, yawDeg || 0, pitchDeg || 0, 0);
+    var view = scratchView;
     var x = -view[2];
     var y = -view[6];
     var z = -view[10];
@@ -2639,14 +3122,20 @@
     var u = 0.5 + lon / (Math.PI * 2);
     u = u - Math.floor(u);
     var v = clamp(0.5 - lat / Math.PI, 0, 1);
-    return { u: u, v: v };
+    scratchUv.u = u;
+    scratchUv.v = v;
+    return scratchUv;
   }
+
+  var scratchExt = { halfU: 0.2, halfV: 0.2 };
 
   function viewExtents(fovDeg, aspect) {
     var vRad = (fovDeg || 75) * Math.PI / 180;
     var halfV = vRad / 2;
     var halfH = Math.atan(Math.tan(halfV) * (aspect > 0 ? aspect : 1));
-    return { halfU: halfH / (Math.PI * 2), halfV: halfV / Math.PI };
+    scratchExt.halfU = halfH / (Math.PI * 2);
+    scratchExt.halfV = halfV / Math.PI;
+    return scratchExt;
   }
 
   function rangesOverlap(a0, a1, b0, b1) {
@@ -2958,6 +3447,111 @@
     return coversSphere(tiles, session.entry.width, session.entry.height);
   }
 
+  var trackedUrls = [];
+
+  function trackUrl(url) {
+    if (url) trackedUrls.push(url);
+  }
+
+  function revokeUrl(url) {
+    if (!url) return;
+    try { URL.revokeObjectURL(url); } catch (error) {}
+    for (var i = trackedUrls.length - 1; i >= 0; i--) {
+      if (trackedUrls[i] === url) trackedUrls.splice(i, 1);
+    }
+  }
+
+  function revokeTrackedUrls() {
+    for (var i = 0; i < trackedUrls.length; i++) {
+      try { URL.revokeObjectURL(trackedUrls[i]); } catch (error) {}
+    }
+    trackedUrls = [];
+  }
+
+  function trackedUrlCount() {
+    return trackedUrls.length;
+  }
+
+  function paceDt(ema, debt, raw) {
+    if (!(raw > 0)) return { ema: ema || 0, debt: debt || 0, step: 0 };
+    var next = ema > 0 ? ema * 0.75 + raw * 0.25 : raw;
+    var step = next;
+    var carried = (debt || 0) + raw - step;
+    var repay = carried * 0.25;
+    var cap = step * 0.5;
+    if (repay > cap) repay = cap;
+    if (repay < -cap) repay = -cap;
+    return { ema: next, debt: carried - repay, step: step + repay };
+  }
+
+  function snapAlphas(ms, duration, haveNew) {
+    var dur = duration > 0 ? duration : SNAP_FADE_MS;
+    if (!haveNew) return { clear: false, newAlpha: 0, snapAlpha: 1 };
+    var t = Math.max(0, Math.min(1, (ms || 0) / dur));
+    return { clear: true, newAlpha: 1, snapAlpha: 1 - t };
+  }
+
+  function memoryCleared(usage) {
+    if (!usage) return false;
+    return usage.gpuBytes === 0 && (usage.snapBytes || 0) === 0 && usage.textures === 0 && usage.objectUrls === 0 &&
+      usage.pendingUploads === 0 && usage.pendingDecodes === 0 && usage.snap === false;
+  }
+
+  function mipsReady(box) {
+    var count = box && box.mipCount | 0;
+    if (!(count > 0)) return true;
+    for (var level = 1; level <= count; level++) {
+      if (!box.mipPayload || !box.mipPayload[level]) return false;
+    }
+    return true;
+  }
+
+  function tileInView(tile, width, height, view) {
+    if (!tile || !(width > 0) || !(height > 0) || !view) return true;
+    var u0 = tile.srcX / width;
+    var u1 = (tile.srcX + tile.srcW) / width;
+    var v0 = tile.srcY / height;
+    var v1 = (tile.srcY + tile.srcH) / height;
+    var halfU = (view.halfU || 0) + 0.02;
+    var halfV = (view.halfV || 0) + 0.02;
+    return uOverlap(u0, u1, view.u, halfU) && rangesOverlap(v0, v1, (view.v || 0) - halfV, (view.v || 0) + halfV);
+  }
+
+  function tilePatch(tile, width, height) {
+    var u0 = tile.srcX / Math.max(width, 1);
+    var u1 = (tile.srcX + tile.srcW) / Math.max(width, 1);
+    var v0 = tile.srcY / Math.max(height, 1);
+    var v1 = (tile.srcY + tile.srcH) / Math.max(height, 1);
+    var lonBands = 24;
+    var latBands = 12;
+    var pos = [];
+    var ind = [];
+    for (var lat = 0; lat <= latBands; lat++) {
+      var v = v0 + (v1 - v0) * (lat / latBands);
+      var latRad = (0.5 - v) * Math.PI;
+      var cosLat = Math.cos(latRad);
+      var sinLat = Math.sin(latRad);
+      for (var lon = 0; lon <= lonBands; lon++) {
+        var u = u0 + (u1 - u0) * (lon / lonBands);
+        var lonRad = (u - 0.5) * Math.PI * 2;
+        pos.push(Math.sin(lonRad) * cosLat, sinLat, -Math.cos(lonRad) * cosLat, u, v);
+      }
+    }
+    var stride = lonBands + 1;
+    for (var y = 0; y < latBands; y++) {
+      for (var x = 0; x < lonBands; x++) {
+        var a = y * stride + x;
+        var b = a + stride;
+        ind.push(a, b, a + 1, a + 1, b, b + 1);
+      }
+    }
+    return {
+      interleaved: new Float32Array(pos),
+      indices: new Uint16Array(ind),
+      count: ind.length,
+    };
+  }
+
   function compositeAlphas(fadeMs, haveOld, haveNew) {
     if (!haveOld && !haveNew) return { clear: false, oldAlpha: 0, newAlpha: 0 };
     if (!haveOld) return { clear: true, oldAlpha: 0, newAlpha: 1 };
@@ -2970,6 +3564,8 @@
     DEFAULT_DPS: DEFAULT_DPS,
     CROSSFADE_MS: CROSSFADE_MS,
     TILE_FADE_MS: TILE_FADE_MS,
+    SNAP_FADE_MS: SNAP_FADE_MS,
+    SENDER_TIMEOUT_MS: SENDER_TIMEOUT_MS,
     GPU_CAP: GPU_CAP,
     OMEGA: OMEGA,
     tileLoadOrder: tileLoadOrder,
@@ -2984,6 +3580,12 @@
     coversSphere: coversSphere,
     sessionReady: sessionReady,
     compositeAlphas: compositeAlphas,
+    snapAlphas: snapAlphas,
+    paceDt: paceDt,
+    tileInView: tileInView,
+    tilePatch: tilePatch,
+    memoryCleared: memoryCleared,
+    trackUrl: trackUrl,
     viewCenterUv: viewCenterUv,
     planResidence: planResidence,
     backingStoreSize: backingStoreSize,

@@ -78,6 +78,7 @@
     }
 
     function handle(msg) {
+      if (player && player.noteSender) player.noteSender();
       if (typeof msg === "string") {
         try { msg = JSON.parse(msg); } catch (e) { return; }
       }
@@ -95,6 +96,8 @@
       if (msg.type === "queue") {
         connectAim(msg.ws);
         player.setSpeed(msg.speed || SpsphereCast.DEFAULT_DPS);
+        player.setPace(msg.preload);
+        if (msg.fadeMs) player.setSnapFadeMs(msg.fadeMs);
         player.setQueue(msg.items || []);
         player.play();
       } else if (msg.type === "append") {
@@ -138,19 +141,26 @@
         player.retile(msg.id, msg.item);
       } else if (msg.type === "fov") {
         player.setFov(msg.fov);
+      } else if (msg.type === "pace") {
+        player.setPace(msg.preload);
+      } else if (msg.type === "fade") {
+        player.setSnapFadeMs(msg.ms);
       } else if (msg.type === "hello") {
         sendLimits();
       }
     }
 
     function sendLimits() {
-      var gl = player._gl;
-      var maxTexture = 4096;
-      if (gl && !gl.isContextLost()) {
-        var reported = gl.getParameter(gl.MAX_TEXTURE_SIZE);
-        if (reported >= 512) maxTexture = reported;
-      }
-      window.__castSend({ type: "limits", maxTexture: maxTexture });
+      var caps = player.deviceReport();
+      window.__castSend({
+        type: "caps",
+        deviceMemory: caps.deviceMemory,
+        maxTexture: caps.maxTexture,
+        renderer: caps.renderer,
+        uploadMsPerMb: caps.uploadMsPerMb,
+        webgl2: !!caps.webgl2,
+      });
+      window.__castSend({ type: "limits", maxTexture: caps.maxTexture });
     }
 
     window.__castHandle = handle;
@@ -181,6 +191,13 @@
     options.customNamespaces[NAMESPACE] = cast.framework.system.MessageType.JSON;
     options.skipMplLoad = startup.skipMplLoad;
     context.addCustomMessageListener(NAMESPACE, onCastMessage);
+    try {
+      context.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, function () {
+        var senders = [];
+        try { senders = context.getSenders() || []; } catch (e) {}
+        if (!senders.length) player.onSenderGone("sender-disconnected");
+      });
+    } catch (e) {}
     context.start(options);
     try {
       var playerManager = context.getPlayerManager();
@@ -206,6 +223,10 @@
       if (!guard.shown) guard.show();
       if (player.playing) guard.play();
       else guard.pause();
+      if (player.senderTimedOut(Date.now())) {
+        player.onSenderGone("heartbeat-timeout");
+        return;
+      }
       if (!guard.tick()) return;
       window.__castSend({ type: "heartbeat", state: guard.state });
     }, 1000);
