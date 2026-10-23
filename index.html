@@ -46,15 +46,17 @@
     }
 
     function connectAim(url) {
-      if (!url || url === aimUrl) return;
-      aimUrl = url;
+      var safe = SpsphereCast.acceptAimSocket(url);
+      if (!safe || safe === aimUrl) return;
+      aimUrl = safe;
+      url = safe;
       if (aimSocket) {
         try { aimSocket.close(); } catch (e) {}
         aimSocket = null;
       }
       var socket;
       try {
-        socket = new WebSocket(url);
+        socket = new WebSocket(safe);
       } catch (e) {
         return;
       }
@@ -78,10 +80,10 @@
     }
 
     function handle(msg) {
+      var accepted = SpsphereCast.acceptCastMessage(msg);
+      if (!accepted) return;
       if (player && player.noteSender) player.noteSender();
-      if (typeof msg === "string") {
-        try { msg = JSON.parse(msg); } catch (e) { return; }
-      }
+      msg = accepted;
       if (msg instanceof ArrayBuffer) {
         var skipDelta = SpsphereCast.decodeSkip(msg);
         if (skipDelta) {

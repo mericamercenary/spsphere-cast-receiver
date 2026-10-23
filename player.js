@@ -31,6 +31,11 @@
   var OMEGA = 40;
   var MIN_FOV = 20;
   var MAX_FOV = 120;
+  // Straight up and straight down, short of the exact pole where yaw and roll trade places.
+  var PITCH_LIMIT = 89.9;
+  // Extra degrees so a tile that just clips the frustum is still drawn.
+  var FRUSTUM_MARGIN_DEG = 4;
+  var POLE_MARGIN_DEG = 3;
 
   function clampSpeed(v) {
     v = Number(v) || DEFAULT_DPS;
@@ -57,7 +62,14 @@
 
   function num(v, fallback) {
     var n = Number(v);
-    return n === n ? n : fallback;
+    return (typeof n === "number" && isFinite(n)) ? n : fallback;
+  }
+
+  function httpUrl(url) {
+    if (typeof url !== "string" || url.length < 8 || url.length > 2048) return "";
+    if (!/^https?:\/\//i.test(url)) return "";
+    if (/[\s<>"']/.test(url)) return "";
+    return url;
   }
 
   function isNewer(seq, last) {
@@ -749,7 +761,7 @@
       this._tfov = this._userFov;
     }
     this._approach(this._tpitch - this.pitch, this._vp, dt);
-    this.pitch = clamp(this.pitch + this._stepDelta, -89, 89);
+    this.pitch = clamp(this.pitch + this._stepDelta, -PITCH_LIMIT, PITCH_LIMIT);
     this._vp = this._stepVel;
     this._approach(this._troll - this.roll, this._vr, dt);
     this.roll += this._stepDelta;
@@ -795,7 +807,7 @@
     this._tyaw = wrap360(this._baseYaw + shortest(yaw - this._oYaw));
     // Pitch and roll are gravity on the phone. Yaw stays anchored so the TV
     // does not spin to the phone's compass when aiming starts.
-    this._tpitch = clamp(pitch, -90, 90);
+    this._tpitch = clamp(pitch, -PITCH_LIMIT, PITCH_LIMIT);
     this._troll = roll;
     this._tfov = clamp(this._baseFov + (fov - this._oFov), MIN_FOV, MAX_FOV);
     this._userFov = this._tfov;
@@ -1056,11 +1068,18 @@
     if (this._gpuBytes < 0) this._gpuBytes = 0;
   };
 
+  Player.prototype._tileVisible = function (item, view) {
+    if (!item || !item.tile || !view) return false;
+    return tileInView(item.tile, item.spanW || 1, item.spanH || 1, view);
+  };
+
   Player.prototype._evictDistant = function (view) {
     var worst = -1;
     var worstDist = -1;
     for (var i = 0; i < this._resident.length; i++) {
       var item = this._resident[i];
+      // A tile in the frustum stays, including the opposite longitude at a pole.
+      if (this._tileVisible(item, view)) continue;
       var dist = uDist(item.u, view.u) + Math.abs(item.v - view.v);
       if (dist > worstDist) {
         worstDist = dist;
@@ -1079,7 +1098,7 @@
   };
 
   Player.prototype._lodView = function () {
-    if (!this._viewScratch) this._viewScratch = { u: 0.5, v: 0.5, halfU: 0.2, halfV: 0.2, yaw: 0, pitch: 0 };
+    if (!this._viewScratch) this._viewScratch = { u: 0.5, v: 0.5, halfU: 0.2, halfV: 0.2, yaw: 0, pitch: 0, roll: 0, fov: 75, aspect: 16 / 9 };
     var center = viewCenterUv(this.yaw, this.pitch);
     var aspect = this.canvas.width / Math.max(this.canvas.height, 1);
     var ext = viewExtents(this.fov, aspect);
@@ -1090,6 +1109,9 @@
     slot.halfV = ext.halfV;
     slot.yaw = this.yaw;
     slot.pitch = this.pitch;
+    slot.roll = this.roll;
+    slot.fov = this.fov;
+    slot.aspect = aspect;
     return slot;
   };
 
@@ -1683,6 +1705,7 @@
       var best = -1;
       for (var r = 0; r < self._resident.length; r++) {
         var item = self._resident[r];
+        if (self._tileVisible(item, view)) continue;
         var dist = uDist(item.u, view.u) + Math.abs(item.v - view.v);
         if (dist > best) best = dist;
       }
@@ -1702,8 +1725,8 @@
     while (attempts-- > 0) {
       tex = this._texImage(gl, source);
       if (tex) break;
-      // A failed upload can evict a tile farther from the view. It cannot
-      // drop the tile the viewer is looking at in order to keep an edge tile.
+      // A failed upload can evict a tile that is outside the view. It cannot
+      // drop a tile the frustum still sees, including a pole tile behind the yaw.
       if (!(farthestResident() > incoming + 1e-6)) break;
       if (!this._evictDistant(view)) break;
     }
@@ -1714,12 +1737,16 @@
     tex._spsPayload = img._spsPayload || null;
     tex._tileId = tile && tile.id;
     this._gpuBytes += bytes;
+    var drawn = win && !win.full ? win : tile;
     this._resident.push({
       id: tex._tileId,
       tex: tex,
       bytes: bytes,
       u: tile ? (tile.srcX + tile.srcW / 2) / spanW : view.u,
       v: tile ? (tile.srcY + tile.srcH / 2) / spanH : view.v,
+      tile: drawn,
+      spanW: spanW,
+      spanH: spanH,
     });
     return tex;
   };
@@ -2186,12 +2213,12 @@
   function copyTiles(list) {
     if (!list || !list.length) return null;
     var out = [];
-    for (var i = 0; i < list.length; i++) {
+    for (var i = 0; i < list.length && out.length < 256; i++) {
       var tile = list[i];
       if (!tile || tile.id == null) continue;
       out.push({
-        id: String(tile.id),
-        url: tile.url || "",
+        id: String(tile.id).slice(0, 160),
+        url: httpUrl(tile.url || ""),
         col: num(tile.col, 0),
         row: num(tile.row, 0),
         srcX: num(tile.srcX, 0),
@@ -2213,13 +2240,18 @@
   function normalizeEntries(list) {
     var out = [];
     if (!list) return out;
-    for (var i = 0; i < list.length; i++) {
+    for (var i = 0; i < list.length && out.length < 40; i++) {
       var item = list[i];
-      if (typeof item === "string") out.push({ id: item, url: item, posePitch: 0, poseRoll: 0 });
-      else if (item && item.url) {
+      if (typeof item === "string") {
+        var asUrl = httpUrl(item);
+        if (!asUrl) continue;
+        out.push({ id: asUrl, url: asUrl, posePitch: 0, poseRoll: 0 });
+      } else if (item && item.url) {
+        var url = httpUrl(item.url);
+        if (!url) continue;
         out.push({
-          id: item.id != null ? String(item.id) : item.url,
-          url: item.url,
+          id: item.id != null ? String(item.id).slice(0, 160) : url,
+          url: url,
           posePitch: num(item.posePitch, 0),
           poseRoll: num(item.poseRoll, 0),
           width: num(item.width, 0),
@@ -2242,7 +2274,7 @@
   function decodeSkip(buffer) {
     if (!buffer) return null;
     var length = buffer.byteLength != null ? buffer.byteLength : buffer.length;
-    if (!length || length < 8) return null;
+    if (!length || length < 8 || length > 256) return null;
     var view = new DataView(buffer.buffer || buffer, buffer.byteOffset || 0, length);
     if (view.getUint8(0) !== 3) return null;
     var dir = view.getUint8(1);
@@ -2252,10 +2284,10 @@
   }
 
   function decodeAim(buffer) {
-    if (!buffer || buffer.byteLength < 32) return null;
+    if (!buffer || buffer.byteLength < 32 || buffer.byteLength > 256) return null;
     var view = new DataView(buffer.buffer || buffer, buffer.byteOffset || 0, buffer.byteLength || buffer.length);
     if (view.getUint8(0) !== 1) return null;
-    return {
+    var sample = {
       seq: view.getUint32(4, true),
       yaw: view.getFloat32(8, true),
       pitch: view.getFloat32(12, true),
@@ -2264,6 +2296,60 @@
       ts: view.getFloat64(24, true),
       anchor: (view.getUint8(1) & 1) !== 0,
     };
+    if (!isFinite(sample.yaw) || !isFinite(sample.pitch) || !isFinite(sample.roll) || !isFinite(sample.fov)) return null;
+    return sample;
+  }
+
+  var MAX_MESSAGE_CHARS = 2 * 1024 * 1024;
+  var MAX_BINARY = 64 * 1024;
+  var MESSAGE_TYPES = {
+    queue: 1, append: 1, remove: 1, move: 1, goto: 1,
+    play: 1, pause: 1, next: 1, previous: 1, stop: 1,
+    heartbeat: 1, speed: 1, aim: 1, chunk: 1, fetchError: 1,
+    retile: 1, fov: 1, pace: 1, fade: 1, hello: 1,
+  };
+
+  function acceptAimSocket(url) {
+    if (typeof url !== "string" || url.length > 300) return "";
+    var match = /^(ws|wss):\/\/(\[[0-9a-fA-F:]+\]|[^\/\s@:]+)(:\d{1,5})?(\/c\/[0-9a-fA-F]{16,64}\/aim)$/.exec(url);
+    if (!match) return "";
+    var host = match[2];
+    var ipv4 = /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
+    var ipv6 = /^\[[0-9a-fA-F:]+\]$/.test(host);
+    if (host !== "localhost" && !ipv4 && !ipv6) return "";
+    if (ipv4) {
+      var parts = host.split(".");
+      for (var i = 0; i < parts.length; i++) {
+        if (parseInt(parts[i], 10) > 255) return "";
+      }
+    }
+    if (match[3]) {
+      var port = parseInt(match[3].slice(1), 10);
+      if (!(port > 0 && port < 65536)) return "";
+    }
+    return url;
+  }
+
+  function acceptCastMessage(msg) {
+    if (msg == null) return null;
+    if (typeof msg === "string") {
+      if (msg.length > MAX_MESSAGE_CHARS) return null;
+      try { msg = JSON.parse(msg); } catch (e) { return null; }
+    }
+    if (Object.prototype.toString.call(msg) === "[object ArrayBuffer]") {
+      if (msg.byteLength > MAX_BINARY) return null;
+      return msg;
+    }
+    if (typeof msg !== "object" || typeof msg.type !== "string" || !MESSAGE_TYPES[msg.type]) return null;
+    if (msg.ws != null && msg.ws !== "") {
+      var socket = acceptAimSocket(msg.ws);
+      if (!socket) return null;
+      msg = Object.assign({}, msg, { ws: socket });
+    }
+    if ((msg.type === "queue" || msg.type === "append") && msg.items && msg.items.length > 40) {
+      msg = Object.assign({}, msg, { items: msg.items.slice(0, 40) });
+    }
+    return msg;
   }
 
   var ZERO_POSE = { pitch: 0, roll: 0 };
@@ -3231,10 +3317,7 @@
       var v0 = tile.srcY / height;
       var v1 = (tile.srcY + tile.srcH) / height;
       var contains = view.u >= u0 && view.u <= u1 && view.v >= v0 && view.v <= v1;
-      var hits = contains || (
-        uOverlap(u0, u1, view.u, view.halfU || 0) &&
-        rangesOverlap(v0, v1, view.v - (view.halfV || 0), view.v + (view.halfV || 0))
-      );
+      var hits = tileInView(tile, width, height, view);
       var dist = uDist((u0 + u1) / 2, view.u) + Math.abs((v0 + v1) / 2 - view.v);
       order.push({ index: i, contains: contains, hits: hits, dist: dist });
     }
@@ -3506,15 +3589,240 @@
     return true;
   }
 
+  var frustumScratchA = new Float32Array(16);
+  var frustumScratchB = new Float32Array(16);
+  var frustumScratchC = new Float32Array(16);
+  var frustumView = new Float32Array(16);
+  var frustumProj = new Float32Array(16);
+  var frustumMvp = new Float32Array(16);
+
+  function lookOf(view) {
+    var pitch = view.pitch;
+    var yaw = view.yaw;
+    if (pitch == null) pitch = view.v != null ? (0.5 - view.v) * 180 : 0;
+    if (yaw == null) yaw = view.u != null ? (view.u - 0.5) * 360 : 0;
+    var fov = view.fov;
+    if (!(fov > 0)) fov = view.halfV > 0 ? view.halfV * 360 : 75;
+    var aspect = view.aspect;
+    if (!(aspect > 0)) {
+      if (view.halfU > 0 && view.halfV > 0) {
+        var halfVRad = view.halfV * Math.PI;
+        var tanV = Math.tan(halfVRad);
+        aspect = tanV > 1e-6 ? Math.tan(view.halfU * Math.PI * 2) / tanV : 1;
+      } else {
+        aspect = 16 / 9;
+      }
+    }
+    if (!(aspect > 0)) aspect = 1;
+    return { yaw: yaw || 0, pitch: pitch || 0, roll: view.roll || 0, fov: fov, aspect: aspect };
+  }
+
+  function buildFrustum(look) {
+    fillAimView(frustumScratchA, frustumScratchB, frustumScratchC, frustumView, look.yaw, look.pitch, look.roll);
+    fillPerspective(frustumProj, look.fov + FRUSTUM_MARGIN_DEG, look.aspect, 0.05, 20);
+    multiplyInto(frustumMvp, frustumProj, frustumView);
+    var m = frustumMvp;
+    function plane(a, b, c, d) {
+      var len = Math.hypot(a, b, c) || 1;
+      return new Float32Array([a / len, b / len, c / len, d / len]);
+    }
+    // clip = mvp * p. Inside is clip.w ± clip.xyz >= 0.
+    var r0 = [m[0], m[4], m[8], m[12]];
+    var r1 = [m[1], m[5], m[9], m[13]];
+    var r2 = [m[2], m[6], m[10], m[14]];
+    var r3 = [m[3], m[7], m[11], m[15]];
+    return [
+      plane(r3[0] + r0[0], r3[1] + r0[1], r3[2] + r0[2], r3[3] + r0[3]),
+      plane(r3[0] - r0[0], r3[1] - r0[1], r3[2] - r0[2], r3[3] - r0[3]),
+      plane(r3[0] + r1[0], r3[1] + r1[1], r3[2] + r1[2], r3[3] + r1[3]),
+      plane(r3[0] - r1[0], r3[1] - r1[1], r3[2] - r1[2], r3[3] - r1[3]),
+      plane(r3[0] + r2[0], r3[1] + r2[1], r3[2] + r2[2], r3[3] + r2[3]),
+      plane(r3[0] - r2[0], r3[1] - r2[1], r3[2] - r2[2], r3[3] - r2[3]),
+    ];
+  }
+
+  function frustumOf(view, look) {
+    var key = look.yaw + "|" + look.pitch + "|" + look.roll + "|" + look.fov + "|" + look.aspect;
+    if (view._frustumKey === key && view._frustum) return view._frustum;
+    var planes = buildFrustum(look);
+    view._frustumKey = key;
+    view._frustum = planes;
+    return planes;
+  }
+
+  var PATCH_LAT_CELLS = 6;
+  var PATCH_LON_CELLS = 8;
+
+  function patchCells(tile, width, height) {
+    if (tile._cells && tile._cellsW === width && tile._cellsH === height) return tile._cells;
+    var u0 = tile.srcX / width;
+    var u1 = (tile.srcX + tile.srcW) / width;
+    var v0 = tile.srcY / height;
+    var v1 = (tile.srcY + tile.srcH) / height;
+    var cells = new Float32Array(PATCH_LAT_CELLS * PATCH_LON_CELLS * 6);
+    var n = 0;
+    var pad = 0.035;
+    for (var lat = 0; lat < PATCH_LAT_CELLS; lat++) {
+      var va = v0 + (v1 - v0) * (lat / PATCH_LAT_CELLS);
+      var vb = v0 + (v1 - v0) * ((lat + 1) / PATCH_LAT_CELLS);
+      for (var lon = 0; lon < PATCH_LON_CELLS; lon++) {
+        var ua = u0 + (u1 - u0) * (lon / PATCH_LON_CELLS);
+        var ub = u0 + (u1 - u0) * ((lon + 1) / PATCH_LON_CELLS);
+        var minX = Infinity;
+        var minY = Infinity;
+        var minZ = Infinity;
+        var maxX = -Infinity;
+        var maxY = -Infinity;
+        var maxZ = -Infinity;
+        for (var s = 0; s <= 2; s++) {
+          var v = va + (vb - va) * (s / 2);
+          var latRad = (0.5 - v) * Math.PI;
+          var cosLat = Math.cos(latRad);
+          var sinLat = Math.sin(latRad);
+          for (var t = 0; t <= 2; t++) {
+            var u = ua + (ub - ua) * (t / 2);
+            var lonRad = (u - 0.5) * Math.PI * 2;
+            var x = Math.sin(lonRad) * cosLat;
+            var y = sinLat;
+            var z = -Math.cos(lonRad) * cosLat;
+            if (x < minX) minX = x;
+            if (y < minY) minY = y;
+            if (z < minZ) minZ = z;
+            if (x > maxX) maxX = x;
+            if (y > maxY) maxY = y;
+            if (z > maxZ) maxZ = z;
+          }
+        }
+        cells[n++] = minX - pad;
+        cells[n++] = minY - pad;
+        cells[n++] = minZ - pad;
+        cells[n++] = maxX + pad;
+        cells[n++] = maxY + pad;
+        cells[n++] = maxZ + pad;
+      }
+    }
+    tile._cells = cells;
+    tile._cellsW = width;
+    tile._cellsH = height;
+    return cells;
+  }
+
+  function cellOutsideFrustum(cells, offset, planes) {
+    var x0 = cells[offset];
+    var y0 = cells[offset + 1];
+    var z0 = cells[offset + 2];
+    var x1 = cells[offset + 3];
+    var y1 = cells[offset + 4];
+    var z1 = cells[offset + 5];
+    for (var i = 0; i < planes.length; i++) {
+      var p = planes[i];
+      var x = p[0] >= 0 ? x1 : x0;
+      var y = p[1] >= 0 ? y1 : y0;
+      var z = p[2] >= 0 ? z1 : z0;
+      if (p[0] * x + p[1] * y + p[2] * z + p[3] < 0) return true;
+    }
+    return false;
+  }
+
+  function patchHitsFrustum(tile, width, height, planes) {
+    var cells = patchCells(tile, width, height);
+    for (var i = 0; i < cells.length; i += 6) {
+      if (!cellOutsideFrustum(cells, i, planes)) return true;
+    }
+    return false;
+  }
+
+  function reachesPole(look, north) {
+    var half = look.fov / 2 + POLE_MARGIN_DEG;
+    if (north) return look.pitch + half >= 90;
+    return look.pitch - half <= -90;
+  }
+
   function tileInView(tile, width, height, view) {
     if (!tile || !(width > 0) || !(height > 0) || !view) return true;
     var u0 = tile.srcX / width;
     var u1 = (tile.srcX + tile.srcW) / width;
     var v0 = tile.srcY / height;
     var v1 = (tile.srcY + tile.srcH) / height;
-    var halfU = (view.halfU || 0) + 0.02;
-    var halfV = (view.halfV || 0) + 0.02;
-    return uOverlap(u0, u1, view.u, halfU) && rangesOverlap(v0, v1, (view.v || 0) - halfV, (view.v || 0) + halfV);
+    if (!(u1 > u0) || !(v1 > v0)) return false;
+    var look = lookOf(view);
+    var north = v0 <= 1e-6;
+    var south = v1 >= 1 - 1e-6;
+    if ((north && reachesPole(look, true)) || (south && reachesPole(look, false))) return true;
+    return patchHitsFrustum(tile, width, height, frustumOf(view, look));
+  }
+
+  function eyeToWorld(yaw, pitch, roll, fov, aspect, ndcX, ndcY) {
+    var t = Math.tan((fov * Math.PI / 180) / 2);
+    var ex = ndcX * aspect * t;
+    var ey = ndcY * t;
+    var ez = -1;
+    fillAimView(frustumScratchA, frustumScratchB, frustumScratchC, frustumView, yaw, pitch, roll);
+    return {
+      x: frustumView[0] * ex + frustumView[1] * ey + frustumView[2] * ez,
+      y: frustumView[4] * ex + frustumView[5] * ey + frustumView[6] * ez,
+      z: frustumView[8] * ex + frustumView[9] * ey + frustumView[10] * ez,
+    };
+  }
+
+  function dirToUv(x, y, z) {
+    var len = Math.hypot(x, y, z) || 1;
+    x /= len;
+    y /= len;
+    z /= len;
+    var lon = Math.atan2(x, -z);
+    var lat = Math.asin(clamp(y, -1, 1));
+    var u = 0.5 + lon / (Math.PI * 2);
+    u -= Math.floor(u);
+    var v = 0.5 - lat / Math.PI;
+    if (v < 0) v = 0;
+    if (v > 1) v = 1;
+    return { u: u, v: v };
+  }
+
+  function rayCovered(tiles, width, height, uv, view) {
+    var atNorth = uv.v <= 0.002;
+    var atSouth = uv.v >= 0.998;
+    for (var i = 0; i < tiles.length; i++) {
+      var tile = tiles[i];
+      var u0 = tile.srcX / width;
+      var u1 = (tile.srcX + tile.srcW) / width;
+      var v0 = tile.srcY / height;
+      var v1 = (tile.srcY + tile.srcH) / height;
+      var inV = uv.v >= v0 - 1e-4 && uv.v <= v1 + 1e-4;
+      if (atNorth) inV = v0 <= 1e-4;
+      if (atSouth) inV = v1 >= 1 - 1e-4;
+      if (!inV) continue;
+      var inU = atNorth || atSouth || (uv.u >= u0 - 1e-4 && uv.u <= u1 + 1e-4);
+      if (!inU) continue;
+      if (tileInView(tile, width, height, view)) return true;
+    }
+    return false;
+  }
+
+  function coverageMisses(tiles, width, height, yaw, pitch, fov, aspect) {
+    var misses = 0;
+    var first = "";
+    var cols = 13;
+    var rows = 9;
+    var view = { yaw: yaw, pitch: pitch, roll: 0, fov: fov, aspect: aspect };
+    var samples = cols * rows;
+    for (var j = 0; j < rows; j++) {
+      var ndcY = -0.92 + 1.84 * (j / (rows - 1));
+      for (var i = 0; i < cols; i++) {
+        var ndcX = -0.92 + 1.84 * (i / (cols - 1));
+        var dir = eyeToWorld(yaw, pitch, 0, fov, aspect, ndcX, ndcY);
+        var uv = dirToUv(dir.x, dir.y, dir.z);
+        if (rayCovered(tiles, width, height, uv, view)) continue;
+        misses++;
+        if (!first) {
+          first = "yaw " + yaw + " pitch " + pitch + " fov " + fov +
+            " ndc " + ndcX.toFixed(2) + "," + ndcY.toFixed(2) +
+            " uv " + uv.u.toFixed(3) + "," + uv.v.toFixed(3);
+        }
+      }
+    }
+    return { misses: misses, first: first, samples: samples };
   }
 
   function tilePatch(tile, width, height) {
@@ -3574,6 +3882,9 @@
     IdleGuard: IdleGuard,
     decodeAim: decodeAim,
     decodeSkip: decodeSkip,
+    acceptCastMessage: acceptCastMessage,
+    acceptAimSocket: acceptAimSocket,
+    httpUrl: httpUrl,
     stepIndex: stepIndex,
     applyPose: applyPose,
     tileTexCoord: tileTexCoord,
@@ -3582,7 +3893,9 @@
     compositeAlphas: compositeAlphas,
     snapAlphas: snapAlphas,
     paceDt: paceDt,
+    PITCH_LIMIT: PITCH_LIMIT,
     tileInView: tileInView,
+    coverageMisses: coverageMisses,
     tilePatch: tilePatch,
     memoryCleared: memoryCleared,
     trackUrl: trackUrl,
