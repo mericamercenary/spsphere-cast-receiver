@@ -149,8 +149,16 @@
         player.setSnapFadeMs(msg.ms);
       } else if (msg.type === "hello") {
         sendLimits();
+      } else if (msg.type === "debug") {
+        player.setDebugTint(msg.on);
       }
     }
+
+    document.addEventListener("keydown", function (event) {
+      var info = event.keyCode === 457 || event.keyCode === 165 || event.key === "i" || event.key === "I";
+      if (!info) return;
+      player.setDebugTint();
+    });
 
     function sendLimits() {
       var caps = player.deviceReport();
