@@ -365,6 +365,18 @@
     return img;
   };
 
+  Player.prototype._sameLiveShow = function (entries) {
+    if (!entries || !this.ids || entries.length !== this.ids.length || !entries.length) return false;
+    for (var i = 0; i < entries.length; i++) {
+      if (String(entries[i].id) !== String(this.ids[i])) return false;
+    }
+    var inflight = 0;
+    if (this.session && this.session._inFlight) inflight += this.session._inFlight();
+    if (this._standby && this._standby._inFlight) inflight += this._standby._inFlight();
+    if (this._back && this._back._inFlight) inflight += this._back._inFlight();
+    return !!(this._shownFirstPhoto || inflight > 0 || (this._diagRequested || 0) > 0);
+  };
+
   Player.prototype.setQueue = function (urls) {
     var entries = normalizeEntries(urls);
     var self = this;
@@ -396,7 +408,7 @@
       if (window.__onCastStatus) window.__onCastStatus(this.snapshot());
       else if (window.__castSend) window.__castSend({ type: "status", index: this.index, playing: this.playing, phase: this.phase });
       this._sendDiag(true);
-      return;
+      return false;
     }
     this._lastQueueAt = now;
     if (this.session) {
@@ -472,6 +484,7 @@
     }
     this._mark();
     this.draw();
+    return true;
   };
 
   Player.prototype.appendItems = function (urls) {

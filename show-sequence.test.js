@@ -488,7 +488,10 @@ assert(startup.skipMplLoad === false, "the media player stays loaded");
 assert(startup.streamType === "LIVE", "the show is a live media session");
 assert(page.indexOf("receiverStartup") >= 0, "the receiver page uses the shared idle options");
 assert(page.indexOf("heartbeat") >= 0, "the receiver page sends heartbeats");
-assert(page.indexOf("getPlayerManager") >= 0, "the page keeps PlayerManager out of idle");
+assert(page.indexOf("setApplicationState") >= 0, "the page marks the receiver active");
+assert(page.indexOf("maxInactivity") >= 0, "the page sets the inactivity window");
+assert(page.indexOf("playerManager.load") < 0, "the page does not load an unplayable show");
+assert(page.indexOf("__playerManager.play") < 0 && page.indexOf("__playerManager.pause") < 0, "the page does not pause the Cast player");
 
 let idleClock = 0;
 const guard = new Cast.IdleGuard(function () { return idleClock; });
@@ -542,6 +545,33 @@ function solidPhoto(id) {
     }],
   };
 }
+
+const dupEntry = solidPhoto("dupShow");
+const dup = fovSandbox.SpsphereCast.create(bareCanvas());
+dup._injectImage = function (payload) { return { label: payload, width: 8, height: 8 }; };
+dup._uploadTile = function (img) { return { label: img.label, bytes: 64, _mip: true }; };
+dup.manual = true;
+dup.setQueue([dupEntry]);
+dup._diagRequested = 3;
+dup._shownFirstPhoto = true;
+dup._tileDraw = [{ tex: { label: "kept" }, tile: dupEntry.tiles[0] }];
+const prevSend = fovSandbox.__castSend;
+const prevStatus = fovSandbox.__onCastStatus;
+let dupDiag = 0;
+let dupStatus = 0;
+fovSandbox.__castSend = function (msg) { if (msg && msg.type === "diag") dupDiag += 1; };
+fovSandbox.__onCastStatus = function () { dupStatus += 1; };
+const dupAgain = dup.setQueue([dupEntry]);
+assert(dupAgain === false, "a duplicate queue is acknowledged, not reloaded");
+assert(dup._tileDraw[0].tex.label === "kept", "a duplicate queue does not wipe the photo");
+assert(dup._diagRequested === 3, "a duplicate queue keeps the request count");
+assert(dup.ids[0] === "dupShow", "a duplicate queue keeps the same show");
+assert(dupStatus === 1 && dupDiag === 1, "a duplicate queue answers with status and diag");
+fovSandbox.__castSend = prevSend;
+fovSandbox.__onCastStatus = prevStatus;
+dup.setQueue([solidPhoto("otherShow")]);
+assert(dup.ids[0] === "otherShow", "a different show still replaces the queue");
+assert(!dup._tileDraw.length || !dup._tileDraw[0].tex || dup._tileDraw[0].tex.label !== "kept", "a different show drops the previous photo");
 
 const pre = fovSandbox.SpsphereCast.create(bareCanvas());
 pre._injectImage = function (payload) { return { label: payload, width: 8, height: 8 }; };

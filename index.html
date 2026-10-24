@@ -142,8 +142,8 @@
         player.setPace(msg.preload);
         if (msg.fadeMs) player.setSnapFadeMs(msg.fadeMs);
         player.setLan(msg.lan === true);
-        player.setQueue(msg.items || []);
-        player.play();
+        var started = player.setQueue(msg.items || []);
+        if (started !== false) player.play();
         if (window.__idle) { window.__idle.play(); window.__idle.show(); }
       } else if (msg.type === "append") {
         player.appendItems(msg.items || []);
