@@ -368,6 +368,37 @@
   Player.prototype.setQueue = function (urls) {
     var entries = normalizeEntries(urls);
     var self = this;
+    var now = this._clock();
+    var sameQueue = !!(
+      this.ids &&
+      entries.length > 0 &&
+      this.ids.length === entries.length &&
+      this.ids[0] === entries[0].id &&
+      this.ids.every(function (id, idx) { return id === entries[idx].id; })
+    );
+    var activeLoad = !!(
+      this._shownFirstPhoto ||
+      this._presented ||
+      this._inflight > 0 ||
+      (this._tileOrder && Object.keys(this._tileOrder).length > 0) ||
+      (this._tileDraw && this._tileDraw.length > 0) ||
+      (this.session && (
+        this.session.shown ||
+        this.session.pending ||
+        (this.session._inFlight && this.session._inFlight() > 0) ||
+        (this.session.loaded && this.session.loaded.length > 0) ||
+        Object.keys(this.session.assemblers || {}).length > 0
+      )) ||
+      this._diagRequested > 0 ||
+      this._loaded > 0
+    );
+    if (sameQueue && activeLoad && (!this._lastQueueAt || now - this._lastQueueAt <= 15000)) {
+      if (window.__onCastStatus) window.__onCastStatus(this.snapshot());
+      else if (window.__castSend) window.__castSend({ type: "status", index: this.index, playing: this.playing, phase: this.phase });
+      this._sendDiag(true);
+      return;
+    }
+    this._lastQueueAt = now;
     if (this.session) {
       this.session.dispose();
       // The phone pushes the overview and the front strip at token 1
@@ -1032,6 +1063,9 @@
     this._awaitIndex = null;
     this._tileDraw = [];
     this._freeGpu();
+    this._lastQueueAt = 0;
+    this._shownFirstPhoto = false;
+    this._diagRequested = 0;
     this._busy = false;
     this._markBusy();
     this.draw();
@@ -1145,9 +1179,9 @@
     });
   };
 
-  Player.prototype.noteSender = function () {
+  Player.prototype.noteSender = function (now) {
     this._senderSeen = true;
-    this._lastSender = Date.now();
+    this._lastSender = now || Date.now();
     this._disconnectGrace = 0;
   };
 
@@ -1851,7 +1885,7 @@
       if (this.session) this.session.tick(now);
       if (this._standby) this._standby.tick(now);
       if (this._back) this._back.tick(now);
-      if (this.senderTimedOut(now)) this.onSenderGone("heartbeat-timeout");
+      if ((!this.items || !this.items.length) && this.senderTimedOut(now)) this.onSenderGone("heartbeat-timeout");
     }
     if (!this._holdFrame || this._snapOn) this.draw();
     if (this.frameCover().black) this._noteBlack("draw");
@@ -4112,7 +4146,7 @@
   var MESSAGE_TYPES = {
     queue: 1, append: 1, remove: 1, move: 1, goto: 1,
     play: 1, pause: 1, next: 1, previous: 1, stop: 1,
-    heartbeat: 1, speed: 1, aim: 1, chunk: 1, fetchError: 1,
+    heartbeat: 1, ping: 1, speed: 1, aim: 1, chunk: 1, fetchError: 1,
     retile: 1, fov: 1, pace: 1, fade: 1, hello: 1, debug: 1,
     lan: 1, "soft-reset": 1, softReset: 1,
   };

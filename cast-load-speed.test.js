@@ -489,4 +489,33 @@ assert(page.indexOf('msg.type === "lan"') >= 0, "the receiver page can turn Wi-F
 
 assert(Cast.acceptCastMessage({ type: "soft-reset" }).type === "soft-reset", "acceptCastMessage allows soft-reset");
 assert(Cast.acceptCastMessage({ type: "lan", enabled: true }).type === "lan", "acceptCastMessage allows lan");
+assert(Cast.acceptCastMessage({ type: "ping", ts: 123 }).type === "ping", "acceptCastMessage allows ping");
+assert(page.indexOf("playerManager.load(") < 0, "receiver page does not call playerManager.load with an unplayable URL");
+assert(page.indexOf("__playerManager.pause(") < 0, "receiver page does not pause PlayerManager and arm CAF 5-minute idle timer");
+assert(page.indexOf("setApplicationState") >= 0, "receiver page refreshes application state for Cast keepalive");
+assert(page.indexOf("setTimeout(sendLimits, 500)") >= 0, "receiver page broadcasts readiness limits after boot");
+
+// Duplicate queue handshake retry does not wipe an active load
+const dup = freshPlayer();
+clock = 30000;
+dup.setQueue([hemisphere("dupA"), hemisphere("dupB")]);
+const dupTokenBefore = dup.session.token;
+const dupPendingBefore = dup.session.pending && dup.session.pending.id;
+assert(dupPendingBefore, "initial queue starts loading");
+const dupReplies = [];
+sandbox.__castSend = function (msg) { dupReplies.push(msg); };
+clock = 30500;
+dup.setQueue([hemisphere("dupA"), hemisphere("dupB")]);
+assert(dup.session.token === dupTokenBefore, "duplicate handshake queue keeps session token");
+assert(dup.session.pending && dup.session.pending.id === dupPendingBefore, "duplicate handshake queue keeps pending request");
+assert(dupReplies.some(function (m) { return m && m.type === "status"; }), "duplicate queue acknowledges with status");
+assert(dupReplies.some(function (m) { return m && m.type === "diag"; }), "duplicate queue acknowledges with diag");
+
+// Active show does not stop on senderTimedOut during step()
+dup._senderSeen = true;
+dup._lastSender = Date.now() - Cast.SENDER_TIMEOUT_MS - 10000;
+dup._last = 1000;
+dup._pumpFrame(1500);
+assert(dup.items.length === 2 && dup.playing === true, "active show stays on screen even when phone heartbeat is delayed");
+
 console.log("cast-load-speed ok");
