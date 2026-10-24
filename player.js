@@ -7,12 +7,14 @@
    GPano PosePitchDegrees and PoseRollDegrees level the sphere before that
    look, matching ProjectionMath.applyPose. The phone bakes cubemaps to
    equirect JPEGs with the standard face orientation, so this page samples
-   equirects only. Level-0 tiles are 512px with a 32px gutter. The phone
-   sends a 64×32 overview of the whole photo first. That sphere stays up
-   wherever a sharp tile is not resident, so the clear color never shows.
-   Full-resolution tiles stay only for the view and the pan lookahead.
-   Auto-pan asks for those ahead of the camera before the ones behind it,
-   and a manual Next or Previous cuts to the overview immediately.
+   equirects only. Level-0 strips are 120° wide and one latitude band tall,
+   with a 32px gutter, up to the TV's texture edge. The phone sends a 64×32
+   overview of the whole photo first. That sphere stays up wherever a sharp
+   strip is not resident, so the clear color never shows. Auto-pan loads the
+   0° horizon strip first and cascades toward the poles. Steering loads the
+   strip at the center of the screen first, keeps every strip of this photo,
+   and does not preload the next one. A manual Next or Previous cuts to the
+   overview immediately.
    The screen has no counters. */
 (function (root) {
   var ROTATIONS = 2;
@@ -50,9 +52,10 @@
   var LOOKAHEAD_FLOOR_S = 3;
   var LOOKAHEAD_LATENCY_FALLBACK_MS = 1500;
   var AHEAD_REQUESTS = 4;
-  // How long one sharp tile eases in. The geometric bloom is longer, so the
-  // circle at the middle of the screen has time to widen toward the poles.
+  // How long one strip eases from the master edge toward the far edge.
+  // The next band does not start until this one has finished.
   var FOCUS_MS = 700;
+  var STRIP_LOOKAHEAD_DEG = 55;
   var GEO_MS = 1600;
   var INTRO_FADE_MS = 700;
   var INTRO_CAP_MS = 8000;
@@ -538,11 +541,51 @@
   };
 
   Player.prototype._revealOf = function (piece) {
-    if (!piece || !piece.tex) return 0;
-    // A tile with no birth stamp used to jump straight to 1. Stamp it and
-    // ease, so the first draw is the start of the fade rather than a pop.
-    if (!(piece._focusAt > 0)) piece._focusAt = this._clock();
-    return revealProgress(piece._focusAt, this._clock(), FOCUS_MS);
+    if (!piece || !piece.tex || piece.tex.deferred || piece.tex._evicted) return 0;
+    if (piece._base || (piece.tile && piece.tile._base)) return 1;
+    // A finished strip stays open when the master moves. The amount still
+    // follows the clock, so a strip that has not reached the end of its fade
+    // is not stuck at 1.
+    if (!(piece._focusAt > 0)) {
+      if (piece._revealDone) return 1;
+      if (!this._fadeOpen(piece)) return 0;
+      piece._focusAt = this._clock();
+    }
+    var amount = revealProgress(piece._focusAt, this._clock(), FOCUS_MS);
+    if (amount >= 1) {
+      piece._revealDone = true;
+      return 1;
+    }
+    return amount;
+  };
+
+  Player.prototype._pieceAt = function (col, row) {
+    var lists = [this.session && this.session.loaded, this._tileDraw];
+    for (var n = 0; n < lists.length; n++) {
+      var list = lists[n];
+      if (!list) continue;
+      for (var i = 0; i < list.length; i++) {
+        var tile = list[i] && list[i].tile;
+        if (!tile || tile._base) continue;
+        if ((tile.col | 0) === col && (tile.row | 0) === row) return list[i];
+      }
+    }
+    return null;
+  };
+
+  Player.prototype._fadeOpen = function (piece) {
+    var tile = piece && piece.tile;
+    if (!tile || tile._base) return true;
+    var entry = this.session && this.session.entry;
+    if (!entry || !entry.tiles || !entry.tiles.length) return true;
+    var view = this._lodView();
+    var anchor = stripAnchorRow(entry.tiles, entry.height || this._tileH || 1, view);
+    var self = this;
+    return revealUnlocked(tile, entry.tiles, anchor, function (col, row) {
+      var parent = self._pieceAt(col, row);
+      if (!parent) return 0;
+      return self._revealOf(parent);
+    });
   };
 
   Player.prototype._photoSpan = function () {
@@ -574,6 +617,8 @@
         var piece = list[i];
         if (!piece || !piece.tex) continue;
         if (piece._base || (piece.tile && piece.tile._base)) continue;
+        if (piece._revealDone || piece._focusAt > 0) continue;
+        if (!this._fadeOpen(piece)) continue;
         piece._focusAt = now;
       }
     }
@@ -632,17 +677,11 @@
     var tiles = entry.tiles || [];
     if (!tiles.length) return true;
     var view = this._lodView();
-    var order = tileLoadOrder(tiles, entry.width, entry.height, view);
-    var cap = 0;
-    var need = Math.min(4, tiles.length);
-    for (var i = 0; i < order.length && cap < need; i++) {
-      var tile = tiles[order[i]];
-      if (!tile || tile._skip) continue;
-      if (!tileInView(tile, entry.width, entry.height, view)) continue;
-      cap += 1;
-      if (!this._pieceReadyId(session, tile.id)) return false;
-    }
-    return cap > 0;
+    var anchor = stripAnchorRow(tiles, entry.height, view);
+    var col = columnAtU(tiles, entry.width, view.u);
+    var master = findStrip(tiles, col, anchor);
+    if (!master || master._skip) return true;
+    return this._pieceReadyId(session, master.id);
   };
 
   Player.prototype._markWanted = function () {
@@ -696,7 +735,7 @@
     var found = this._neighborPiece(tile, dRow, dCol);
     if (found === 1) return 1;
     if (!found) return 0;
-    return this._mergeAmount(found);
+    return this._revealOf(found);
   };
 
   Player.prototype._neighborPiece = function (tile, dRow, dCol) {
@@ -1388,8 +1427,36 @@
     this._userFov = this._tfov;
     this.manual = true;
     this.playing = false;
+    // Steering keeps this photo and drops the next one so the GPU belongs here.
+    // The aim message does not reset a strip that has already started to open.
+    this._controllerHold = true;
+    this._pausePreload();
+    if (this.session && this.session._requestCurrent) this.session._requestCurrent();
     this._kick();
     return true;
+  };
+
+  Player.prototype._controllerMode = function () {
+    if (this.manual || this.held) return true;
+    if (this._presented && !this.playing && !this._awaitingSwap) return true;
+    return false;
+  };
+
+  Player.prototype._pausePreload = function () {
+    if (this._uploadQueue && this._uploadQueue.length) {
+      this._uploadQueue = this._uploadQueue.filter(function (job) { return !job.standby; });
+    }
+    this._dropStandby();
+  };
+
+  Player.prototype._syncResidency = function () {
+    var hold = this._controllerMode();
+    if (hold && !this._controllerHold) {
+      this._controllerHold = true;
+      this._pausePreload();
+    } else if (!hold && this._controllerHold) {
+      this._controllerHold = false;
+    }
   };
 
   Player.prototype.encodeEcho = function (seq, ts) {
@@ -1449,9 +1516,10 @@
     if (this._fading && this._fadeMs >= TILE_FADE_MS) this._endFade();
     if (this._snapOn && this._snapReveal && this._snapMs >= (this._snapFadeMs || SNAP_FADE_MS)) this._endSnap();
     this._pumpGpu();
+    this._syncResidency();
     this._releaseOutsideBand();
     if (this.session && this.session.entry) this.session._requestCurrent();
-    if (this._standby && this._standby.entry) this._standby._requestCurrent();
+    if (!this._controllerMode() && this._standby && this._standby.entry) this._standby._requestCurrent();
     this._diagAcc = (this._diagAcc || 0) + raw;
     if (this._diagAcc >= 1000) {
       this._diagAcc = 0;
@@ -1702,26 +1770,26 @@
 
   Player.prototype._evictScore = function (item, view) {
     if (!item) return null;
-    // The full-sphere overview stays. So does the frustum, the lookahead
-    // band, and the fade overlay. Behind the camera leaves first.
     if (item._base || (item.tex && item.tex._base) || (item.tile && item.tile._base)) return null;
     if (this._listedTex(this._fadeFrom, item.tex)) return null;
-    if (!item.tile && this._drawingTex(item.tex)) return null;
-    var sign = view && view.panSign < 0 ? -1 : 1;
-    if (item.tile && tileInResidentBand(item.tile, item.spanW || 1, item.spanH || 1, view)) return null;
-    if (!item.tile && this._tileVisible(item, view)) return null;
-    var lead = panLeadDeg(item.u || 0, view ? view.u : 0.5, sign);
-    if (lead <= 0) return 10000 - lead;
-    return 1000 + lead;
+    // Controller mode keeps every strip of the photo on screen. A standby
+    // texture from the next photo is the only thing that can leave.
+    if (this._controllerMode()) return item.standby ? 1 : null;
+    if (!item.standby) {
+      if (!item.tile) return this._drawingTex(item.tex) ? null : 1000;
+      if (this._tileVisible(item, view)) return null;
+      if (tileInResidentBand(item.tile, item.spanW || 1, item.spanH || 1, view)) return null;
+      var sign = view && view.panSign < 0 ? -1 : 1;
+      var lead = panLeadDeg(item.u || 0, view ? view.u : 0.5, sign);
+      if (lead > 0) return null;
+      return 5000 - lead;
+    }
+    return 100;
   };
 
   Player.prototype._releaseOutsideBand = function () {
-    if (!this._useTiles || !this._resident || !this._resident.length) return;
-    var view = this._lodView();
-    var guard = this._resident.length;
-    while (guard-- > 0) {
-      if (!this._evictDistant(view)) break;
-    }
+    // Auto-pan trims a strip only while uploading something that does not fit.
+    // Controller mode does not trim the current photo at all.
   };
 
   Player.prototype._evictDistant = function (view) {
@@ -1761,6 +1829,8 @@
     slot.aspect = aspect;
     slot.lookaheadDeg = this._lookaheadDeg();
     slot.panSign = 1;
+    slot.manual = !!this.manual;
+    slot.standby = false;
     return slot;
   };
 
@@ -2050,22 +2120,21 @@
       view: function () {
         var live = self._lodView();
         if (!session.standby) return live;
-        var start = {
+        return {
           u: 0.5,
           v: 0.5,
           halfU: live.halfU,
           halfV: live.halfV,
           yaw: 0,
-          pitch: live.pitch,
+          pitch: 0,
           roll: 0,
           fov: live.fov,
           aspect: live.aspect,
           lookaheadDeg: live.lookaheadDeg,
           panSign: 1,
+          manual: false,
+          standby: true,
         };
-        if (live.pitch > 28) start.v = live.v;
-        else if (live.pitch < -28) start.v = live.v;
-        return start;
       },
       onEntry: function (entry) { self._ensureBase(entry); },
       upload: function (img, tile, done) {
@@ -2769,6 +2838,7 @@
       tile: drawn,
       spanW: spanW,
       spanH: spanH,
+      standby: !!standby,
     });
     if (upW * upH >= 256 * 256) this._noteUploadLatency(nowMs() - uploadStarted);
     if (entry && tile && source && source.width > 0 && source.height > 0) this._paintBase(entry, source, tile);
@@ -3012,7 +3082,7 @@
     this._focusAnim = false;
     var geoT = this._geoLinear();
     if (geoT < 1) this._focusAnim = true;
-    var anchorV = Math.abs(view.pitch || 0) > 28 ? view.v : 0.5;
+    var anchorV = this.manual ? view.v : 0.5;
     if (loc.geo) gl.uniform1f(loc.geo, geoT);
     if (loc.viewU) gl.uniform1f(loc.viewU, view.u);
     if (loc.viewV) gl.uniform1f(loc.viewV, view.v);
@@ -3762,20 +3832,20 @@
       "  float spanV=max(uV1-uV0,1e-4);\n" +
       "  float sx=clamp((su-uU0)/spanU,0.0,1.0);\n" +
       "  float sy=clamp((sv-uV0)/spanV,0.0,1.0);\n" +
-      "  float degU=spanU*360.0;float degV=spanV*180.0;\n" +
-      "  float dx=(sx-0.5)*degU;float dy=(sy-0.5)*degV;\n" +
-      "  float dist=sqrt(dx*dx+dy*dy);\n" +
-      "  float halfU=degU*0.5;float halfV=degV*0.5;\n" +
-      "  float inscribed=max(min(halfU,halfV),0.001);\n" +
-      "  float feather=inscribed*0.42;\n" +
-      "  float safeR=max(inscribed-feather,0.001);\n" +
-      "  float corner=sqrt(halfU*halfU+halfV*halfV);\n" +
-      "  float ready=min(min(ease01(uNL),ease01(uNR)),min(ease01(uNU),ease01(uND)));\n" +
-      "  float grow=e>0.999?ready:0.0;\n" +
-      "  float rad=mix(max(safeR*max(e,0.001),0.001),max(corner*2.2,0.001),grow);\n" +
-      "  float inner=rad*0.55;float outer=rad*1.45;\n" +
-      "  float x=clamp((dist-inner)/max(outer-inner,1e-4),0.0,1.0);\n" +
-      "  return e*(1.0-x*x*(3.0-2.0*x));\n" +
+      "  float anchor=clamp((uAnchorV-uV0)/spanV,-0.25,1.25);\n" +
+      "  float along;\n" +
+      "  if(anchor<=0.0) along=sy;\n" +
+      "  else if(anchor>=1.0) along=1.0-sy;\n" +
+      "  else along=abs(sy-anchor)/max(max(anchor,1.0-anchor),1e-4);\n" +
+      "  float feather=0.62;\n" +
+      "  float wave=ease01(clamp((e*(1.0+feather)-along)/feather,0.0,1.0));\n" +
+      "  float hx=sx<0.5?ease01(uNL):ease01(uNR);\n" +
+      "  float hy=sy<0.5?ease01(uNU):ease01(uND);\n" +
+      "  float ex=min(sx,1.0-sx);\n" +
+      "  float ey=min(sy,1.0-sy);\n" +
+      "  float fx=mix(smoothstep(0.0,0.08,ex),1.0,hx);\n" +
+      "  float fy=mix(smoothstep(0.0,0.14,ey),1.0,hy);\n" +
+      "  return wave*fx*fy;\n" +
       "}\n" +
       "const float PI=3.141592653589793;const float TWO_PI=6.283185307179586;\n" +
       pose + "\nvoid main(){\n" + body + "}";
@@ -4258,30 +4328,43 @@
     return (lead - tileDeg / 2) <= limit;
   };
 
-  PhotoSession.prototype._pickTile = function (windowOnly) {
+  PhotoSession.prototype._pickTile = function () {
     var entry = this.entry;
     if (!entry || !entry.tiles) return null;
-    var order = this.tileOrder;
-    var total = order ? order.length : entry.tiles.length;
-    var start = order ? (this.orderPos | 0) : (this.tileIndex | 0);
-    var view = this.hooks.view ? this.hooks.view() : null;
-    var fallback = null;
-    for (var s = start; s < total; s++) {
-      var index = order ? order[s] : s;
-      var tile = entry.tiles[index];
-      if (!tile) continue;
-      if (tile._skip) continue;
-      if (this.assemblers[tile.id]) continue;
-      if (this._tileReady(tile.id)) continue;
-      var outside = view && view.lookaheadDeg > 0 && !tileInResidentBand(tile, entry.width, entry.height, view);
-      if (outside || (windowOnly && !this._tileInLookahead(tile, view))) {
-        if (!fallback) fallback = tile;
+    var view = this.hooks.view ? this.hooks.view() : { u: 0.5, v: 0.5, panSign: 1 };
+    var masters = activeMasters(entry.tiles, entry.width, entry.height, view, this._masterInfo(view));
+    var anchor = stripAnchorRow(entry.tiles, entry.height, view);
+    var viewCol = columnAtU(entry.tiles, entry.width, view.u);
+    var anchorTile = findStrip(entry.tiles, viewCol, anchor);
+    var anchorLoaded = !!(anchorTile && this._masterInfo(view).loaded(anchorTile));
+    var anchorReveal = this._revealAt(viewCol, anchor);
+    var viewWaiting = false;
+    var pool = [];
+    for (var i = 0; i < masters.length; i++) {
+      var tile = masters[i];
+      if (!tile || tile._skip || this.assemblers[tile.id] || this._tileReady(tile.id)) {
+        if (tile && (tile.col | 0) === viewCol && this._revealAt(tile.col | 0, tile.row | 0) < 1) viewWaiting = true;
         continue;
       }
-      return tile;
+      if ((tile.col | 0) === viewCol && this._revealAt(tile.col | 0, tile.row | 0) < 1) viewWaiting = true;
+      pool.push(tile);
     }
-    if (windowOnly || this._inFlight() > 0) return null;
-    return fallback;
+    var best = null;
+    var bestRank = 1e15;
+    for (var j = 0; j < pool.length; j++) {
+      var candidate = pool[j];
+      var sameColumn = (candidate.col | 0) === viewCol;
+      var lookahead = !sameColumn && (candidate.row | 0) === anchor && anchorLoaded;
+      if (viewWaiting && !sameColumn && !(lookahead && anchorReveal < 1)) continue;
+      if (!sameColumn && !lookahead && anchorReveal < 1) continue;
+      var rank = masterRank(candidate, entry.tiles, entry.width, entry.height, view);
+      if (!sameColumn) rank += 500;
+      if (rank < bestRank) {
+        bestRank = rank;
+        best = candidate;
+      }
+    }
+    return best;
   };
 
   PhotoSession.prototype._issue = function (tile) {
@@ -4336,6 +4419,84 @@
     return !!(this._openTokens && this._openTokens[token]);
   };
 
+  PhotoSession.prototype._pieceFor = function (tile) {
+    if (!tile) return null;
+    var loaded = this.loaded || [];
+    for (var i = 0; i < loaded.length; i++) {
+      var piece = loaded[i];
+      if (piece && piece.tile && piece.tile.id === tile.id) return piece;
+    }
+    return null;
+  };
+
+  PhotoSession.prototype._revealAt = function (col, row) {
+    if (!this.entry) return 0;
+    var tile = findStrip(this.entry.tiles, col, row);
+    if (!tile) return 0;
+    var piece = this._pieceFor(tile);
+    if (!piece || !piece.tex || piece.tex.deferred || piece.tex._evicted) return 0;
+    if (!(piece._focusAt > 0)) return piece._revealDone ? 1 : 0;
+    var amount = revealProgress(piece._focusAt, this._now(), FOCUS_MS);
+    if (amount >= 1) piece._revealDone = true;
+    return amount;
+  };
+
+  PhotoSession.prototype._openForFade = function (tile) {
+    if (!tile || tile._base || tile._overview) return true;
+    if (!this.entry || !this.entry.tiles) return true;
+    var view = this.hooks.view ? this.hooks.view() : { u: 0.5, v: 0.5 };
+    var anchor = stripAnchorRow(this.entry.tiles, this.entry.height, view);
+    var self = this;
+    return revealUnlocked(tile, this.entry.tiles, anchor, function (col, row) {
+      return self._revealAt(col, row);
+    });
+  };
+
+  PhotoSession.prototype._masterInfo = function (view) {
+    var self = this;
+    return {
+      loaded: function (tile) {
+        var piece = self._pieceFor(tile);
+        return !!(piece && piece.tex && !piece.tex.deferred && !piece.tex._evicted);
+      },
+      revealAt: function (col, row) { return self._revealAt(col, row); },
+    };
+  };
+
+  PhotoSession.prototype._releaseStale = function () {
+    if (!this.entry || !this.entry.tiles || !this.assemblers) return;
+    var view = this.hooks.view ? this.hooks.view() : null;
+    var masters = activeMasters(this.entry.tiles, this.entry.width, this.entry.height, view, this._masterInfo(view));
+    var keep = {};
+    for (var i = 0; i < masters.length; i++) keep[masters[i].id] = true;
+    var dropped = false;
+    for (var id in this.assemblers) {
+      var box = this.assemblers[id];
+      if (!box || (box.tile && (box.tile._overview || box.tile._base))) continue;
+      if (keep[id]) continue;
+      delete this.assemblers[id];
+      if (this._openTokens && box) delete this._openTokens[box.token];
+      dropped = true;
+    }
+    if (dropped) this._syncPending();
+  };
+
+  PhotoSession.prototype._pickListed = function () {
+    var entry = this.entry;
+    if (!entry || !entry.tiles) return null;
+    var order = this.tileOrder;
+    var total = order ? order.length : entry.tiles.length;
+    var start = order ? (this.orderPos | 0) : (this.tileIndex | 0);
+    for (var s = start; s < total; s++) {
+      var index = order ? order[s] : s;
+      var tile = entry.tiles[index];
+      if (!tile || tile._skip) continue;
+      if (this.assemblers[tile.id] || this._tileReady(tile.id)) continue;
+      return tile;
+    }
+    return null;
+  };
+
   PhotoSession.prototype._requestCurrent = function () {
     var entry = this.entry;
     if (!entry || !entry.tiles || this.budgetFull) return;
@@ -4343,16 +4504,31 @@
       this.preloadCapped = true;
       return;
     }
+    var view = this.hooks.view ? this.hooks.view() : null;
+    if (!view) {
+      // A session with no camera still feeds the next listed strip as each
+      // one finishes, one at a time. The TV always has a view, and that path
+      // spends the whole pipe on the current master strips.
+      this._syncCursor();
+      this._syncPending();
+      if (this._inFlight() > 0) return;
+      var listed = this._pickListed();
+      if (listed && !this.assemblers[listed.id]) this._issue(listed);
+      return;
+    }
+    this._releaseStale();
     this._aimOrder();
     this._syncCursor();
     this._syncPending();
-    var tile = this._pickTile(false);
-    if (!tile) {
-      this._fillWindow();
-      return;
+    var guard = 0;
+    var ahead = this.hooks.ahead ? (this.hooks.ahead() | 0) : AHEAD_REQUESTS;
+    if (!(ahead > 0)) ahead = AHEAD_REQUESTS;
+    while (this._inFlight() < ahead && guard < ahead) {
+      guard += 1;
+      var tile = this._pickTile(false);
+      if (!tile) return;
+      if (!this.assemblers[tile.id]) this._issue(tile);
     }
-    if (!this.assemblers[tile.id]) this._issue(tile);
-    this._fillWindow();
   };
 
   PhotoSession.prototype._lookaheadCovered = function () {
@@ -4553,8 +4729,8 @@
           var have = self.loaded[slot];
           if (have && have.tile && box.tile && have.tile.id === box.tile.id) replaced = slot;
         }
-        var stored = { tex: tex, tile: box.tile, payload: image._spsPayload || null };
-        if (!self.standby) stored._focusAt = self._now();
+        var stored = { tex: tex, tile: box.tile, payload: image._spsPayload || null, _focusAt: 0 };
+        if (!self.standby && self._openForFade(box.tile)) stored._focusAt = self._now();
         if (replaced >= 0) self.loaded[replaced] = stored;
         else self.loaded.push(stored);
         self._syncCursor();
@@ -5192,54 +5368,171 @@
     return "";
   }
 
-  function tileLoadOrder(tiles, width, height, view) {
-    view = view || {};
-    var directed = !!(view.lookaheadDeg > 0 || view.panSign === 1 || view.panSign === -1);
-    var sign = view.panSign < 0 ? -1 : 1;
-    var pitch = view.pitch || 0;
-    var lookPole = pitch > 28 ? "north" : (pitch < -28 ? "south" : "");
-    var vu = view.u != null ? view.u : 0.5;
-    var vv = view.v != null ? view.v : 0.5;
-    var spanW = Math.max(width, 1);
-    var spanH = Math.max(height, 1);
-    var order = [];
+  function gridStats(tiles) {
+    var rows = 1;
+    var cols = 1;
+    if (!tiles) return { rows: rows, cols: cols };
     for (var i = 0; i < tiles.length; i++) {
       var tile = tiles[i];
-      var cu = (tile.srcX + tile.srcW / 2) / spanW;
-      var cv = (tile.srcY + tile.srcH / 2) / spanH;
-      var du = uDist(cu, vu) * 360;
-      var dv = Math.abs(cv - vv) * 180;
-      var ang = Math.sqrt(du * du + dv * dv);
-      var contains = vu >= tile.srcX / spanW && vu <= (tile.srcX + tile.srcW) / spanW &&
-        vv >= tile.srcY / spanH && vv <= (tile.srcY + tile.srcH) / spanH;
-      // Horizon rows near the screen center come first. Latitude then costs
-      // more, so the next bands step toward the poles instead of jumping there.
-      var horizonPenalty = lookPole ? 0 : Math.abs(cv - 0.5) * 180 * 1.15;
-      var lead = directed ? panLeadDeg(cu, vu, sign) : 0;
-      var inView = !!(view && tileInView(tile, spanW, spanH, view));
-      var ahead = 0;
-      // The tile under the screen center is not pushed aside for the pan.
-      // Lookahead only reorders the tiles around it.
-      if (directed && !contains) {
-        if (!inView && lead < -0.5) ahead = 90;
-        else if (lead > 0) ahead = -Math.min(lead, 40) * 0.15;
-      }
-      var pole = tilePole(tile, spanH);
-      var poleRank = lookPole ? (pole === lookPole ? 0 : 1) : 0;
-      order.push({
-        index: i,
-        poleRank: poleRank,
-        score: (contains ? -1000 : 0) + ang + horizonPenalty + ahead,
-        ang: ang,
-      });
+      if (!tile || tile._base) continue;
+      if ((tile.row | 0) + 1 > rows) rows = (tile.row | 0) + 1;
+      if ((tile.col | 0) + 1 > cols) cols = (tile.col | 0) + 1;
     }
+    return { rows: rows, cols: cols };
+  }
+
+  function stripAnchorRow(tiles, height, view) {
+    var stats = gridStats(tiles);
+    var mid = Math.floor(stats.rows / 2);
+    if (!view || !view.manual) return mid;
+    var v = view.v == null ? 0.5 : view.v;
+    var span = Math.max(height, 1);
+    var found = mid;
+    for (var i = 0; i < tiles.length; i++) {
+      var tile = tiles[i];
+      if (!tile || tile._base) continue;
+      var v0 = tile.srcY / span;
+      var v1 = (tile.srcY + tile.srcH) / span;
+      var last = (tile.row | 0) === stats.rows - 1;
+      if (v >= v0 && (v < v1 || (last && v <= v1 + 1e-6))) return tile.row | 0;
+      if (v >= v0 && v <= v1) found = tile.row | 0;
+    }
+    return found;
+  }
+
+  function columnAtU(tiles, width, u) {
+    var span = Math.max(width, 1);
+    var uu = u == null ? 0.5 : u;
+    var best = 0;
+    var bestD = 2;
+    var found = false;
+    for (var i = 0; i < tiles.length; i++) {
+      var tile = tiles[i];
+      if (!tile || tile._base) continue;
+      var u0 = tile.srcX / span;
+      var u1 = (tile.srcX + tile.srcW) / span;
+      if (uu >= u0 - 1e-6 && uu <= u1 + 1e-6) {
+        // An exact seam stays with the lower column, the strip the view is
+        // still in. The next column is the pan-direction neighbor.
+        if (!found || (tile.col | 0) < best) best = tile.col | 0;
+        found = true;
+        continue;
+      }
+      var d = uDist((u0 + u1) / 2, uu);
+      if (!found && d < bestD) {
+        bestD = d;
+        best = tile.col | 0;
+      }
+    }
+    return best;
+  }
+
+  function findStrip(tiles, col, row) {
+    if (!tiles) return null;
+    for (var i = 0; i < tiles.length; i++) {
+      var tile = tiles[i];
+      if (!tile || tile._base) continue;
+      if ((tile.col | 0) === col && (tile.row | 0) === row) return tile;
+    }
+    return null;
+  }
+
+  function parentRowOf(row, anchor) {
+    if (row === anchor) return -1;
+    return row < anchor ? row + 1 : row - 1;
+  }
+
+  function revealUnlocked(tile, tiles, anchor, revealAt) {
+    if (!tile || tile._base) return true;
+    var row = tile.row | 0;
+    if (row === anchor) return true;
+    var parent = parentRowOf(row, anchor);
+    var amount = revealAt ? revealAt(tile.col | 0, parent) : 0;
+    return amount >= 1;
+  }
+
+  function columnEngaged(col, viewCol, tiles, width, view) {
+    if (col === viewCol) return true;
+    var sample = null;
+    for (var i = 0; i < tiles.length; i++) {
+      if (tiles[i] && !tiles[i]._base && (tiles[i].col | 0) === col) {
+        sample = tiles[i];
+        break;
+      }
+    }
+    if (!sample) return false;
+    var span = Math.max(width, 1);
+    var cu = (sample.srcX + sample.srcW / 2) / span;
+    var vu = view && view.u != null ? view.u : 0.5;
+    var sign = view && view.panSign < 0 ? -1 : 1;
+    var lead = panLeadDeg(cu, vu, sign);
+    var tileDeg = (sample.srcW / span) * 360;
+    var far = lead + tileDeg / 2;
+    var near = lead - tileDeg / 2;
+    var half = ((view && view.halfU) || 0.12) * 360;
+    if (near <= 0 && far >= 0) return true;
+    // Behind the camera only stays a master when it still clips the frustum.
+    // Ahead, start the next 120° strip while it is still short of the screen edge.
+    if (far < 0) return -far <= half + 8;
+    var extra = STRIP_LOOKAHEAD_DEG;
+    if (view && view.lookaheadDeg > 0) extra = Math.max(extra, Math.min(view.lookaheadDeg, 90));
+    return near <= half + extra;
+  }
+
+  function activeMasters(tiles, width, height, view, info) {
+    info = info || {};
+    var loaded = info.loaded || function () { return false; };
+    var revealAt = info.revealAt || function () { return 0; };
+    view = view || {};
+    var anchor = stripAnchorRow(tiles, height, view);
+    var viewCol = columnAtU(tiles, width, view.u);
+    var anchorTile = findStrip(tiles, viewCol, anchor);
+    var anchorLoaded = !!(anchorTile && loaded(anchorTile));
+    var masters = [];
+    for (var i = 0; i < tiles.length; i++) {
+      var tile = tiles[i];
+      if (!tile || tile._base || tile._skip) continue;
+      if (!revealUnlocked(tile, tiles, anchor, revealAt)) continue;
+      var col = tile.col | 0;
+      if (col !== viewCol) {
+        if (!anchorLoaded) continue;
+        if (!columnEngaged(col, viewCol, tiles, width, view)) continue;
+      }
+      if (view.standby && Math.abs((tile.row | 0) - anchor) > 0) continue;
+      masters.push(tile);
+    }
+    return masters;
+  }
+
+  function masterRank(tile, tiles, width, height, view) {
+    var stats = gridStats(tiles);
+    var anchor = stripAnchorRow(tiles, height, view);
+    var viewCol = columnAtU(tiles, width, view && view.u);
+    var tier = Math.abs((tile.row | 0) - anchor);
+    var dist = Math.abs((tile.col | 0) - viewCol);
+    var wrap = stats.cols - dist;
+    if (wrap < dist) dist = wrap;
+    var sign = view && view.panSign < 0 ? -1 : 1;
+    var delta = (tile.col | 0) - viewCol;
+    if (delta > stats.cols / 2) delta -= stats.cols;
+    if (delta < -stats.cols / 2) delta += stats.cols;
+    var ahead = delta * sign;
+    var side = ahead > 0 ? 0 : (ahead < 0 ? 1 : 0);
+    var vertical = (tile.row | 0) < anchor ? 0 : 1;
+    return tier * 1000 + dist * 100 + side * 10 + vertical;
+  }
+
+  function tileLoadOrder(tiles, width, height, view) {
+    view = view || {};
+    var order = [];
+    for (var i = 0; i < tiles.length; i++) order.push(i);
     order.sort(function (a, b) {
-      if (a.poleRank !== b.poleRank) return a.poleRank - b.poleRank;
-      if (a.score !== b.score) return a.score - b.score;
-      if (a.ang !== b.ang) return a.ang - b.ang;
-      return a.index - b.index;
+      var ra = masterRank(tiles[a], tiles, width, height, view);
+      var rb = masterRank(tiles[b], tiles, width, height, view);
+      if (ra !== rb) return ra - rb;
+      return a - b;
     });
-    return order.map(function (item) { return item.index; });
+    return order;
   }
 
   function easeInOut(t) {
@@ -5289,13 +5582,6 @@
     var down = neighbors.down == null ? 1 : neighbors.down;
     var tileA = reveal > 0 ? reveal : 0;
     if (tileA > 1) tileA = 1;
-    // A global bloom clock used to hit 1 before a late tile arrived, and the
-    // rectangle then faded in as a square. The circle is this tile's own
-    // reveal, measured from the tile center in degrees on the sphere.
-    // Corners stay dark until the neighbors are open too, so a finished
-    // tile does not cut a straight edge into a neighbor that is still soft.
-    // geo is accepted so older callers still parse, and it does not fill the square.
-    void geo;
     var e = easeInOut(tileA);
     var u0 = tile.srcX / spanW;
     var u1 = (tile.srcX + tile.srcW) / spanW;
@@ -5309,22 +5595,23 @@
     if (sx > 1) sx = 1;
     if (sy < 0) sy = 0;
     if (sy > 1) sy = 1;
-    var degU = spanU * 360;
-    var degV = spanV * 180;
-    var dx = (sx - 0.5) * degU;
-    var dy = (sy - 0.5) * degV;
-    var dist = Math.sqrt(dx * dx + dy * dy);
-    var halfU = degU * 0.5;
-    var halfV = degV * 0.5;
-    var inscribed = Math.max(Math.min(halfU, halfV), 0.001);
-    var feather = inscribed * 0.42;
-    var safeR = Math.max(inscribed - feather, 0.001);
-    var corner = Math.sqrt(halfU * halfU + halfV * halfV);
-    var ready = Math.min(easeInOut(left), easeInOut(right), easeInOut(up), easeInOut(down));
-    var grow = e > 0.999 ? ready : 0;
-    var rad = (safeR * Math.max(e, 0.001)) * (1 - grow) + (corner * 2.2) * grow;
-    if (rad < 0.001) rad = 0.001;
-    return e * (1 - smoothstep(rad * 0.55, rad * 1.45, dist));
+    var anchorV = geo.anchorV == null ? 0.5 : geo.anchorV;
+    var anchor = (anchorV - v0) / spanV;
+    if (anchor < -0.25) anchor = -0.25;
+    if (anchor > 1.25) anchor = 1.25;
+    var along;
+    if (anchor <= 0) along = sy;
+    else if (anchor >= 1) along = 1 - sy;
+    else along = Math.abs(sy - anchor) / Math.max(Math.max(anchor, 1 - anchor), 1e-4);
+    var feather = 0.62;
+    var wave = easeInOut(Math.max(0, Math.min(1, (e * (1 + feather) - along) / feather)));
+    var hx = sx < 0.5 ? easeInOut(left) : easeInOut(right);
+    var hy = sy < 0.5 ? easeInOut(up) : easeInOut(down);
+    var ex = Math.min(sx, 1 - sx);
+    var ey = Math.min(sy, 1 - sy);
+    var fx = smoothstep(0, 0.08, ex) * (1 - hx) + hx;
+    var fy = smoothstep(0, 0.14, ey) * (1 - hy) + hy;
+    return wave * fx * fy;
   }
 
   function standbyAllowance(cap, used) {
@@ -5790,6 +6077,10 @@
     geoRadii: geoRadii,
     shouldStripUpload: shouldStripUpload,
     focusMask: focusMask,
+    activeMasters: activeMasters,
+    revealUnlocked: revealUnlocked,
+    stripAnchorRow: stripAnchorRow,
+    columnAtU: columnAtU,
     armSenderGrace: armSenderGrace,
     shouldTryLan: shouldTryLan,
     loadHttpJpeg: loadHttpJpeg,
