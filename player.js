@@ -21,7 +21,8 @@
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
   var CROSSFADE_MS = 1200;
-  var TILE_FADE_MS = 600;
+  // Photo-to-photo fade from the 2:38 PM restore point.
+  var TILE_FADE_MS = 2400;
   var SNAP_FADE_MS = 1200;
   var SNAP_W = 1920;
   var SNAP_H = 1080;
@@ -52,16 +53,23 @@
   var LOOKAHEAD_FLOOR_S = 3;
   var LOOKAHEAD_LATENCY_FALLBACK_MS = 1500;
   var AHEAD_REQUESTS = 2;
-  // One phone miss used to be 2.2s and then Wi-Fi stayed off for the show.
-  // Strips of an 8192 photo need longer, and a miss falls back to Cast.
-  var LAN_TIMEOUT_MS = 8000;
-  var LAN_FAIL_LIMIT = 4;
+  // Once a LAN JPEG has actually arrived, keep a few strips in flight.
+  var LAN_AHEAD = 4;
+  // The first HTTP try is a probe. A blocked phone must fall back to Cast
+  // before it can stall the show. A proven LAN gets a longer timeout.
+  var LAN_PROBE_TIMEOUT_MS = 1500;
+  var LAN_TIMEOUT_MS = 3000;
+  var LAN_FAIL_LIMIT = 2;
+  // A single decode, fetch, or stall must not blank the horizon. Each strip
+  // is asked again at least this many times, over Cast, before it is skipped.
+  var TILE_RETRIES = 3;
   // How long one strip moves from the master edge toward the far edge.
-  // The next band joins when this strip's leading edge reaches the seam,
-  // which is 1/(1+feather) of the way through the same linear fade.
-  var FOCUS_MS = 2800;
-  var FOCUS_FEATHER = 0.5;
-  var REVEAL_HANDOFF = 1 / (1 + FOCUS_FEATHER);
+  // The next band joins at 0.35. The soft band is 0.65 of a strip wide.
+  // 0.35 + 0.65 = 1, so the seam is one continuous wave.
+  var FOCUS_MS = 1800;
+  var FOCUS_FEATHER = 0.65;
+  var FOCUS_HANDOFF = 0.35;
+  var REVEAL_HANDOFF = FOCUS_HANDOFF;
   var STRIP_LOOKAHEAD_DEG = 55;
   var GEO_MS = 3200;
   var INTRO_FADE_MS = 700;
@@ -415,9 +423,10 @@
     this._diagNote = "";
     this._diagKey = "";
     // setLan() runs before setQueue(). A new show retries Wi-Fi, and it
-    // keeps the flag the queue message just set.
+    // keeps the flag the queue message just set. The probe starts over.
     this._lanDead = false;
     this._lanFailures = 0;
+    this._lanVerified = false;
       this._markBusy();
       this._paintMark();
       if (this.items.length) this._openCurrent();
@@ -931,6 +940,7 @@
     this._lan = !!on;
     this._lanDead = false;
     this._lanFailures = 0;
+    this._lanVerified = false;
   };
 
   Player.prototype._urlFor = function (id) {
@@ -957,14 +967,20 @@
     return null;
   };
 
+  Player.prototype._lanTimeoutMs = function () {
+    return this._lanVerified ? LAN_TIMEOUT_MS : LAN_PROBE_TIMEOUT_MS;
+  };
+
   Player.prototype._loadLan = function (id, token, url) {
     var self = this;
-    loadHttpJpeg(url, LAN_TIMEOUT_MS, function (err, img) {
+    var probing = !self._lanVerified;
+    loadHttpJpeg(url, probing ? LAN_PROBE_TIMEOUT_MS : LAN_TIMEOUT_MS, function (err, img) {
       if (err || !img) {
-        // One slow strip is not a dead phone. Keep Wi-Fi up and ask Cast
-        // for this JPEG only. Several misses in a row drop the LAN path.
+        // Until one JPEG arrives, a single miss means the TV cannot reach
+        // the phone. Fall back to Cast immediately. A proven LAN tolerates
+        // a short run of misses before the same fallback.
         self._lanFailures = (self._lanFailures || 0) + 1;
-        if (self._lanFailures >= LAN_FAIL_LIMIT) self._lanDead = true;
+        if (probing || self._lanFailures >= LAN_FAIL_LIMIT) self._lanDead = true;
         self._diagErrors = (self._diagErrors || 0) + 1;
         self._diagNote = "LAN JPEG unreachable; using Cast messages";
         self._reportTv(self._diagNote);
@@ -972,6 +988,7 @@
         if (window.__castSend) window.__castSend({ type: "fetch", id: id, token: token, reason: "lan" });
         return;
       }
+      self._lanVerified = true;
       self._lanFailures = 0;
       var pool = self._poolWithToken(id, token);
       if (!pool || !pool.noteImage(id, token, img)) {
@@ -1077,13 +1094,47 @@
     return found;
   };
 
+  Player.prototype._hasMidBands = function (session) {
+    var entry = session && session.entry;
+    if (!entry || !entry.tiles) return false;
+    var rows = gridStats(entry.tiles).rows;
+    if (rows <= 2) return false;
+    for (var i = 0; i < entry.tiles.length; i++) {
+      var tile = entry.tiles[i];
+      if (!tile || tile._base || tile._skip || tile._overview) continue;
+      var row = tile.row | 0;
+      if (row > 0 && row < rows - 1) return true;
+    }
+    return false;
+  };
+
+  /** Rows between the pole caps, on every column. The screen and the next horizon. */
+  Player.prototype._screenStripsReady = function () {
+    var session = this.session;
+    var entry = session && session.entry;
+    if (!entry || !entry.tiles || !entry.tiles.length) return false;
+    var rows = gridStats(entry.tiles).rows;
+    var found = false;
+    for (var i = 0; i < entry.tiles.length; i++) {
+      var tile = entry.tiles[i];
+      if (!tile || tile._base || tile._overview) continue;
+      var row = tile.row | 0;
+      if (row <= 0 || row >= rows - 1) continue;
+      found = true;
+      // A strip that exhausted its retries must not hold the next photo.
+      if (tile._skip) continue;
+      if (!this._pieceReadyId(session, tile.id)) return false;
+    }
+    return found;
+  };
+
   Player.prototype._activeBusy = function () {
     var session = this.session;
     if (!session || !session.entry) return false;
     if (sessionReady(session)) return false;
-    // The outer strips can still be downloading. The next photo starts once
-    // the opening band is in, and it does not wait on the blur fade.
-    if (this._openingFetched()) return false;
+    // The next photo waits until every non-pole strip of both hemispheres
+    // is in. Pole caps and the blur fade do not hold that preload.
+    if (this._hasMidBands(session)) return !this._screenStripsReady();
     if (session.pending) return true;
     if (session._inFlight && session._inFlight() > 0) return true;
     if (session._pickTile && session._pickTile()) return true;
@@ -2199,7 +2250,13 @@
         }
         if (window.__castSend) window.__castSend({ type: "fetch", id: id, token: token });
       },
+      onTileRetry: function () {
+        // A lost JPEG is retried on the Cast channel. Leaving LAN armed
+        // would spend another probe on the same dead socket.
+        self._lanDead = true;
+      },
       ahead: function () {
+        if (self._lan && !self._lanDead && self._lanVerified) return LAN_AHEAD;
         return AHEAD_REQUESTS;
       },
       preloadLimit: function () { return self._preloadDepth || 0; },
@@ -4213,8 +4270,10 @@
       "  if(anchor<=0.0) along=sy;\n" +
       "  else if(anchor>=1.0) along=1.0-sy;\n" +
       "  else along=abs(sy-anchor)/max(max(anchor,1.0-anchor),1e-4);\n" +
-      "  float feather=0.5;\n" +
-      "  return clamp((e*(1.0+feather)-along)/feather,0.0,1.0);\n" +
+      "  float feather=" + FOCUS_FEATHER.toFixed(2) + ";\n" +
+      "  float handoff=" + FOCUS_HANDOFF.toFixed(2) + ";\n" +
+      "  float lead=e/max(handoff,1.0e-4);\n" +
+      "  return clamp((lead-along)/max(feather,1.0e-4),0.0,1.0);\n" +
       "}\n" +
       "const float PI=3.141592653589793;const float TWO_PI=6.283185307179586;\n" +
       pose + "\nvoid main(){\n" + body + "}";
@@ -4468,6 +4527,7 @@
     this.hooks = hooks || {};
     this.generation = 0;
     this.token = 0;
+    this._tokenEpoch = 0;
     this.live = [];
     this.loaded = [];
     this.assemblers = {};
@@ -4494,6 +4554,7 @@
   PhotoSession.prototype.dispose = function () {
     this.generation += 1;
     this.token += 1;
+    this._tokenEpoch = (this._tokenEpoch || 0) + 1;
     this._releaseAll();
     this.loaded = [];
     this.assemblers = {};
@@ -4508,6 +4569,10 @@
 
   PhotoSession.prototype.open = function (entry) {
     this.dispose();
+    // dispose() climbed the counter so a late chunk from the previous photo
+    // cannot match. The phone still pushes this photo's overview and the
+    // front horizon at token 1, so the new wave starts there again.
+    this.token = 0;
     this.standby = false;
     this.budgetFull = false;
     this.tileOrder = null;
@@ -4531,6 +4596,7 @@
     if (!entry || !entry.tiles || !entry.tiles.length) return;
     if (this.entry && this.entry.id === entry.id && (this.loaded.length || this.pending)) return;
     this.dispose();
+    this.token = 0;
     this.standby = true;
     this.budgetFull = false;
     this.entry = entry;
@@ -4705,19 +4771,44 @@
     return (lead - tileDeg / 2) <= limit;
   };
 
+  PhotoSession.prototype._bandsOutstanding = function (view) {
+    var entry = this.entry;
+    if (!entry || !entry.tiles) return false;
+    var anchor = stripAnchorRow(entry.tiles, entry.height, view);
+    var viewCol = columnAtU(entry.tiles, entry.width, view && view.u);
+    var stats = gridStats(entry.tiles);
+    for (var i = 0; i < entry.tiles.length; i++) {
+      var tile = entry.tiles[i];
+      if (!tile || tile._base || tile._skip || tile._overview) continue;
+      if (Math.abs((tile.row | 0) - anchor) > 1) continue;
+      var dist = Math.abs((tile.col | 0) - viewCol);
+      var wrap = stats.cols - dist;
+      if (wrap < dist) dist = wrap;
+      if (stats.cols === 2 && (tile.col | 0) !== viewCol) dist = 1;
+      if (dist > 1) continue;
+      if (this.assemblers[tile.id] || this._tileReady(tile.id)) continue;
+      return true;
+    }
+    return false;
+  };
+
   PhotoSession.prototype._pickTile = function () {
     var entry = this.entry;
     if (!entry || !entry.tiles) return null;
     var view = this.hooks.view ? this.hooks.view() : { u: 0.5, v: 0.5, panSign: 1 };
     var masters = activeMasters(entry.tiles, entry.width, entry.height, view, this._masterInfo(view));
+    var anchor = stripAnchorRow(entry.tiles, entry.height, view);
+    // Pole caps wait until the screen and the next horizon's bands are at
+    // least on the wire. A free slot must not download r0 while r2c1 is in flight.
+    var deferPoles = this._bandsOutstanding(view);
     var best = null;
     var bestRank = 1e15;
     for (var i = 0; i < masters.length; i++) {
       var tile = masters[i];
       if (!tile || tile._skip || this.assemblers[tile.id] || this._tileReady(tile.id)) continue;
-      // masterRank is already tier-first: both horizons, then the bands
-      // above and below them, then the poles. A flat penalty on the other
-      // column put the unseen poles ahead of the incoming horizon.
+      if (deferPoles && Math.abs((tile.row | 0) - anchor) > 1) continue;
+      // The column under the lens finishes its visible bands before the
+      // other hemisphere is requested. Pole caps wait until that lookahead.
       var rank = masterRank(tile, entry.tiles, entry.width, entry.height, view);
       if (rank < bestRank) {
         bestRank = rank;
@@ -4727,14 +4818,30 @@
     return best;
   };
 
-  PhotoSession.prototype._leadToken = function (tile) {
-    // Only the first wave of a session. Later opens keep climbing so a
-    // stale token-1 chunk cannot assemble as the next photo.
-    if (!tile || (this.token | 0) > 1) return false;
+  PhotoSession.prototype._isOpeningStrip = function (tile) {
+    if (!tile) return false;
     if (tile._overview || tile._base) return true;
     if ((tile.col | 0) !== 0) return false;
     var stats = gridStats(this.entry && this.entry.tiles);
-    return (tile.row | 0) === Math.floor(stats.rows / 2);
+    var rows = stats.rows || 1;
+    return (tile.row | 0) === Math.floor(rows / 2);
+  };
+
+  PhotoSession.prototype._leadToken = function (tile) {
+    // Only the first wave. Once the counter has climbed, a later strip must
+    // not reuse token 1. open() resets the counter so this wave's overview
+    // and front horizon still match the phone's token-1 push.
+    if (!tile || (this.token | 0) > 1) return false;
+    return this._isOpeningStrip(tile);
+  };
+
+  PhotoSession.prototype._chunkTokenOk = function (box, token) {
+    if (!box) return false;
+    if (token == null) return true;
+    if ((token | 0) === (box.token | 0)) return true;
+    // The phone pushes the overview and the front horizon at token 1 even
+    // when this session had already climbed past that (retile, photo 2+).
+    return (token | 0) === 1 && !!(box.tile && this._isOpeningStrip(box.tile));
   };
 
   PhotoSession.prototype._issue = function (tile) {
@@ -4749,7 +4856,9 @@
       token = this.token;
     }
     if (!this._openTokens) this._openTokens = {};
-    this._openTokens[token] = true;
+    // Refcount, not a boolean. The overview and the front horizon share
+    // token 1, and one finishing must not retire the other.
+    this._openTokens[token] = (this._openTokens[token] | 0) + 1;
     this.assemblers[tile.id] = {
       id: tile.id,
       gen: this.generation,
@@ -4765,6 +4874,8 @@
       mipGot: [],
       mipN: [],
       mipPayload: [],
+      _tokenHeld: true,
+      _epoch: this._tokenEpoch || 0,
     };
     this._syncPending();
     if (this.hooks.request) this.hooks.request(tile.id, token);
@@ -4790,22 +4901,25 @@
     }
   };
 
-  PhotoSession.prototype._tokenLive = function (token, gen) {
+  PhotoSession.prototype._tokenLive = function (token, gen, epoch) {
     if (gen !== this.generation) return false;
-    return !!(this._openTokens && this._openTokens[token]);
+    if ((epoch || 0) !== (this._tokenEpoch || 0)) return false;
+    return !!(this._openTokens && (this._openTokens[token] | 0) > 0);
   };
 
   PhotoSession.prototype._releaseToken = function (token) {
     if (!this._openTokens) return;
-    // The overview and the front strip are both token 1. Finishing one
-    // must not retire the other transfer that is still open.
-    if (this.assemblers) {
-      for (var id in this.assemblers) {
-        var box = this.assemblers[id];
-        if (box && (box.token | 0) === (token | 0)) return;
-      }
-    }
-    delete this._openTokens[token];
+    var left = (this._openTokens[token] | 0) - 1;
+    if (left > 0) this._openTokens[token] = left;
+    else delete this._openTokens[token];
+  };
+
+  /** One release per _issue. A second call, or a transfer from an older wave, is a no-op. */
+  PhotoSession.prototype._releaseHold = function (box) {
+    if (!box || !box._tokenHeld) return;
+    box._tokenHeld = false;
+    if ((box._epoch || 0) !== (this._tokenEpoch || 0)) return;
+    this._releaseToken(box.token);
   };
 
   PhotoSession.prototype._pieceFor = function (tile) {
@@ -4959,7 +5073,9 @@
     // The token is the one this tile asked for. It is not "whatever the
     // showing photo requested last": a neighbor preloaded in the background
     // keeps its own token, and those chunks are not a stale transfer.
-    if (msg.token != null && (msg.token | 0) !== box.token) return;
+    // Token 1 is also accepted for the overview and the front horizon,
+    // because the phone pushes those at token 1 after every open.
+    if (!this._chunkTokenOk(box, msg.token)) return;
     var level = msg.level | 0;
     if (level > 0) {
       this._noteLevel(box, level, msg);
@@ -5052,22 +5168,15 @@
     if (!msg) return;
     var box = this.assemblers[msg.id];
     if (!box || box.gen !== this.generation) return;
-    if (msg.token != null && (msg.token | 0) !== box.token) return;
-    if (box.tile && box.tile._overview) {
-      delete this.assemblers[msg.id];
-      this._releaseToken(box.token);
-      this._overviewPending = false;
-      this._syncPending();
-      this._requestCurrent();
-      return;
-    }
-    this._failOrRetry(msg.message || "fetch");
+    if (!this._chunkTokenOk(box, msg.token)) return;
+    this._skipTile(box, msg.message || "fetch");
   };
 
   PhotoSession.prototype._materialize = function (box, payload) {
     var self = this;
     var token = box.token;
     var gen = box.gen;
+    var epoch = box._epoch || 0;
     var accepted = false;
     var settled = false;
     var finish = function (err, image) {
@@ -5077,7 +5186,7 @@
       // upload is applied, so an async upload can still land.
       if (accepted || settled) return;
       accepted = true;
-      if (!self._tokenLive(token, gen)) {
+      if (!self._tokenLive(token, gen, epoch)) {
         settled = true;
         if (image && self.hooks.dropImage) self.hooks.dropImage(image);
         return;
@@ -5091,12 +5200,12 @@
       function apply(tex) {
         if (settled) return;
         settled = true;
-        if (!self._tokenLive(token, gen)) {
+        if (!self._tokenLive(token, gen, epoch)) {
           if (image && self.hooks.dropImage) self.hooks.dropImage(image);
           if (tex && self.hooks.release) self.hooks.release(tex);
           return;
         }
-        self._releaseToken(token);
+        self._releaseHold(box);
         if (image && self.hooks.dropImage) self.hooks.dropImage(image);
         if (!tex || tex.oom) {
           if (tex && self.hooks.release) self.hooks.release(tex);
@@ -5188,7 +5297,7 @@
           settled = true;
           if (self.hooks.dropImage) self.hooks.dropImage(image);
           if (isOom(error)) self._oom(box.photoId);
-          else self._failOrRetry(error);
+          else self._skipTile(box, error);
           return;
         }
         if (returned !== undefined) apply(returned);
@@ -5227,7 +5336,7 @@
   PhotoSession.prototype.noteImage = function (id, token, image) {
     var box = this.assemblers[id];
     if (!box || box.gen !== this.generation) return false;
-    if ((token | 0) !== box.token) return false;
+    if (!this._chunkTokenOk(box, token)) return false;
     if (image && box.tile && box.tile.url && !image._spsUrl) image._spsUrl = box.tile.url;
     delete this.assemblers[id];
     box._readyImage = image;
@@ -5236,17 +5345,27 @@
   };
 
   PhotoSession.prototype._skipTile = function (box, reason) {
-    if (box) this._releaseToken(box.token);
+    this._releaseHold(box);
     if (box && box.id) delete this.assemblers[box.id];
     this._syncPending();
-    var text = String((reason && reason.message) || reason || "tile skipped");
-    if (this.hooks.onLog) this.hooks.onLog(text);
-    if (box && box.tile && box.tile._overview) {
+    var tile = box && box.tile;
+    if (tile && (tile._overview || tile._base)) {
       this._overviewPending = false;
       this._requestCurrent();
       return;
     }
-    if (box && box.tile) box.tile._skip = true;
+    if (tile) {
+      tile._retries = (tile._retries || 0) + 1;
+      if (tile._retries <= TILE_RETRIES) {
+        if (this.hooks.onTileRetry) this.hooks.onTileRetry(tile, tile._retries);
+        if (this.hooks.onLog) this.hooks.onLog("retry " + tile.id);
+        this._issue(tile);
+        return;
+      }
+      tile._skip = true;
+    }
+    var text = String((reason && reason.message) || reason || "tile skipped");
+    if (this.hooks.onLog) this.hooks.onLog(text);
     var entry = this.entry;
     var pendingWork = false;
     if (entry && entry.tiles) {
@@ -5266,6 +5385,7 @@
   PhotoSession.prototype._failOrRetry = function (reason) {
     if (this.waitingShrink) return;
     var entry = this.entry;
+    this._tokenEpoch = (this._tokenEpoch || 0) + 1;
     this._openTokens = {};
     this._releaseAll();
     this.loaded = [];
@@ -5276,7 +5396,10 @@
       this.entry = entry;
       if (entry.tiles) {
         for (var i = 0; i < entry.tiles.length; i++) {
-          if (entry.tiles[i]) entry.tiles[i]._skip = false;
+          if (entry.tiles[i]) {
+            entry.tiles[i]._skip = false;
+            entry.tiles[i]._retries = 0;
+          }
         }
       }
       this.attempt += 1;
@@ -5295,6 +5418,8 @@
     // full-resolution tiles that already cover the sphere; otherwise leave the
     // last frame where it is and log the miss.
     warn("full-resolution tile did not upload", photoId);
+    this._tokenEpoch = (this._tokenEpoch || 0) + 1;
+    this._openTokens = {};
     this.assemblers = {};
     this.pending = null;
     this.waitingShrink = false;
@@ -5333,12 +5458,8 @@
     }
     if (this._overviewReady || (this.loaded && this.loaded.length)) {
       var stalled = this.assemblers[this.pending.id];
-      if (stalled && stalled.tile) stalled.tile._skip = true;
-      if (stalled) delete this.assemblers[stalled.id];
-      if (stalled) this._releaseToken(stalled.token);
-      this._syncPending();
-      if (this.hooks.onLog) this.hooks.onLog("A tile stalled and was skipped");
-      this._requestCurrent();
+      if (stalled) this._skipTile(stalled, "timeout");
+      else this._requestCurrent();
       return;
     }
     this._failOrRetry("timeout");
@@ -5895,6 +6016,7 @@
     var row = tile.row | 0;
     if (row === anchor) return true;
     var parent = findStrip(tiles, tile.col | 0, parentRowOf(row, anchor));
+    if (parent && parent._skip) return true;
     return !!(parent && loadedFn && loadedFn(parent));
   }
 
@@ -5936,7 +6058,8 @@
     var anchor = stripAnchorRow(tiles, height, view);
     var viewCol = columnAtU(tiles, width, view.u);
     var anchorTile = findStrip(tiles, viewCol, anchor);
-    var anchorLoaded = !!(anchorTile && loaded(anchorTile));
+    // A horizon that exhausted its retries must not freeze every other strip.
+    var anchorLoaded = !!(anchorTile && (anchorTile._skip || loaded(anchorTile)));
     var masters = [];
     for (var i = 0; i < tiles.length; i++) {
       var tile = tiles[i];
@@ -5980,13 +6103,20 @@
     var ahead = delta * sign;
     var side = ahead > 0 ? 0 : (ahead < 0 ? 1 : 0);
     var vertical = (tile.row | 0) < anchor ? 0 : 1;
-    var rank = tier * 1000 + dist * 100 + side * 10 + vertical;
+    var other = (tile.col | 0) !== viewCol;
+    // 0: the bands on the TV right now. 1: the same bands on the hemisphere
+    // the pan is about to enter. 2: pole caps under the lens. 3: the rest.
+    var phase = 3;
+    if (tier <= 1 && !other) phase = 0;
+    else if (tier <= 1 && dist <= 1) phase = 1;
+    else if (!other) phase = 2;
+    var rank = phase * 10000 + tier * 1000 + dist * 100 + side * 10 + vertical;
     // Steering finishes the column under the crosshair (horizon and the
     // bands beside it) before it spends the pipe on the next column.
-    if (view && view.manual && tier <= 1 && (tile.col | 0) !== viewCol) rank += 1000;
+    if (view && view.manual && tier <= 1 && other) rank += 1000;
     // Standby finishes the column the next photo will open on before it
     // spends the pipe on the other hemisphere.
-    if (view && view.standby && (tile.col | 0) !== viewCol) rank += 5000;
+    if (view && view.standby && other) rank += 5000;
     return rank;
   }
 
@@ -6019,7 +6149,7 @@
   }
 
   function focusJoinAt(uploadedAt, parentFocusAt, now) {
-    var handoffAt = (parentFocusAt || 0) + Math.round(FOCUS_MS / (1 + FOCUS_FEATHER));
+    var handoffAt = (parentFocusAt || 0) + Math.round(FOCUS_MS * REVEAL_HANDOFF);
     var uploaded = uploadedAt > 0 ? uploadedAt : (now || 0);
     return Math.max(uploaded, handoffAt);
   }
@@ -6080,8 +6210,10 @@
     if (anchor <= 0) along = sy;
     else if (anchor >= 1) along = 1 - sy;
     else along = Math.abs(sy - anchor) / Math.max(Math.max(anchor, 1 - anchor), 1e-4);
-    var feather = FOCUS_FEATHER;
-    var wave = (e * (1 + feather) - along) / feather;
+    var feather = FOCUS_FEATHER > 0 ? FOCUS_FEATHER : 1;
+    var handoff = REVEAL_HANDOFF > 0 ? REVEAL_HANDOFF : 1;
+    var lead = e / handoff;
+    var wave = (lead - along) / feather;
     if (wave < 0) wave = 0;
     if (wave > 1) wave = 1;
     return wave;
@@ -6674,8 +6806,14 @@
     TILE_FADE_MS: TILE_FADE_MS,
     FOCUS_MS: FOCUS_MS,
     FOCUS_FEATHER: FOCUS_FEATHER,
+    FOCUS_HANDOFF: FOCUS_HANDOFF,
     REVEAL_HANDOFF: REVEAL_HANDOFF,
+    LAN_PROBE_TIMEOUT_MS: LAN_PROBE_TIMEOUT_MS,
     LAN_TIMEOUT_MS: LAN_TIMEOUT_MS,
+    LAN_FAIL_LIMIT: LAN_FAIL_LIMIT,
+    TILE_RETRIES: TILE_RETRIES,
+    LAN_AHEAD: LAN_AHEAD,
+    AHEAD_REQUESTS: AHEAD_REQUESTS,
     GEO_MS: GEO_MS,
     easeInOut: easeInOut,
     revealProgress: revealProgress,
