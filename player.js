@@ -21,7 +21,7 @@
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
   var CROSSFADE_MS = 1200;
-  var TILE_FADE_MS = 300;
+  var TILE_FADE_MS = 600;
   var SNAP_FADE_MS = 1200;
   var SNAP_W = 1920;
   var SNAP_H = 1080;
@@ -51,12 +51,13 @@
   // Seconds of pan to keep queued even before a slow upload has been timed.
   var LOOKAHEAD_FLOOR_S = 3;
   var LOOKAHEAD_LATENCY_FALLBACK_MS = 1500;
-  var AHEAD_REQUESTS = 4;
+  var AHEAD_REQUESTS = 3;
   // How long one strip eases from the master edge toward the far edge.
-  // The next band does not start until this one has finished.
-  var FOCUS_MS = 700;
+  // The next band does not fade until this one has finished, but its JPEG
+  // starts as soon as this strip has been received.
+  var FOCUS_MS = 1400;
   var STRIP_LOOKAHEAD_DEG = 55;
-  var GEO_MS = 1600;
+  var GEO_MS = 3200;
   var INTRO_FADE_MS = 700;
   var INTRO_CAP_MS = 8000;
   // createImageBitmap on some Cast WebViews never settles. Fall back before
@@ -543,6 +544,8 @@
   Player.prototype._revealOf = function (piece) {
     if (!piece || !piece.tex || piece.tex.deferred || piece.tex._evicted) return 0;
     if (piece._base || (piece.tile && piece.tile._base)) return 1;
+    // A half-uploaded strip stays off the sphere so its missing rows are not black.
+    if (piece.tex._spsUploaded === false) return 0;
     // A finished strip stays open when the master moves. The amount still
     // follows the clock, so a strip that has not reached the end of its fade
     // is not stuck at 1.
@@ -2672,6 +2675,8 @@
     var w = source.width || 0;
     var h = source.height || 0;
     this._finishSampler(gl, tex, w, h, source);
+    tex._contentW = tex._contentW || w;
+    tex._contentH = tex._contentH || h;
     tex._spsUploaded = true;
     return tex;
   };
@@ -2723,6 +2728,8 @@
     }
     this._minFilter = min;
     this._aniso = aniso;
+    tex._contentW = width;
+    tex._contentH = height;
     tex._uploadW = uploadW;
     tex._uploadH = uploadH;
     if (tex._mip !== true) {
@@ -2945,6 +2952,8 @@
       srcH: gl.getUniformLocation(prog, "uSrcH"),
       texW: gl.getUniformLocation(prog, "uTexW"),
       texH: gl.getUniformLocation(prog, "uTexH"),
+      contentW: gl.getUniformLocation(prog, "uContentW"),
+      contentH: gl.getUniformLocation(prog, "uContentH"),
       alpha: gl.getUniformLocation(prog, "uAlpha"),
       kind: gl.getUniformLocation(prog, "uKind"),
       debug: gl.getUniformLocation(prog, "uDebug"),
@@ -2980,7 +2989,7 @@
       var kept = 0;
       for (var n = 0; n < list.length; n++) {
         var piece = list[n];
-        if (!piece || !piece.tex || piece.tex.deferred || piece.tex._evicted) continue;
+        if (!piece || !piece.tex || piece.tex.deferred || piece.tex._evicted || piece.tex._spsUploaded === false) continue;
         var spec = piece.tex._window || piece.tile;
         if (!spec || spec.srcW < 1 || spec.srcH < 1) continue;
         seen += 1;
@@ -3051,6 +3060,8 @@
         gl.uniform1f(loc.srcH, sample ? sample.srcH : tile.srcH);
         gl.uniform1f(loc.texW, sample ? sample.texW : (tex._uploadW || tile.texW));
         gl.uniform1f(loc.texH, sample ? sample.texH : (tex._uploadH || tile.texH));
+        if (loc.contentW) gl.uniform1f(loc.contentW, sample ? sample.texW : (tex._contentW || tile.texW || tex._uploadW || 0));
+        if (loc.contentH) gl.uniform1f(loc.contentH, sample ? sample.texH : (tex._contentH || tile.texH || tex._uploadH || 0));
         if (loc.kind) gl.uniform1f(loc.kind, overview ? 1 : 0);
         if (loc.debug) gl.uniform1f(loc.debug, self._debugTint ? 1 : 0);
         var reveal = 1;
@@ -3232,6 +3243,9 @@
     }
     tex._uploadW = source.width;
     tex._uploadH = source.height;
+    tex._contentW = source.width;
+    tex._contentH = source.height;
+    tex._spsUploaded = false;
     tex._mip = false;
     this._strip = { gl: gl, tex: tex, source: source, y: 0, rows: rows, w: source.width, h: source.height };
     this._uploadStripSlice();
@@ -3723,8 +3737,33 @@
     if (!ctx) return null;
     ctx.imageSmoothingEnabled = false;
     ctx.drawImage(source, 0, 0, w, h, 0, 0, w, h);
-    if (pw > w) ctx.drawImage(source, w - 1, 0, 1, h, w, 0, pw - w, h);
-    if (ph > h) ctx.drawImage(canvas, 0, h - 1, pw, 1, 0, h, pw, ph - h);
+    // Replicate the last column and row into the power-of-two margin so a
+    // bilinear sample never reads the canvas's transparent black.
+    try {
+      var srcData = ctx.getImageData(0, 0, w, h);
+      var dst = ctx.createImageData(pw, ph);
+      var srcPx = srcData.data;
+      var dstPx = dst.data;
+      for (var y = 0; y < h; y++) {
+        var srcRow = y * w * 4;
+        var dstRow = y * pw * 4;
+        dstPx.set(srcPx.subarray(srcRow, srcRow + w * 4), dstRow);
+        var edge = srcRow + (w - 1) * 4;
+        for (var x = w; x < pw; x++) {
+          var at = dstRow + x * 4;
+          dstPx[at] = srcPx[edge];
+          dstPx[at + 1] = srcPx[edge + 1];
+          dstPx[at + 2] = srcPx[edge + 2];
+          dstPx[at + 3] = srcPx[edge + 3];
+        }
+      }
+      var lastRow = (h - 1) * pw * 4;
+      for (var yy = h; yy < ph; yy++) dstPx.set(dstPx.subarray(lastRow, lastRow + pw * 4), yy * pw * 4);
+      ctx.putImageData(dst, 0, 0);
+    } catch (error) {
+      if (pw > w) ctx.drawImage(source, w - 1, 0, 1, h, w, 0, pw - w, h);
+      if (ph > h) ctx.drawImage(canvas, 0, h - 1, pw, 1, 0, h, pw, ph - h);
+    }
     return canvas;
   }
 
@@ -3758,7 +3797,10 @@
         "  } else {\n" +
         "  float spanU=max(uU1-uU0,1e-6);\n" +
         "  float spanV=max(uV1-uV0,1e-6);\n" +
-        "  float sx=(u-uU0)/spanU;\n" +
+        "  float uu=u;float midU=(uU0+uU1)*0.5;\n" +
+        "  if(abs(u+1.0-midU)<abs(uu-midU)) uu=u+1.0;\n" +
+        "  if(abs(u-1.0-midU)<abs(uu-midU)) uu=u-1.0;\n" +
+        "  float sx=(uu-uU0)/spanU;\n" +
         "  float sy=(v-uV0)/spanV;\n" +
         "  float dLonX=dFdx(lon);float dLonY=dFdy(lon);\n" +
         "  dLonX=mod(dLonX+PI,TWO_PI)-PI;\n" +
@@ -3768,30 +3810,33 @@
         "  float ky=-(uSrcH/max(uTexH,1.0))/spanV/PI;\n" +
         "  vec2 dstDx=vec2(kx*dLonX,ky*dLatX);\n" +
         "  vec2 dstDy=vec2(kx*dLonY,ky*dLatY);\n" +
+        "  float contentW=uContentW>0.0?uContentW:uTexW;\n" +
+        "  float contentH=uContentH>0.0?uContentH:uTexH;\n" +
         "  vec2 st=vec2((uPadL+sx*uSrcW)/max(uTexW,1.0),(uPadT+sy*uSrcH)/max(uTexH,1.0));\n" +
-        "  float padR=max(uTexW-uPadL-uSrcW,0.0);\n" +
-        "  float padB=max(uTexH-uPadT-uSrcH,0.0);\n" +
+        "  float padR=max(contentW-uPadL-uSrcW,0.0);\n" +
+        "  float padB=max(contentH-uPadT-uSrcH,0.0);\n" +
         "  float roomX=max(min(uPadL,padR),0.5);\n" +
         "  float roomY=max(min(uPadT,padB),0.5);\n" +
         "  float texelX=st.x*uTexW;float texelY=st.y*uTexH;\n" +
-        "  roomX=min(roomX,max(min(texelX,uTexW-texelX),0.5));\n" +
-        "  roomY=min(roomY,max(min(texelY,uTexH-texelY),0.5));\n" +
+        "  roomX=min(roomX,max(min(texelX,contentW-texelX),0.5));\n" +
+        "  roomY=min(roomY,max(min(texelY,contentH-texelY),0.5));\n" +
         "  vec2 tdx=dstDx*vec2(uTexW,uTexH);\n" +
         "  vec2 tdy=dstDy*vec2(uTexW,uTexH);\n" +
         "  float extX=max(abs(tdx.x),abs(tdy.x));\n" +
         "  float extY=max(abs(tdx.y),abs(tdy.y));\n" +
         "  float lim=min(extX>roomX?roomX/max(extX,1e-6):1.0,extY>roomY?roomY/max(extY,1e-6):1.0);\n" +
         "  dstDx*=lim;dstDy*=lim;\n" +
-        "  vec2 halfTex=vec2(0.5/max(uTexW,1.0),0.5/max(uTexH,1.0));\n" +
-        "  st=clamp(st,halfTex,vec2(1.0)-halfTex);\n" +
+        "  vec2 minSt=vec2(0.5/max(uTexW,1.0),0.5/max(uTexH,1.0));\n" +
+        "  vec2 maxSt=vec2((contentW-0.5)/max(uTexW,1.0),(contentH-0.5)/max(uTexH,1.0));\n" +
+        "  st=clamp(st,minSt,maxSt);\n" +
         "  float edgePx=min(min(sx,1.0-sx)*uSrcW,min(sy,1.0-sy)*uSrcH);\n" +
         "  if(edgePx<3.0) " + color + "=" + sampleExpr + ";\n" +
         "  else " + color + "=" + (webgl2 ? "texture" : "texture2D") + "(uTex,st);\n" +
         "  " + color + ".a=uAlpha*focusMask(u,v);\n" +
-        "  float slopU=0.5*spanU/max(uSrcW,1.0);\n" +
-        "  float slopV=0.5*spanV/max(uSrcH,1.0);\n" +
+        "  float slopU=max(0.5*spanU/max(uSrcW,1.0),0.5/360.0);\n" +
+        "  float slopV=max(0.5*spanV/max(uSrcH,1.0),0.5/180.0);\n" +
         "  if(uDebug>0.5)" + color + ".rgb*=vec3(1.05,0.78,0.42);\n" +
-        "  if(u<uU0-slopU||u>uU1+slopU||v<uV0-slopV||v>uV1+slopV) discard;\n" +
+        "  if(uu<uU0-slopU||uu>uU1+slopU||v<uV0-slopV||v>uV1+slopV) discard;\n" +
         "  }\n"
       : "  vec2 uv=equirectUv(poseToCamera(normalize(vObj),uPitch,uRoll));\n" +
         "  if(uKind>0.5){\n" +
@@ -3802,23 +3847,30 @@
         "  } else {\n" +
         "  float spanU=max(uU1-uU0,1e-6);\n" +
         "  float spanV=max(uV1-uV0,1e-6);\n" +
-        "  float sx=(uv.x-uU0)/spanU;\n" +
+        "  float uu=uv.x;float midU=(uU0+uU1)*0.5;\n" +
+        "  if(abs(uv.x+1.0-midU)<abs(uu-midU)) uu=uv.x+1.0;\n" +
+        "  if(abs(uv.x-1.0-midU)<abs(uu-midU)) uu=uv.x-1.0;\n" +
+        "  float sx=(uu-uU0)/spanU;\n" +
         "  float sy=(uv.y-uV0)/spanV;\n" +
+        "  float contentW=uContentW>0.0?uContentW:uTexW;\n" +
+        "  float contentH=uContentH>0.0?uContentH:uTexH;\n" +
         "  vec2 st=vec2((uPadL+sx*uSrcW)/max(uTexW,1.0),(uPadT+sy*uSrcH)/max(uTexH,1.0));\n" +
-        "  vec2 halfTex=vec2(0.5/max(uTexW,1.0),0.5/max(uTexH,1.0));\n" +
-        "  st=clamp(st,halfTex,vec2(1.0)-halfTex);\n" +
+        "  vec2 minSt=vec2(0.5/max(uTexW,1.0),0.5/max(uTexH,1.0));\n" +
+        "  vec2 maxSt=vec2((contentW-0.5)/max(uTexW,1.0),(contentH-0.5)/max(uTexH,1.0));\n" +
+        "  st=clamp(st,minSt,maxSt);\n" +
         "  " + color + "=" + (webgl2 ? "texture" : "texture2D") + "(uTex,st);\n" +
         "  " + color + ".a=uAlpha*focusMask(uv.x,uv.y);\n" +
-        "  float slopU=0.5*spanU/max(uSrcW,1.0);\n" +
-        "  float slopV=0.5*spanV/max(uSrcH,1.0);\n" +
+        "  float slopU=max(0.5*spanU/max(uSrcW,1.0),0.5/360.0);\n" +
+        "  float slopV=max(0.5*spanV/max(uSrcH,1.0),0.5/180.0);\n" +
         "  if(uDebug>0.5)" + color + ".rgb*=vec3(1.05,0.78,0.42);\n" +
-        "  if(uv.x<uU0-slopU||uv.x>uU1+slopU||uv.y<uV0-slopV||uv.y>uV1+slopV) discard;\n" +
+        "  if(uu<uU0-slopU||uu>uU1+slopU||uv.y<uV0-slopV||uv.y>uV1+slopV) discard;\n" +
         "  }\n";
     return head + vary + " vec3 vObj;\n" + outDecl +
       "uniform sampler2D uTex;\n" +
       "uniform float uPitch;uniform float uRoll;uniform float uAlpha;\n" +
       "uniform float uU0;uniform float uU1;uniform float uV0;uniform float uV1;\n" +
       "uniform float uPadL;uniform float uPadT;uniform float uSrcW;uniform float uSrcH;uniform float uTexW;uniform float uTexH;\n" +
+      "uniform float uContentW;uniform float uContentH;\n" +
       "uniform float uKind;uniform float uDebug;\n" +
       "uniform float uReveal;uniform float uGeo;uniform float uViewU;uniform float uViewV;uniform float uAnchorV;\n" +
       "uniform float uNL;uniform float uNR;uniform float uNU;uniform float uND;\n" +
@@ -4333,35 +4385,19 @@
     if (!entry || !entry.tiles) return null;
     var view = this.hooks.view ? this.hooks.view() : { u: 0.5, v: 0.5, panSign: 1 };
     var masters = activeMasters(entry.tiles, entry.width, entry.height, view, this._masterInfo(view));
-    var anchor = stripAnchorRow(entry.tiles, entry.height, view);
     var viewCol = columnAtU(entry.tiles, entry.width, view.u);
-    var anchorTile = findStrip(entry.tiles, viewCol, anchor);
-    var anchorLoaded = !!(anchorTile && this._masterInfo(view).loaded(anchorTile));
-    var anchorReveal = this._revealAt(viewCol, anchor);
-    var viewWaiting = false;
-    var pool = [];
-    for (var i = 0; i < masters.length; i++) {
-      var tile = masters[i];
-      if (!tile || tile._skip || this.assemblers[tile.id] || this._tileReady(tile.id)) {
-        if (tile && (tile.col | 0) === viewCol && this._revealAt(tile.col | 0, tile.row | 0) < 1) viewWaiting = true;
-        continue;
-      }
-      if ((tile.col | 0) === viewCol && this._revealAt(tile.col | 0, tile.row | 0) < 1) viewWaiting = true;
-      pool.push(tile);
-    }
     var best = null;
     var bestRank = 1e15;
-    for (var j = 0; j < pool.length; j++) {
-      var candidate = pool[j];
-      var sameColumn = (candidate.col | 0) === viewCol;
-      var lookahead = !sameColumn && (candidate.row | 0) === anchor && anchorLoaded;
-      if (viewWaiting && !sameColumn && !(lookahead && anchorReveal < 1)) continue;
-      if (!sameColumn && !lookahead && anchorReveal < 1) continue;
-      var rank = masterRank(candidate, entry.tiles, entry.width, entry.height, view);
-      if (!sameColumn) rank += 500;
+    for (var i = 0; i < masters.length; i++) {
+      var tile = masters[i];
+      if (!tile || tile._skip || this.assemblers[tile.id] || this._tileReady(tile.id)) continue;
+      var rank = masterRank(tile, entry.tiles, entry.width, entry.height, view);
+      // The next band in this column downloads before a neighboring column,
+      // so the top and bottom do not wait behind a horizontal lookahead.
+      if ((tile.col | 0) !== viewCol) rank += 2500;
       if (rank < bestRank) {
         bestRank = rank;
-        best = candidate;
+        best = tile;
       }
     }
     return best;
@@ -4464,21 +4500,8 @@
   };
 
   PhotoSession.prototype._releaseStale = function () {
-    if (!this.entry || !this.entry.tiles || !this.assemblers) return;
-    var view = this.hooks.view ? this.hooks.view() : null;
-    var masters = activeMasters(this.entry.tiles, this.entry.width, this.entry.height, view, this._masterInfo(view));
-    var keep = {};
-    for (var i = 0; i < masters.length; i++) keep[masters[i].id] = true;
-    var dropped = false;
-    for (var id in this.assemblers) {
-      var box = this.assemblers[id];
-      if (!box || (box.tile && (box.tile._overview || box.tile._base))) continue;
-      if (keep[id]) continue;
-      delete this.assemblers[id];
-      if (this._openTokens && box) delete this._openTokens[box.token];
-      dropped = true;
-    }
-    if (dropped) this._syncPending();
+    // A strip that has already been requested for this photo finishes.
+    // Panning across a column boundary must not abort the transfer.
   };
 
   PhotoSession.prototype._pickListed = function () {
@@ -4730,7 +4753,7 @@
           if (have && have.tile && box.tile && have.tile.id === box.tile.id) replaced = slot;
         }
         var stored = { tex: tex, tile: box.tile, payload: image._spsPayload || null, _focusAt: 0 };
-        if (!self.standby && self._openForFade(box.tile)) stored._focusAt = self._now();
+        if (!self.standby && tex._spsUploaded !== false && self._openForFade(box.tile)) stored._focusAt = self._now();
         if (replaced >= 0) self.loaded[replaced] = stored;
         else self.loaded.push(stored);
         self._syncCursor();
@@ -5451,6 +5474,14 @@
     return amount >= 1;
   }
 
+  function fetchUnlocked(tile, tiles, anchor, loadedFn) {
+    if (!tile || tile._base) return true;
+    var row = tile.row | 0;
+    if (row === anchor) return true;
+    var parent = findStrip(tiles, tile.col | 0, parentRowOf(row, anchor));
+    return !!(parent && loadedFn && loadedFn(parent));
+  }
+
   function columnEngaged(col, viewCol, tiles, width, view) {
     if (col === viewCol) return true;
     var sample = null;
@@ -5482,7 +5513,6 @@
   function activeMasters(tiles, width, height, view, info) {
     info = info || {};
     var loaded = info.loaded || function () { return false; };
-    var revealAt = info.revealAt || function () { return 0; };
     view = view || {};
     var anchor = stripAnchorRow(tiles, height, view);
     var viewCol = columnAtU(tiles, width, view.u);
@@ -5492,7 +5522,7 @@
     for (var i = 0; i < tiles.length; i++) {
       var tile = tiles[i];
       if (!tile || tile._base || tile._skip) continue;
-      if (!revealUnlocked(tile, tiles, anchor, revealAt)) continue;
+      if (!fetchUnlocked(tile, tiles, anchor, loaded)) continue;
       var col = tile.col | 0;
       if (col !== viewCol) {
         if (!anchorLoaded) continue;
@@ -5699,6 +5729,7 @@
     if (!piece || !piece.tex || !piece.tile) return false;
     var tex = piece.tex;
     if (tex.deferred || tex._evicted || tex.oom) return false;
+    if (tex._spsUploaded === false) return false;
     if (tex._window && tex._window.full === false) return false;
     if (tex._mip !== true) return false;
     return true;
@@ -6024,10 +6055,27 @@
   }
 
   function tilePatch(tile, width, height) {
-    var u0 = tile.srcX / Math.max(width, 1);
-    var u1 = (tile.srcX + tile.srcW) / Math.max(width, 1);
-    var v0 = tile.srcY / Math.max(height, 1);
-    var v1 = (tile.srcY + tile.srcH) / Math.max(height, 1);
+    var span = Math.max(width, 1);
+    var spanH = Math.max(height, 1);
+    var u0 = tile.srcX / span;
+    var u1 = (tile.srcX + tile.srcW) / span;
+    var v0 = tile.srcY / spanH;
+    var v1 = (tile.srcY + tile.srcH) / spanH;
+    var halfDegU = 0.5 / 360;
+    var halfDegV = 0.5 / 180;
+    var gutterL = (tile.padL || 0) / span;
+    var gutterR = (tile.padR || 0) / span;
+    var gutterT = (tile.padT || 0) / spanH;
+    var gutterB = (tile.padB || 0) / spanH;
+    function edgeExpand(gutter, halfDeg, atPole) {
+      if (atPole) return 0;
+      if (gutter > 0) return Math.min(halfDeg, gutter);
+      return Math.min(halfDeg, 0.5 / span);
+    }
+    u0 -= edgeExpand(gutterL, halfDegU, false);
+    u1 += edgeExpand(gutterR, halfDegU, false);
+    v0 -= edgeExpand(gutterT, halfDegV, v0 <= 1e-6 && !(tile.padT > 0));
+    v1 += edgeExpand(gutterB, halfDegV, v1 >= 1 - 1e-6 && !(tile.padB > 0));
     var lonBands = 24;
     var latBands = 12;
     var pos = [];
@@ -6058,6 +6106,38 @@
     };
   }
 
+  function unwrapStripU(u, u0, u1) {
+    var mid = ((Number(u0) || 0) + (Number(u1) || 0)) / 2;
+    var best = Number(u) || 0;
+    var bestD = Math.abs(best - mid);
+    var plus = best + 1;
+    var minus = best - 1;
+    if (Math.abs(plus - mid) < bestD) {
+      best = plus;
+      bestD = Math.abs(plus - mid);
+    }
+    if (Math.abs(minus - mid) < bestD) best = minus;
+    return best;
+  }
+
+  function clampStripSt(sx, sy, padL, padT, srcW, srcH, texW, texH, contentW, contentH) {
+    var tw = Math.max(texW || 1, 1);
+    var th = Math.max(texH || 1, 1);
+    var cw = contentW > 0 ? contentW : tw;
+    var ch = contentH > 0 ? contentH : th;
+    var stX = ((padL || 0) + sx * srcW) / tw;
+    var stY = ((padT || 0) + sy * srcH) / th;
+    var minX = 0.5 / tw;
+    var minY = 0.5 / th;
+    var maxX = (cw - 0.5) / tw;
+    var maxY = (ch - 0.5) / th;
+    if (stX < minX) stX = minX;
+    if (stY < minY) stY = minY;
+    if (stX > maxX) stX = maxX;
+    if (stY > maxY) stY = maxY;
+    return { x: stX * tw, y: stY * th };
+  }
+
   function compositeAlphas(fadeMs, haveOld, haveNew) {
     if (!haveOld && !haveNew) return { clear: false, oldAlpha: 0, newAlpha: 0 };
     if (!haveOld) return { clear: true, oldAlpha: 0, newAlpha: 1 };
@@ -6079,6 +6159,10 @@
     focusMask: focusMask,
     activeMasters: activeMasters,
     revealUnlocked: revealUnlocked,
+    fetchUnlocked: fetchUnlocked,
+    clampStripSt: clampStripSt,
+    unwrapStripU: unwrapStripU,
+    tilePatch: tilePatch,
     stripAnchorRow: stripAnchorRow,
     columnAtU: columnAtU,
     armSenderGrace: armSenderGrace,
