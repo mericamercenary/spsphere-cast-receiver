@@ -29,7 +29,7 @@
   var OUTPUT_H = 1080;
   var SENDER_TIMEOUT_MS = 45000;
   var UPLOAD_BUDGET_MS = 4;
-  var GPU_CAP = 192 * 1024 * 1024;
+  var GPU_CAP = 256 * 1024 * 1024;
   var IDLE_HEARTBEAT_MS = 15000;
   var MIN_DPS = 6;
   var MAX_DPS = 72;
@@ -1003,7 +1003,10 @@
       else return "not-started";
     }
     if (sessionReady(standby)) return "ready";
-    if (standby._viewCovered && standby._viewCovered()) return "view-ready";
+    // A covered front view, or the overview plus the horizon strip, is enough
+    // to cut to the next photo. That must not be reported as stalled: a
+    // stalled preload used to evict the photo on screen every frame.
+    if (swapReady(standby)) return "view-ready";
     if (standby.budgetFull) return "budget-full";
     if (standby.preloadCapped) return "preload-cap";
     if (standby.pending) return "pending";
@@ -1034,8 +1037,22 @@
     return why + " " + got + "/" + standby.entry.tiles.length + " room " + room;
   };
 
+  Player.prototype._activeBusy = function () {
+    var session = this.session;
+    if (!session || !session.entry) return false;
+    if (sessionReady(session)) return false;
+    if (session.pending) return true;
+    if (session._inFlight && session._inFlight() > 0) return true;
+    if (session._pickTile && session._pickTile()) return true;
+    return false;
+  };
+
   Player.prototype._feedPreload = function () {
     if (!this._useTiles || !this.playing || this.manual) return;
+    // The photo on screen keeps the phone pipe until its strips are in.
+    // The next photo starts only after that, or when the turn is over and
+    // the show is waiting on the swap.
+    if (!this._awaitingSwap && this._activeBusy()) return;
     var why = this._preloadStatus();
     if (why === "ready" || why === "pending" || why === "single") return;
     if (this._preloadLogged !== why) {
@@ -1046,9 +1063,11 @@
     var standby = this._standby;
     if (!standby || !standby.entry) return;
     if (why === "view-ready") {
-      // The tiles in front of the camera are already on the GPU. Keep asking
-      // for the rest while this photo pans, but do not evict that view.
-      if ((standby.preloadCapped || standby.budgetFull) && !standby.pending && !sessionReady(standby)) {
+      // The tiles in front of the camera are already on the GPU. Do not evict
+      // that view, and do not resume a standby session that has already
+      // loaded every strip it is allowed to prefetch.
+      var more = standby._pickTile && standby._pickTile();
+      if (more && (standby.preloadCapped || standby.budgetFull) && !standby.pending && !sessionReady(standby)) {
         standby.preloadCapped = false;
         standby.budgetFull = false;
         standby.resume();
@@ -1549,7 +1568,11 @@
     this._syncResidency();
     this._releaseOutsideBand();
     if (this.session && this.session.entry) this.session._requestCurrent();
-    if (!this._controllerMode() && this._standby && this._standby.entry) this._standby._requestCurrent();
+    var holdStandby = !this._awaitingSwap && this._activeBusy();
+    if (!holdStandby && !this._controllerMode() && this._standby && this._standby.entry) {
+      if (this._awaitingSwap) this._openIncoming(this._standby);
+      this._standby._requestCurrent();
+    }
     this._diagAcc = (this._diagAcc || 0) + raw;
     if (this._diagAcc >= 1000) {
       this._diagAcc = 0;
@@ -1805,7 +1828,13 @@
     // Controller mode keeps every strip of the photo on screen. A standby
     // texture from the next photo is the only thing that can leave.
     if (this._controllerMode()) return item.standby ? 1 : null;
+    var wide = !!(item.tile && item.tile.srcW * 2 >= (item.spanW || 1));
     if (!item.standby) {
+      // Ten 180° strips of an 8K photo are about 144 MB. They stay until the
+      // GPU is actually over the cap, and a 180° strip is never the one that
+      // leaves: dropping it left a hole the LAN payload could not refill.
+      if (!(this._gpuBytes > GPU_CAP)) return null;
+      if (wide) return null;
       if (!item.tile) return this._drawingTex(item.tex) ? null : 1000;
       if (this._tileVisible(item, view)) return null;
       if (tileInResidentBand(item.tile, item.spanW || 1, item.spanH || 1, view)) return null;
@@ -2381,6 +2410,16 @@
     this._back.preload(entry);
   };
 
+  Player.prototype._openIncoming = function (pool) {
+    if (!pool || !this._awaitingSwap) return;
+    // Standby only prefetches the front three strips. Once the turn is over,
+    // that cap must come off or the swap waits on tiles the session refuses
+    // to request.
+    pool.standby = false;
+    pool.budgetFull = false;
+    pool.preloadCapped = false;
+  };
+
   Player.prototype._requestIndex = function (at) {
     if (at == null || at < 0 || at >= this.items.length) return false;
     var entry = this.entries && this.entries[at];
@@ -2392,10 +2431,19 @@
         if (this.playing && !this.manual) this.itemDegrees = ROTATIONS * FULL_TURN;
         var waiting = this._incomingPool(entry.id);
         if (!waiting) this._ensureIncoming(entry);
-        else if ((waiting.budgetFull || waiting.preloadCapped) && !this._holdFrame) this._considerHold(waiting);
-        else if (!waiting.pending && !waiting.budgetFull && !waiting.preloadCapped) waiting._requestCurrent();
-        return true;
+        waiting = this._incomingPool(entry.id) || this._readyPool(entry.id);
+        if (waiting && !swapReady(waiting)) {
+          this._openIncoming(waiting);
+          if (!waiting.pending) waiting._requestCurrent();
+        }
+        readyNow = this._readyPool(entry.id);
+        if (!readyNow) {
+          if (waiting && (waiting.budgetFull || waiting.preloadCapped) && !this._holdFrame) this._considerHold(waiting);
+          return true;
+        }
       }
+      if (readyNow) this._commitIndex(at, readyNow);
+      return true;
     }
     var pool = this._readyPool(entry.id);
     this._awaitingSwap = true;
@@ -2408,7 +2456,15 @@
     if (this.playing && !this.manual) this.itemDegrees = ROTATIONS * FULL_TURN;
     this._ensureIncoming(entry);
     var incoming = this._incomingPool(entry.id);
-    if (incoming && (incoming.budgetFull || incoming.preloadCapped)) this._considerHold(incoming);
+    if (incoming) {
+      this._openIncoming(incoming);
+      if (!incoming.pending) incoming._requestCurrent();
+      if (swapReady(incoming)) {
+        this._commitIndex(at, incoming);
+        return true;
+      }
+      if ((incoming.budgetFull || incoming.preloadCapped) && !this._holdFrame) this._considerHold(incoming);
+    }
     return true;
   };
 
@@ -2603,8 +2659,9 @@
 
   Player.prototype._preloadNeighbors = function () {
     if (!this._useTiles || !this.entries || this.entries.length < 2) return;
-    // Finish the photo on screen before spending the send lane on the one after it.
-    if (this.session && this.session.entry && !this.session.shown && !swapReady(this.session)) return;
+    // The overview makes session.shown true after the first strip. The next
+    // photo still waits until this one has nothing left to request.
+    if (!this._awaitingSwap && this._activeBusy()) return;
     var nextAt = stepIndex(this.index, this.entries.length, 1, true);
     if (nextAt == null) return;
     var entry = this.entries[nextAt];
@@ -4417,16 +4474,15 @@
     if (!entry || !entry.tiles) return null;
     var view = this.hooks.view ? this.hooks.view() : { u: 0.5, v: 0.5, panSign: 1 };
     var masters = activeMasters(entry.tiles, entry.width, entry.height, view, this._masterInfo(view));
-    var viewCol = columnAtU(entry.tiles, entry.width, view.u);
     var best = null;
     var bestRank = 1e15;
     for (var i = 0; i < masters.length; i++) {
       var tile = masters[i];
       if (!tile || tile._skip || this.assemblers[tile.id] || this._tileReady(tile.id)) continue;
+      // masterRank is already tier-first: both horizons, then the bands
+      // above and below them, then the poles. A flat penalty on the other
+      // column put the unseen poles ahead of the incoming horizon.
       var rank = masterRank(tile, entry.tiles, entry.width, entry.height, view);
-      // The next band in this column downloads before a neighboring column,
-      // so the top and bottom do not wait behind a horizontal lookahead.
-      if ((tile.col | 0) !== viewCol) rank += 2500;
       if (rank < bestRank) {
         bestRank = rank;
         best = tile;
@@ -5115,7 +5171,7 @@
     var u1 = (tile.srcX + tile.srcW) / width;
     var v0 = tile.srcY / height;
     var v1 = (tile.srcY + tile.srcH) / height;
-    var uu = u;
+    var uu = unwrapStripU(u, u0, u1);
     var vv = v;
     if (uu < u0 || uu > u1) uu = (u0 + u1) / 2;
     if (vv < v0 || vv > v1) vv = (v0 + v1) / 2;
@@ -5265,20 +5321,29 @@
     return Math.max(speed * seconds * 2, speed * LOOKAHEAD_FLOOR_S);
   }
 
+  function forwardEdgeDeg(u0, u1, viewU, sign) {
+    if (stripContainsU(u0, u1, viewU)) return 0;
+    var raw = sign < 0 ? ((Number(viewU) || 0) - u1) : (u0 - (Number(viewU) || 0));
+    return ((raw % 1) + 1) % 1 * 360;
+  }
+
   function tileInResidentBand(tile, width, height, view) {
     if (!tile || !view) return true;
     if (!(view.lookaheadDeg > 0) && view.panSign !== 1 && view.panSign !== -1) return true;
+    var span = Math.max(width, 1);
+    // Both 180° columns of the photo on screen stay resident for the whole
+    // turn. Measuring the center and wrapping at ±180° called the upcoming
+    // column "behind" for the first half of every column.
+    if ((tile.srcW || 0) * 2 >= span) return true;
     if (tileInView(tile, width, height, view)) return true;
     var sign = view.panSign < 0 ? -1 : 1;
-    var centerU = (tile.srcX + tile.srcW / 2) / Math.max(width, 1);
-    var lead = panLeadDeg(centerU, view.u, sign);
-    var tileDeg = (tile.srcW / Math.max(width, 1)) * 360;
+    var u0 = tile.srcX / span;
+    var u1 = (tile.srcX + tile.srcW) / span;
+    var ahead = forwardEdgeDeg(u0, u1, view.u, sign);
     var limit = (view.halfU || 0) * 360 + (view.lookaheadDeg || 0) + RESIDENT_MARGIN_DEG;
-    var near = lead - tileDeg / 2;
-    var far = lead + tileDeg / 2;
-    if (far < -RESIDENT_MARGIN_DEG) return false;
-    if (near > limit) return false;
-    return true;
+    if (ahead <= limit) return true;
+    var back = forwardEdgeDeg(u0, u1, view.u, -sign);
+    return back <= RESIDENT_MARGIN_DEG;
   }
 
   function overviewUniforms(texW, texH) {
@@ -5547,32 +5612,34 @@
   }
 
   function columnEngaged(col, viewCol, tiles, width, view) {
-    if (col === viewCol) return true;
+    if ((col | 0) === (viewCol | 0)) return true;
+    // Two 180° columns both fit in GPU memory. The one the camera has not
+    // reached yet is always a master once the horizon under the lens is in,
+    // including the first half of the current column where a wrapped lead
+    // used to look negative.
+    if (gridStats(tiles).cols <= 2) return true;
     var sample = null;
     for (var i = 0; i < tiles.length; i++) {
-      if (tiles[i] && !tiles[i]._base && (tiles[i].col | 0) === col) {
+      if (tiles[i] && !tiles[i]._base && (tiles[i].col | 0) === (col | 0)) {
         sample = tiles[i];
         break;
       }
     }
     if (!sample) return false;
     var span = Math.max(width, 1);
-    var cu = (sample.srcX + sample.srcW / 2) / span;
-    cu = cu - Math.floor(cu);
+    var u0 = sample.srcX / span;
+    var u1 = (sample.srcX + sample.srcW) / span;
     var vu = view && view.u != null ? view.u : 0.5;
     var sign = view && view.panSign < 0 ? -1 : 1;
-    var lead = panLeadDeg(cu, vu, sign);
-    var tileDeg = (sample.srcW / span) * 360;
-    var far = lead + tileDeg / 2;
-    var near = lead - tileDeg / 2;
-    var half = ((view && view.halfU) || 0.12) * 360;
-    if (near <= 0 && far >= 0) return true;
-    // Behind the camera only stays a master when it still clips the frustum.
-    // Ahead, start the next 180° strip while it is still short of the screen edge.
-    if (far < 0) return -far <= half + 8;
+    var halfU = (view && view.halfU) || 0.12;
+    if (stripContainsU(u0, u1, vu) || uOverlap(u0, u1, vu, halfU)) return true;
+    var ahead = forwardEdgeDeg(u0, u1, vu, sign);
+    var half = halfU * 360;
     var extra = STRIP_LOOKAHEAD_DEG;
     if (view && view.lookaheadDeg > 0) extra = Math.max(extra, Math.min(view.lookaheadDeg, 90));
-    return near <= half + extra;
+    if (ahead <= half + extra) return true;
+    var back = forwardEdgeDeg(u0, u1, vu, -sign);
+    return back <= half + 8 && back + 0.5 < ahead;
   }
 
   function activeMasters(tiles, width, height, view, info) {
@@ -5593,7 +5660,14 @@
         if (!anchorLoaded) continue;
         if (!columnEngaged(col, viewCol, tiles, width, view)) continue;
       }
-      if (view.standby && Math.abs((tile.row | 0) - anchor) > 0) continue;
+      if (view.standby) {
+        // A 180° photo prefetches the three strips in the opening frustum.
+        // The other hemisphere and the pole caps wait until it is on screen.
+        // Narrower columns still follow the pan, or the tile beside the
+        // seam never arrives before the swap.
+        if (gridStats(tiles).cols <= 2 && col !== viewCol) continue;
+        if (Math.abs((tile.row | 0) - anchor) > 1) continue;
+      }
       masters.push(tile);
     }
     return masters;
@@ -5609,12 +5683,24 @@
     if (wrap < dist) dist = wrap;
     var sign = view && view.panSign < 0 ? -1 : 1;
     var delta = (tile.col | 0) - viewCol;
-    if (delta > stats.cols / 2) delta -= stats.cols;
-    if (delta < -stats.cols / 2) delta += stats.cols;
+    if (stats.cols === 2) {
+      // The other 180° column is the one the pan is heading toward. A
+      // shortest-path wrap of exactly half a turn called it "behind" once
+      // the camera sat in column 1.
+      delta = (tile.col | 0) === viewCol ? 0 : sign;
+      if ((tile.col | 0) !== viewCol) dist = 1;
+    } else {
+      if (delta > stats.cols / 2) delta -= stats.cols;
+      if (delta < -stats.cols / 2) delta += stats.cols;
+    }
     var ahead = delta * sign;
     var side = ahead > 0 ? 0 : (ahead < 0 ? 1 : 0);
     var vertical = (tile.row | 0) < anchor ? 0 : 1;
-    return tier * 1000 + dist * 100 + side * 10 + vertical;
+    var rank = tier * 1000 + dist * 100 + side * 10 + vertical;
+    // Steering finishes the column under the crosshair (horizon and the
+    // bands beside it) before it spends the pipe on the next column.
+    if (view && view.manual && tier <= 1 && (tile.col | 0) !== viewCol) rank += 1000;
+    return rank;
   }
 
   function tileLoadOrder(tiles, width, height, view) {
@@ -5804,11 +5890,29 @@
     return true;
   }
 
+  function anchorPieceReady(session) {
+    if (!session || !session.entry || !session.entry.tiles) return false;
+    var tiles = session.entry.tiles;
+    var anchor = stripAnchorRow(tiles, session.entry.height, { manual: false, v: 0.5 });
+    var col = columnAtU(tiles, session.entry.width, 0.5);
+    var tile = findStrip(tiles, col, anchor) || findStrip(tiles, 0, anchor);
+    if (!tile) return false;
+    var loaded = session.loaded || [];
+    for (var i = 0; i < loaded.length; i++) {
+      if (loaded[i] && loaded[i].tile && loaded[i].tile.id === tile.id && pieceReady(loaded[i])) return true;
+    }
+    return false;
+  }
+
   function swapReady(session) {
+    if (!session) return false;
     if (sessionReady(session)) return true;
-    if (!(session && session._viewCovered && session._viewCovered())) return false;
-    if (session._lookaheadCovered && !session._lookaheadCovered()) return false;
-    return true;
+    // The opening frustum is enough. Waiting on every lookahead strip,
+    // including both pole caps, deadlocked the swap: standby was not
+    // allowed to fetch those rows, so this never became true.
+    if (session._viewCovered && session._viewCovered()) return true;
+    if (session._overviewReady && anchorPieceReady(session)) return true;
+    return false;
   }
 
   function sessionReady(session) {
@@ -6235,6 +6339,11 @@
     tilePatch: tilePatch,
     stripAnchorRow: stripAnchorRow,
     columnAtU: columnAtU,
+    columnEngaged: columnEngaged,
+    masterRank: masterRank,
+    swapReady: swapReady,
+    forwardEdgeDeg: forwardEdgeDeg,
+    viewPixel: viewPixel,
     armSenderGrace: armSenderGrace,
     shouldTryLan: shouldTryLan,
     loadHttpJpeg: loadHttpJpeg,
