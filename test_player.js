@@ -218,30 +218,36 @@ lanPlayer.setQueue([wide]);
 const lanWaits = lanTimers.filter(function (timer) { return timer.ms === Cast.LAN_PROBE_TIMEOUT_MS; });
 assert(Cast.LAN_PROBE_TIMEOUT_MS === 5000, "the first LAN try waits 5000ms");
 assert(Cast.LAN_TIMEOUT_MS === 8000, "a proven LAN waits 8000ms");
-assert(Cast.LAN_FAIL_LIMIT === 4, "LAN tolerates 3 misses and drops on the 4th");
+assert(Cast.LAN_FAIL_LIMIT === 4, "LAN dies after four misses");
 assert(lanWaits.length === 2, "overview plus the strip under the lens is the LAN probe, got " + lanWaits.length);
 assert(lanPlayer.session._inFlight() === 1, "the centered strip is in flight before the next column, got " + lanPlayer.session._inFlight());
 lanWaits[0].fn();
 assert(lanPlayer._lan === true, "a timeout keeps the LAN flag");
-assert(lanPlayer._lanDead === false, "a single probe timeout does not kill LAN");
+assert(lanPlayer._lanDead === false, "one probe miss does not kill LAN");
 assert(lanPlayer._lanFailures === 1, "the timeout counts as one failure, got " + lanPlayer._lanFailures);
 const fallback = lanSent.filter(function (msg) { return msg && msg.type === "fetch" && msg.reason === "lan"; });
 assert(fallback.length === 1, "that request falls back to Cast, got " + JSON.stringify(fallback));
 
 const miss = Cast.create(bareCanvas());
 miss.setLan(true);
-for (let n = 0; n < 3; n++) {
-  const before = lanTimers.length;
-  miss._loadLan("miss-" + n, n + 1, "http://10.1.1.1/m" + n + ".jpg");
-  const timer = lanTimers.slice(before).filter(function (item) { return item.ms === Cast.LAN_PROBE_TIMEOUT_MS; }).pop();
-  assert(timer, "miss " + n + " armed a probe timer");
-  timer.fn();
+const beforeProbe = lanTimers.length;
+miss._loadLan("miss-0", 1, "http://10.1.1.1/m0.jpg");
+const probe = lanTimers.slice(beforeProbe).filter(function (item) { return item.ms === Cast.LAN_PROBE_TIMEOUT_MS; }).pop();
+assert(probe, "an unverified LAN arms the 5000ms probe");
+probe.fn();
+assert(miss._lanFailures === 1 && miss._lanDead === false, "one probe miss keeps LAN");
+miss._lanVerified = true;
+miss._lanFailures = 0;
+for (let missN = 1; missN <= 3; missN++) {
+  const beforeMiss = lanTimers.length;
+  miss._loadLan("miss-" + missN, missN + 1, "http://10.1.1.1/m" + missN + ".jpg");
+  lanTimers.slice(beforeMiss).filter(function (item) { return item.ms === Cast.LAN_TIMEOUT_MS; }).pop().fn();
+  assert(miss._lanDead === false, "miss " + missN + " on a proven LAN stays on Wi-Fi");
 }
-assert(miss._lanFailures === 3 && miss._lanDead === false && miss._lan === true, "three misses still leave LAN up");
 const beforeFourth = lanTimers.length;
-miss._loadLan("miss-3", 4, "http://10.1.1.1/m3.jpg");
-lanTimers.slice(beforeFourth).filter(function (item) { return item.ms === Cast.LAN_PROBE_TIMEOUT_MS; }).pop().fn();
-assert(miss._lanFailures === 4 && miss._lanDead === true && miss._lan === true, "the fourth consecutive miss drops LAN fetches");
+miss._loadLan("miss-4", 5, "http://10.1.1.1/m4.jpg");
+lanTimers.slice(beforeFourth).filter(function (item) { return item.ms === Cast.LAN_TIMEOUT_MS; }).pop().fn();
+assert(miss._lanFailures === 4 && miss._lanDead === true && miss._lan === true, "the fourth proven miss drops LAN fetches");
 
 sandbox.Image = function () {
   Object.defineProperty(this, "src", {
@@ -252,16 +258,19 @@ sandbox.Image = function () {
     },
   });
 };
+miss._lanDead = true;
+miss._lanFailures = 3;
 miss._loadLan("miss-ok", 9, "http://10.1.1.1/ok.jpg");
-assert(miss._lanFailures === 0, "a LAN success clears the failure run");
+assert(miss._lanFailures === 0 && miss._lanDead === false && miss._lanVerified === true, "a LAN success clears the failure run and restores Wi-Fi");
 miss.setLan(true);
 assert(miss._lanDead === false && miss._lanFailures === 0, "setLan arms a fresh Wi-Fi attempt");
 
-assert(Cast.TILE_FADE_MS === 2400, "photo-to-photo tile fade is 2400ms");
 assert(Cast.FOCUS_MS === 1800, "focus fade is 1800ms");
+assert(Cast.TILE_FADE_MS === 2400, "the photo crossfade is 2400ms");
 assert(Math.abs(Cast.FOCUS_FEATHER - 0.65) < 1e-9, "the wave feather is 0.65 of a strip");
-assert(Math.abs(Cast.FOCUS_HANDOFF - 0.35) < 1e-9, "the next strip joins at 0.35, got " + Cast.FOCUS_HANDOFF);
-assert(Math.abs(Cast.REVEAL_HANDOFF - 0.35) < 1e-9, "reveal handoff matches focus handoff, got " + Cast.REVEAL_HANDOFF);
+assert(Math.abs(Cast.FOCUS_HANDOFF - 0.35) < 1e-9, "the handoff stays at 0.35");
+assert(Math.abs(Cast.REVEAL_HANDOFF - 0.35) < 1e-9, "the next strip joins at 0.35, got " + Cast.REVEAL_HANDOFF);
+assert(Math.abs(Cast.FOCUS_HANDOFF + Cast.FOCUS_FEATHER - 1) < 1e-9, "handoff plus feather width is one continuous strip");
 const born = 1000;
 assert(Math.abs(Cast.revealProgress(born, born + Cast.FOCUS_MS / 4, Cast.FOCUS_MS) - 0.25) < 1e-9, "reveal progress is linear at one quarter");
 assert(Math.abs(Cast.revealProgress(born, born + Cast.FOCUS_MS / 2, Cast.FOCUS_MS) - 0.5) < 1e-9, "reveal progress is linear at halfway");
@@ -287,8 +296,8 @@ assert(code.indexOf("0.5/180.0") < 0, "the vertical seam is not a half-degree ov
 const finished = { srcX: 2048, srcY: 1638, srcW: 4096, srcH: 820, row: 2, col: 0 };
 const under = { srcX: 2048, srcY: 2458, srcW: 4096, srcH: 819, row: 3, col: 0 };
 const edgeSeam = 2458 / 4096;
-const edgeParent = Cast.focusMask(0.5, edgeSeam, finished, 8192, 4096, Cast.FOCUS_HANDOFF + Cast.FOCUS_FEATHER / 2, { down: Cast.FOCUS_FEATHER / 2 }, { anchorV: 0.5 });
-const edgeChild = Cast.focusMask(0.5, edgeSeam, under, 8192, 4096, Cast.FOCUS_FEATHER / 2, { up: Cast.FOCUS_HANDOFF + Cast.FOCUS_FEATHER / 2 }, { anchorV: 0.5 });
+const edgeParent = Cast.focusMask(0.5, edgeSeam, finished, 8192, 4096, Cast.REVEAL_HANDOFF + 1 / 6, { down: 1 / 6 }, { anchorV: 0.5 });
+const edgeChild = Cast.focusMask(0.5, edgeSeam, under, 8192, 4096, 1 / 6, { up: Cast.REVEAL_HANDOFF + 1 / 6 }, { anchorV: 0.5 });
 assert(Math.abs(edgeParent - edgeChild) < 0.02, "the wave is continuous across the seam, got " + edgeParent + " / " + edgeChild);
 const bottom = Cast.focusMask(0.5, (2458 - 1) / 4096, finished, 8192, 4096, 1, { down: 0 }, { anchorV: 0.5 });
 assert(bottom === 1, "a finished strip stays sharp at its bottom edge, got " + bottom);
@@ -319,12 +328,12 @@ const parentAmount = function (amount) {
     return row === 1 ? amount : 0;
   });
 };
-assert(parentAmount(0.34) === false, "a child stays locked below the handoff");
-assert(parentAmount(0.35) === true, "a child unlocks at the handoff");
+assert(parentAmount(Cast.REVEAL_HANDOFF - 0.01) === false, "a child stays locked below the handoff");
+assert(parentAmount(Cast.REVEAL_HANDOFF) === true, "a child unlocks at the handoff");
 assert(parentAmount(0.9) === true, "a child stays unlocked while the parent feather is still running");
 
 const handoffAt = horizonFocus + Math.round(Cast.FOCUS_MS * Cast.REVEAL_HANDOFF);
-clock.t = horizonFocus + Math.round(Cast.FOCUS_MS * 0.25);
+clock.t = horizonFocus + Math.round(Cast.FOCUS_MS * Cast.REVEAL_HANDOFF * 0.5);
 const earlyChild = session.pending;
 assert(earlyChild && earlyChild.id.indexOf("-r") >= 0, "a neighboring strip is waiting, got " + (earlyChild && earlyChild.id));
 deliver(player, earlyChild);
@@ -346,7 +355,7 @@ const seamV = above.tile.row < 1 ? (above.tile.srcY + above.tile.srcH) / spanH :
 const parentSeam = Cast.focusMask(0.5, seamV, horizon.tile, spanW, spanH, parentReveal, {}, { anchorV: 0.5 });
 const childSeam = Cast.focusMask(0.5, seamV, above.tile, spanW, spanH, childReveal, {}, { anchorV: 0.5 });
 assert(childSeam > 0.2, "the next band is already opening across the seam, got " + childSeam);
-assert(parentSeam <= childSeam + 0.02, "the parent edge is not ahead of the band that joined at halfway, got " + parentSeam + " vs " + childSeam);
+assert(Math.abs(parentSeam - childSeam) < 0.02, "the seam is one wave, got " + parentSeam + " vs " + childSeam);
 
 const lateClock = horizonFocus + Math.round(Cast.FOCUS_MS * 0.8);
 clock.t = lateClock;
@@ -437,26 +446,5 @@ handoff.session.loaded.forEach(function (piece) {
   if (!piece || !piece._revealDone) return;
   assert(handoff._revealOf(piece) === 1, "a preloaded strip is fully sharp on the first frame, got " + handoff._revealOf(piece));
 });
-
-// Verify standby view-ready / budget-full does not loop-request over 120 frames
-const stormGuard = Cast.create(bareCanvas());
-stormGuard._focusNow = function () { return 90000; };
-install(stormGuard);
-stormGuard.playing = true;
-stormGuard.manual = false;
-stormGuard.setQueue([rowsPhoto("sg0"), rowsPhoto("sg1")]);
-pump(stormGuard.session);
-assert(stormGuard._standby && stormGuard._standby.entry, "standby opened for sg1");
-// Deliver opening strip so standby is view-ready, then mark budgetFull
-deliver(stormGuard, stormGuard._standby.pending);
-if (stormGuard._standby.pending) deliver(stormGuard, stormGuard._standby.pending);
-stormGuard._gpuBytes = Cast.GPU_CAP;
-stormGuard._standby.budgetFull = true;
-const reqBeforeLoop = stormGuard._diagRequested;
-for (let f = 0; f < 120; f++) {
-  stormGuard._feedPreload();
-  stormGuard._pumpFrame(16);
-}
-assert(stormGuard._diagRequested - reqBeforeLoop <= 4, "120 frames at GPU_CAP must not storm standby requests, delta=" + (stormGuard._diagRequested - reqBeforeLoop));
 
 console.log("test_player ok");

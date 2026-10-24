@@ -165,10 +165,12 @@
         player.setSnapFadeMs(msg.ms);
       } else if (msg.type === "hello") {
         sendLimits();
-      } else if (msg.type === "debug") {
-        player.setDebugTint(msg.on);
+      } else if (msg.type === "lan") {
+        player.setLan(msg.enabled !== false);
       } else if (msg.type === "soft-reset" || msg.type === "softReset") {
         player.softReset(msg.reason || "phone");
+      } else if (msg.type === "debug") {
+        player.setDebugTint(msg.on);
       }
     }
 

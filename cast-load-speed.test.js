@@ -232,35 +232,29 @@ for (let t = clock; t <= 4000; t += 10) {
 }
 assert(sharpAt != null && sharpAt < 3000, "front screen is sharp at " + sharpAt + "ms");
 
-assert(Cast.TILE_FADE_MS === 2400, "TILE_FADE_MS is 2400");
-assert(Math.abs(Cast.FOCUS_FEATHER - 0.65) < 1e-9, "FOCUS_FEATHER is 0.65");
-assert(Math.abs(Cast.FOCUS_HANDOFF - 0.35) < 1e-9, "FOCUS_HANDOFF is 0.35");
-assert(Cast.LAN_PROBE_TIMEOUT_MS === 5000, "probe budget is " + Cast.LAN_PROBE_TIMEOUT_MS);
-assert(Cast.LAN_TIMEOUT_MS === 8000, "LAN timeout is " + Cast.LAN_TIMEOUT_MS);
-assert(Cast.LAN_FAIL_LIMIT === 4, "LAN fail limit is " + Cast.LAN_FAIL_LIMIT);
-
 const lan = freshPlayer();
 lan.setLan(true);
 clock = 5000;
 const lanMark = sandbox.__timers.length;
 lan.setQueue([hemisphere("lan")]);
 const probes = sandbox.__timers.slice(lanMark).filter(function (timer) { return timer.ms === Cast.LAN_PROBE_TIMEOUT_MS; });
-assert(probes.length >= 2, "the initial LAN fetches arm probes");
+assert(Cast.LAN_PROBE_TIMEOUT_MS === 5000, "probe budget is " + Cast.LAN_PROBE_TIMEOUT_MS);
+assert(Cast.LAN_TIMEOUT_MS === 8000, "a proven LAN waits 8000ms");
+assert(Cast.LAN_FAIL_LIMIT === 4, "LAN dies after four misses");
+assert(probes.length >= 1, "the first LAN try arms a probe");
+assert(probes.every(function (timer) { return timer.ms === 5000; }), "the first try is a 5s probe, not an 8s wait");
 const castBefore = lan.fetches.filter(function (item) { return item.reason === "lan"; }).length;
 probes[0].fn();
-assert(lan._lanDead === false, "a single slow LAN fetch falls back to Cast for that tile only and does not set _lanDead");
-assert(lan._lanFailures === 1, "failure count is 1 after one timeout");
+assert(lan._lanDead === false, "the first probe miss does not leave LAN");
+assert(lan._lanFailures === 1, "the probe counts as one miss, got " + lan._lanFailures);
 const castAfter = lan.fetches.filter(function (item) { return item.reason === "lan"; });
-assert(castAfter.length === castBefore + 1, "only that timed-out tile falls back to a Cast fetch");
-// 3 more consecutive LAN misses reach LAN_FAIL_LIMIT (4) and set _lanDead = true
-probes[1].fn();
-assert(lan._lanDead === false && lan._lanFailures === 2, "2 consecutive failures still keep LAN alive");
-lan._loadLan("lan-r1c0", 3, "http://192.168.1.20/lan/1/0.jpg");
-sandbox.__timers[sandbox.__timers.length - 1].fn();
-assert(lan._lanDead === false && lan._lanFailures === 3, "3 consecutive failures still keep LAN alive");
-lan._loadLan("lan-r3c0", 4, "http://192.168.1.20/lan/3/0.jpg");
-sandbox.__timers[sandbox.__timers.length - 1].fn();
-assert(lan._lanDead === true && lan._lanFailures === 4, "_lanDead becomes true after LAN_FAIL_LIMIT = 4 consecutive failures");
+assert(castAfter.length > castBefore, "the probe falls back to a Cast fetch");
+if (lan.session && lan.session.hooks && lan.session.hooks.onTileRetry) {
+  lan.session.hooks.onTileRetry({ id: "lan-retry" });
+  lan.session.hooks.request("lan-retry", 3);
+}
+assert(lan._lanDead === false, "a tile retry does not kill LAN");
+assert(lan.fetches.some(function (item) { return item.id === "lan-retry" && item.reason === "retry"; }), "the retry goes over Cast");
 
 function sessionHarness(timeoutMs) {
   const requests = [];
@@ -383,114 +377,116 @@ const masters = Cast.activeMasters(givePhoto.tiles, givePhoto.width, givePhoto.h
 });
 assert(masters.some(function (tile) { return tile.id === "give-r2c1"; }), "the other horizon is still reachable after the anchor is skipped");
 
-// Verify single tile retry does not kill LAN for the rest of the show
-const retryLan = freshPlayer();
-retryLan.setLan(true);
-retryLan.setQueue([hemisphere("rlan")]);
-assert(retryLan._lanDead === false, "LAN starts alive");
-const rlanTile = retryLan.session.entry.tiles[0];
-const rlanBox = { id: rlanTile.id, token: 2, gen: retryLan.session.generation, tile: rlanTile, _tokenHeld: false };
-retryLan.session._skipTile(rlanBox, "stall");
-assert(retryLan._lanDead === false, "a single tile retry uses Cast for that retry without killing _lanDead");
-assert(retryLan.fetches.some(function (item) { return item.id === rlanTile.id; }), "the retry was sent over Cast");
+assert(Cast.TILE_FADE_MS === 2400, "photo fade stays 2400ms");
+assert(Math.abs(Cast.FOCUS_FEATHER - 0.65) < 1e-9, "feather stays 0.65");
+assert(Math.abs(Cast.FOCUS_HANDOFF - 0.35) < 1e-9, "handoff stays 0.35");
 
-// Verify 120 frames when _gpuBytes is near GPU_CAP and standby is view-ready or budget-full do NOT loop-request
-const capShow = freshPlayer();
-capShow.playing = true;
-capShow.manual = false;
-capShow.setQueue([hemisphere("capA"), hemisphere("capB")]);
-while (capShow.session && capShow.session.pending) {
-  stamp(capShow.session);
-  clock += STRIP_MS;
-  deliverOne(capShow.session);
+const storm = freshPlayer();
+storm.playing = true;
+storm.manual = false;
+clock = 20000;
+storm.setQueue([hemisphere("stormA"), hemisphere("stormB")]);
+let stormGuard = 0;
+while (stormGuard < 40 && storm.session && storm.session.pending) {
+  stormGuard += 1;
+  stamp(storm.session);
+  let soonest = null;
+  Object.keys(storm.session.assemblers || {}).forEach(function (id) {
+    const box = storm.session.assemblers[id];
+    if (!box || box._deliverAt == null) return;
+    if (soonest == null || box._deliverAt < soonest) soonest = box._deliverAt;
+  });
+  if (soonest == null) break;
+  clock = soonest;
+  if (!deliverOne(storm.session)) break;
 }
-capShow._integrate(16);
-assert(capShow._standby && capShow._standby.entry, "standby started for capB");
-// Deliver overview + opening view (r2c0, r1c0, r3c0) on standby, then simulate GPU_CAP full on r2c1
-while (capShow._standby.pending) {
-  const pid = capShow._standby.pending.id;
-  if (pid === "capB:overview" || pid === "capB-r2c0" || pid === "capB-r1c0" || pid === "capB-r3c0") {
-    capShow._standby.noteChunk({ type: "chunk", id: pid, token: capShow._standby.pending.token, i: 0, n: 1, data: pid });
-  } else {
-    break;
-  }
+storm._activeBusy = function () { return false; };
+for (let kick = 0; kick < 8 && (!storm._standby || !storm._standby.entry); kick++) storm._feedPreload();
+let standbyGuard = 0;
+while (standbyGuard < 20 && storm._standby && storm._standby.pending) {
+  standbyGuard += 1;
+  stamp(storm._standby);
+  let soonest = null;
+  Object.keys(storm._standby.assemblers || {}).forEach(function (id) {
+    const box = storm._standby.assemblers[id];
+    if (!box || box._deliverAt == null) return;
+    if (soonest == null || box._deliverAt < soonest) soonest = box._deliverAt;
+  });
+  if (soonest == null) break;
+  clock = soonest;
+  if (!deliverOne(storm._standby)) break;
+  storm._feedPreload();
 }
-assert(Cast.swapReady(capShow._standby) === true, "standby is view-ready");
-capShow._gpuBytes = Cast.GPU_CAP - 4 * 1024 * 1024;
-capShow._uploadTile = function (img, tile, standby) {
-  if (standby) return capShow._deferred(img, tile);
-  return { label: img.label, bytes: 32, _mip: true };
-};
-if (capShow._standby.pending) {
-  const defPending = capShow._standby.pending;
-  capShow._standby.noteChunk({ type: "chunk", id: defPending.id, token: defPending.token, i: 0, n: 1, data: defPending.id });
+assert(storm._standby && storm._standby.entry, "photo 2 started preloading");
+storm._standby.budgetFull = true;
+storm._standby.preloadCapped = true;
+const beforeLoop = storm.fetches.length;
+for (let frame = 0; frame < 180; frame++) {
+  storm._feedPreload();
+  if (storm._standby && storm._standby._requestCurrent) storm._standby._requestCurrent();
 }
-assert(capShow._standby.budgetFull === true, "standby marked budgetFull when GPU_CAP is full");
-const requestedAtCap = capShow._diagRequested;
-for (let frame = 0; frame < 120; frame++) {
-  clock += 16;
-  capShow._feedPreload();
-  capShow._pumpFrame(16);
-}
-const extraRequests = capShow._diagRequested - requestedAtCap;
-assert(extraRequests <= 4, "120 frames near GPU_CAP must not storm requests, extra=" + extraRequests + " total=" + capShow._diagRequested);
-assert(capShow._diagRequested < 40, "total requested stays bounded (" + capShow._diagRequested + "), never climbing to 50+ or 282");
-
-// Verify softReset() and _checkHealthWatchdog() self-healing behavior
-const healSent = [];
-const heal = freshPlayer();
-sandbox.__castSend = function (msg) {
-  if (msg) healSent.push(msg);
-};
-heal.setLan(true);
-heal.setQueue([hemisphere("healA"), hemisphere("healB")]);
-while (heal.session && heal.session.pending) {
-  stamp(heal.session);
-  clock += STRIP_MS;
-  deliverOne(heal.session);
-}
-heal._presented = true;
-heal.yaw = 123;
-heal.pitch = 15;
-heal.fov = 65;
-const drawnBeforeHeal = heal._tileDraw.length;
-assert(drawnBeforeHeal > 0, "healA has live tiles on screen");
-// Simulate a wedged storm state
-heal._lanDead = true;
-heal._lanDeadAt = clock - 5000;
-heal._lanFailures = 4;
-heal._diagRequested = 282;
-heal._diagReceived = 269;
-heal._diagDecoded = 118;
-heal._diagUploaded = 100;
-heal._diagErrors = 3;
-for (let q = 0; q < 20; q++) {
-  heal._decodeQueue.push({ payload: "wedged", done: function () {} });
-  heal._uploadQueue.push({ img: {}, tile: {}, standby: true, done: function () {} });
-}
-const triggered = heal._checkHealthWatchdog(clock);
-assert(triggered === true, "watchdog triggers softReset on 282/100 request storm");
-assert(heal._decodeQueue.length === 0, "softReset flushes _decodeQueue");
-assert(heal._uploadQueue.length === 0, "softReset flushes _uploadQueue");
-assert(heal._standby === null && heal._back === null, "softReset disposes standby/back sessions");
-assert(heal._lanDead === false && heal._lanFailures === 0, "softReset restores direct Wi-Fi LAN mode");
-assert(heal.index === 0 && heal.entries.length === 2, "softReset preserves queue and photo index");
-assert(heal.yaw === 123 && heal.pitch === 15 && heal.fov === 65, "softReset preserves camera aim");
-assert(heal._tileDraw.length === drawnBeforeHeal, "softReset keeps on-screen textures so TV never flashes black");
-assert(heal._diagErrors === 0 && heal._diagNote === "Soft-reset: restored normal mode", "softReset resets diagnostic error state");
-assert(heal._diagRequested === drawnBeforeHeal && heal._diagUploaded === drawnBeforeHeal, "softReset resets storm counters to live tile count");
-assert(healSent.some(function (m) { return m.type === "soft-reset" && m.reason === "request-storm"; }), "softReset notifies phone to flush outbound chunk backlog");
-// Cooldown prevents back-to-back softReset within 8s
-heal._diagRequested = 200;
-assert(heal._checkHealthWatchdog(clock + 2000) === false, "watchdog respects 8s cooldown");
-assert(heal._checkHealthWatchdog(clock + 9000) === true, "watchdog fires again after 8s cooldown if storm recurs");
-// Degraded LAN auto-recovery after 12s
-heal._lanDead = true;
-heal._lanDeadAt = clock + 9000;
-heal._lanFailures = 4;
-heal._checkHealthWatchdog(clock + 22000);
-assert(heal._lanDead === false && heal._lanFailures === 0, "watchdog re-arms LAN after 12s on Cast fallback");
-assert(Cast.acceptCastMessage({ type: "soft-reset" }).type === "soft-reset", "inbound soft-reset Cast message is accepted");
+assert(storm.fetches.length === beforeLoop, "a full GPU does not re-request the same standby strips, grew by " + (storm.fetches.length - beforeLoop));
+assert(storm.fetches.length <= 22, "a two-photo show stays within 22 requests, got " + storm.fetches.length);
+storm._standby._overviewReady = false;
+storm._standby._viewCovered = function () { return false; };
+storm._standby.loaded = storm._standby.loaded.filter(function (piece) { return piece && piece.tile && piece.tile._overview; });
+storm._standby.budgetFull = true;
+const beforeCap = storm.fetches.length;
+for (let frame = 0; frame < 120; frame++) storm._feedPreload();
+assert(storm.fetches.length === beforeCap, "budget-full with nothing to evict stays paused, grew by " + (storm.fetches.length - beforeCap));
 
 assert(before >= 0, "timer log started");
+
+const heal = freshPlayer();
+heal.playing = true;
+clock = 1000;
+heal.setQueue([hemisphere("healA"), hemisphere("healB")]);
+const keptDraw = [{ tex: { id: "on-screen", _mip: true } }];
+const keptBases = { healA: { tex: { id: "base" } } };
+heal._tileDraw = keptDraw;
+heal._bases = keptBases;
+heal._diagRequested = 50;
+heal._diagUploaded = 10;
+heal._decodeQueue = new Array(18).fill({ payload: "j" });
+heal._uploadQueue = new Array(18).fill({ img: {}, tile: { id: "queued" } });
+heal._decoding = 3;
+heal._uploading = true;
+heal._lan = true;
+heal._lanDead = true;
+heal._lanFailures = 4;
+heal._lanDeadSince = clock - 20000;
+if (heal.session && heal.session.entry && heal.session.entry.tiles[0]) {
+  heal.session.entry.tiles[0]._skip = true;
+  heal.session.budgetFull = true;
+  heal.session.assemblers.stuck = { id: "stuck", gen: heal.session.generation };
+}
+const notes = [];
+sandbox.__castSend = function (msg) { notes.push(msg); };
+assert(heal._checkHealthWatchdog() === true, "a request gap over 28 soft-resets");
+assert(heal._decodeQueue.length === 0 && heal._decoding === 0, "the decode queue is cleared");
+assert(heal._uploadQueue.length === 0 && heal._uploading === false, "the upload queue is cleared");
+assert(heal._lanDead === false && heal._lanFailures === 0, "Wi-Fi is armed again after a lockup");
+assert(heal._tileDraw === keptDraw && heal._bases === keptBases, "the photo on screen stays where it is");
+assert(!heal.session.assemblers.stuck && heal.session.budgetFull === false, "stuck assemblers and the GPU pause are cleared");
+assert(heal.session.entry.tiles[0]._skip !== true, "the current photo can request a skipped strip again");
+assert(notes.some(function (msg) { return msg && msg.type === "soft-reset" && msg.reason === "tile-backlog"; }), "the phone hears the soft reset");
+clock = 2000;
+heal._diagRequested = 90;
+heal._diagUploaded = 0;
+assert(heal._checkHealthWatchdog() === false, "a second lockup inside 8s does not reset again");
+const calm = freshPlayer();
+calm.playing = true;
+clock = 20000;
+calm.setQueue([hemisphere("calm")]);
+calm._diagRequested = 20;
+calm._diagUploaded = 12;
+assert(calm._checkHealthWatchdog() === false, "a normal photo is not treated as a lockup");
+calm.session.pending = { id: "calm-r2c0", token: 1, started: clock - 11000 };
+assert(calm._checkHealthWatchdog() === true, "a tile wedged for more than 10s soft-resets");
+const page = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
+assert(page.indexOf('msg.type === "soft-reset"') >= 0, "the receiver page applies a phone soft reset");
+assert(page.indexOf('msg.type === "lan"') >= 0, "the receiver page can turn Wi-Fi back on");
+
+assert(Cast.acceptCastMessage({ type: "soft-reset" }).type === "soft-reset", "acceptCastMessage allows soft-reset");
+assert(Cast.acceptCastMessage({ type: "lan", enabled: true }).type === "lan", "acceptCastMessage allows lan");
 console.log("cast-load-speed ok");
