@@ -167,6 +167,8 @@
         sendLimits();
       } else if (msg.type === "debug") {
         player.setDebugTint(msg.on);
+      } else if (msg.type === "soft-reset" || msg.type === "softReset") {
+        player.softReset(msg.reason || "phone");
       }
     }
 

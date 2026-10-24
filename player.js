@@ -57,9 +57,9 @@
   var LAN_AHEAD = 4;
   // The first HTTP try is a probe. A blocked phone must fall back to Cast
   // before it can stall the show. A proven LAN gets a longer timeout.
-  var LAN_PROBE_TIMEOUT_MS = 1500;
-  var LAN_TIMEOUT_MS = 3000;
-  var LAN_FAIL_LIMIT = 2;
+  var LAN_PROBE_TIMEOUT_MS = 5000;
+  var LAN_TIMEOUT_MS = 8000;
+  var LAN_FAIL_LIMIT = 4;
   // A single decode, fetch, or stall must not blank the horizon. Each strip
   // is asked again at least this many times, over Cast, before it is skipped.
   var TILE_RETRIES = 3;
@@ -425,6 +425,7 @@
     // setLan() runs before setQueue(). A new show retries Wi-Fi, and it
     // keeps the flag the queue message just set. The probe starts over.
     this._lanDead = false;
+    this._lanDeadAt = 0;
     this._lanFailures = 0;
     this._lanVerified = false;
       this._markBusy();
@@ -553,6 +554,13 @@
   Player.prototype.pause = function (held) {
     this.playing = false;
     if (held) this.held = true;
+    if (this._standby && (this._standby.pending || (this._standby._inFlight && this._standby._inFlight() > 0))) {
+      this._standby.quietStop();
+    }
+    if (this._back && (this._back.pending || (this._back._inFlight && this._back._inFlight() > 0))) {
+      this._back.quietStop();
+    }
+    this._pruneQueues();
     this._mark();
   };
 
@@ -939,6 +947,7 @@
   Player.prototype.setLan = function (on) {
     this._lan = !!on;
     this._lanDead = false;
+    this._lanDeadAt = 0;
     this._lanFailures = 0;
     this._lanVerified = false;
   };
@@ -976,13 +985,17 @@
     var probing = !self._lanVerified;
     loadHttpJpeg(url, probing ? LAN_PROBE_TIMEOUT_MS : LAN_TIMEOUT_MS, function (err, img) {
       if (err || !img) {
-        // Until one JPEG arrives, a single miss means the TV cannot reach
-        // the phone. Fall back to Cast immediately. A proven LAN tolerates
-        // a short run of misses before the same fallback.
+        // One slow strip is not a dead phone. Keep Wi-Fi up and ask Cast
+        // for this JPEG only. Several consecutive misses drop the LAN path.
         self._lanFailures = (self._lanFailures || 0) + 1;
-        if (probing || self._lanFailures >= LAN_FAIL_LIMIT) self._lanDead = true;
+        if (self._lanFailures >= LAN_FAIL_LIMIT) {
+          self._lanDead = true;
+          if (!self._lanDeadAt) self._lanDeadAt = self._clock();
+        }
         self._diagErrors = (self._diagErrors || 0) + 1;
-        self._diagNote = "LAN JPEG unreachable; using Cast messages";
+        self._diagNote = self._lanDead
+          ? "LAN JPEG unreachable; using Cast messages"
+          : "LAN JPEG slow; retrying tile over Cast";
         self._reportTv(self._diagNote);
         try { if (img && img.close) img.close(); } catch (error) {}
         if (window.__castSend) window.__castSend({ type: "fetch", id: id, token: token, reason: "lan" });
@@ -990,6 +1003,8 @@
       }
       self._lanVerified = true;
       self._lanFailures = 0;
+      self._lanDead = false;
+      self._lanDeadAt = 0;
       var pool = self._poolWithToken(id, token);
       if (!pool || !pool.noteImage(id, token, img)) {
         try { if (img.close) img.close(); } catch (error) {}
@@ -1049,7 +1064,7 @@
     if (swapReady(standby)) return "view-ready";
     if (standby.budgetFull) return "budget-full";
     if (standby.preloadCapped) return "preload-cap";
-    if (standby.pending) return "pending";
+    if (standby.pending || (standby._inFlight && standby._inFlight() > 0)) return "pending";
     return "stalled";
   };
 
@@ -1153,26 +1168,39 @@
       this._preloadLogged = why;
       this._logSwitch("preload", this._preloadDetail());
     }
+    if (why === "next-has-no-tiles") return;
     if (why === "not-started" || why === "standby-other") this._preloadNeighbors();
     var standby = this._standby;
     if (!standby || !standby.entry) return;
     if (why === "view-ready") {
       // The tiles in front of the camera are already on the GPU. Do not evict
       // that view, and do not resume a standby session that has already
-      // loaded every strip it is allowed to prefetch.
+      // loaded every strip it is allowed to prefetch or hit a cap.
+      if (standby.budgetFull || standby.preloadCapped) return;
       var more = standby._pickTile && standby._pickTile();
-      if (more && (standby.preloadCapped || standby.budgetFull) && !standby.pending && !sessionReady(standby)) {
+      if (more && !standby.pending && !(standby._inFlight && standby._inFlight() > 0) && !sessionReady(standby)) {
+        standby._requestCurrent();
+      }
+      return;
+    }
+    if (why === "budget-full" || why === "preload-cap") {
+      var freed = this._evictOffscreen();
+      if (freed > 0 && (this._gpuBytes || 0) < GPU_CAP - 16 * 1024 * 1024) {
         standby.preloadCapped = false;
         standby.budgetFull = false;
         standby.resume();
       }
       return;
     }
-    if (why === "budget-full" || why === "preload-cap" || why === "stalled" || why === "next-has-no-tiles") {
-      this._evictOffscreen();
-      standby.preloadCapped = false;
-      standby.budgetFull = false;
-      standby.resume();
+    if (why === "stalled") {
+      var freedStalled = this._evictOffscreen();
+      if (!standby.budgetFull && !standby.preloadCapped) {
+        standby.resume();
+      } else if (freedStalled > 0 && (this._gpuBytes || 0) < GPU_CAP - 16 * 1024 * 1024) {
+        standby.preloadCapped = false;
+        standby.budgetFull = false;
+        standby.resume();
+      }
     }
   };
 
@@ -1327,6 +1355,7 @@
       pool.standby = false;
       pool.budgetFull = false;
       pool.preloadCapped = false;
+      pool._reqCount = {};
       if (pool === this._standby) this._standby = null;
       if (pool === this._back) this._back = null;
       this.session = pool;
@@ -1595,10 +1624,48 @@
   };
 
   Player.prototype._pausePreload = function () {
+    if (this._standby && this._standby.quietStop) this._standby.quietStop();
+    if (this._back && this._back.quietStop) this._back.quietStop();
     if (this._uploadQueue && this._uploadQueue.length) {
-      this._uploadQueue = this._uploadQueue.filter(function (job) { return !job.standby; });
+      this._uploadQueue = this._uploadQueue.filter(function (job) {
+        if (job.standby || (job.live && !job.live())) {
+          if (job.done) job.done(null);
+          return false;
+        }
+        return true;
+      });
+    }
+    if (this._decodeQueue && this._decodeQueue.length) {
+      this._decodeQueue = this._decodeQueue.filter(function (job) {
+        if (job.standby || (job.live && !job.live())) {
+          if (job.done) job.done(new Error("cancelled"), null);
+          return false;
+        }
+        return true;
+      });
     }
     this._dropStandby();
+  };
+
+  Player.prototype._pruneQueues = function () {
+    if (this._uploadQueue && this._uploadQueue.length) {
+      this._uploadQueue = this._uploadQueue.filter(function (job) {
+        if (job && job.live && !job.live()) {
+          if (job.done) job.done(null);
+          return false;
+        }
+        return true;
+      });
+    }
+    if (this._decodeQueue && this._decodeQueue.length) {
+      this._decodeQueue = this._decodeQueue.filter(function (job) {
+        if (job && job.live && !job.live()) {
+          if (job.done) job.done(new Error("cancelled"), null);
+          return false;
+        }
+        return true;
+      });
+    }
   };
 
   Player.prototype._syncResidency = function () {
@@ -1680,8 +1747,107 @@
     this._diagAcc = (this._diagAcc || 0) + raw;
     if (this._diagAcc >= 1000) {
       this._diagAcc = 0;
+      this._checkHealthWatchdog(this._clock());
       this._sendDiag(true);
     }
+  };
+
+  Player.prototype.softReset = function (reason) {
+    var why = reason || "auto";
+    this._lastSoftResetAt = this._clock();
+    this._softResets = (this._softResets || 0) + 1;
+    this._logSwitch("soft-reset", why);
+    this._decodeQueue = [];
+    this._decodeBusy = false;
+    this._decoding = 0;
+    this._uploadQueue = [];
+    this._uploading = false;
+    this._strip = null;
+    this._promoting = false;
+    this._lodHold = null;
+    if (this._standby) {
+      this._standby.dispose();
+      this._standby = null;
+    }
+    if (this._back) {
+      this._back.dispose();
+      this._back = null;
+    }
+    if (this._resident && this._resident.length) {
+      for (var r = this._resident.length - 1; r >= 0; r--) {
+        if (this._resident[r] && this._resident[r].standby && this._resident[r].tex) {
+          this._deleteTex(this._resident[r].tex);
+        }
+      }
+    }
+    this._evictOffscreen();
+    this._lanDead = false;
+    this._lanDeadAt = 0;
+    this._lanFailures = 0;
+    this._lanVerified = false;
+    var kept = 0;
+    if (this._tileDraw) {
+      for (var d = 0; d < this._tileDraw.length; d++) {
+        if (pieceReady(this._tileDraw[d])) kept += 1;
+      }
+    }
+    this._diagRequested = kept;
+    this._diagReceived = kept;
+    this._diagDecoded = kept;
+    this._diagUploaded = kept;
+    this._diagErrors = 0;
+    this._diagNote = "Soft-reset: restored normal mode";
+    if (this.session && this.session.entry && !sessionReady(this.session)) {
+      this.session._tokenEpoch = (this.session._tokenEpoch || 0) + 1;
+      this.session._openTokens = {};
+      this.session.assemblers = {};
+      this.session._materializing = {};
+      this.session.pending = null;
+      this.session.budgetFull = false;
+      this.session.preloadCapped = false;
+      this.session._reqCount = {};
+      var tiles = this.session.entry.tiles || [];
+      for (var i = 0; i < tiles.length; i++) {
+        if (tiles[i]) {
+          tiles[i]._skip = false;
+          tiles[i]._retries = 0;
+        }
+      }
+      if (!this.session._overviewReady && this.session.entry.overview) {
+        this.session._beginOverview();
+      }
+      this.session._requestCurrent();
+    }
+    if (window.__castSend) {
+      window.__castSend({ type: "soft-reset", reason: why, index: this.index });
+    }
+    this._sendDiag(true);
+    if (!this._holdFrame) this.draw();
+    this._kick();
+    return true;
+  };
+
+  Player.prototype._checkHealthWatchdog = function (now) {
+    var t = now != null ? now : this._clock();
+    if (this._lan && this._lanDead && this._lanDeadAt > 0 && (t - this._lanDeadAt > 12000)) {
+      this._lanDead = false;
+      this._lanDeadAt = 0;
+      this._lanFailures = 0;
+      this._lanVerified = false;
+      this._diagNote = "LAN re-armed after cooldown";
+    }
+    if (this._lastSoftResetAt > 0 && (t - this._lastSoftResetAt < 8000)) return false;
+    var backlog = (this._diagRequested || 0) - (this._diagUploaded || 0);
+    var decodeLen = this._decodeQueue ? this._decodeQueue.length : 0;
+    var uploadLen = this._uploadQueue ? this._uploadQueue.length : 0;
+    if (backlog > 28 || decodeLen > 16 || uploadLen > 16) {
+      var why = backlog > 28 ? "request-storm" : (decodeLen > 16 ? "decode-backlog" : "upload-backlog");
+      return this.softReset(why);
+    }
+    if (this.session && this.session.pending && (t - (this.session.pending.started || 0) > 10000)) {
+      return this.softReset("stuck-transfer");
+    }
+    return false;
   };
 
   Player.prototype._clearQueues = function () {
@@ -1690,21 +1856,22 @@
     this._decodeBusy = false;
   };
 
-  Player.prototype._enqueueUpload = function (img, tile, standby, done) {
+  Player.prototype._enqueueUpload = function (img, tile, standby, done, live) {
     if (!this._uploadQueue) this._uploadQueue = [];
     this._uploadQueue.push({
       img: img,
       tile: tile,
       standby: !!standby,
       done: done,
+      live: live || null,
       queuedAt: this._mediaMs || 0,
     });
     this._kick();
   };
 
-  Player.prototype._enqueueDecode = function (payload, done) {
+  Player.prototype._enqueueDecode = function (payload, done, live, standby) {
     if (!this._decodeQueue) this._decodeQueue = [];
-    this._decodeQueue.push({ payload: payload, done: done });
+    this._decodeQueue.push({ payload: payload, done: done, live: live || null, standby: !!standby });
     this._kick();
   };
 
@@ -1718,6 +1885,7 @@
       this._uploadStripSlice();
       return;
     }
+    this._pruneQueues();
     if (this._uploadQueue && this._uploadQueue.length) {
       var job = this._uploadQueue[0];
       if (job.queuedAt == null) job.queuedAt = this._mediaMs || 0;
@@ -2240,20 +2408,24 @@
     var session;
     session = new PhotoSession({
       now: function () { return self._clock(); },
-      request: function (id, token) {
+      request: function (id, token, opts) {
         self._diagRequested = (self._diagRequested || 0) + 1;
         self._sendDiag();
+        var forceCast = !!(opts && opts.forceCast);
         var url = self._urlFor(id);
-        if (shouldTryLan(self._lan, self._lanDead, url)) {
+        if (!forceCast && shouldTryLan(self._lan, self._lanDead, url)) {
           self._loadLan(id, token, url);
           return;
         }
         if (window.__castSend) window.__castSend({ type: "fetch", id: id, token: token });
       },
       onTileRetry: function () {
-        // A lost JPEG is retried on the Cast channel. Leaving LAN armed
-        // would spend another probe on the same dead socket.
-        self._lanDead = true;
+        // A stalled tile retries on the Cast channel for that tile only.
+        // Only mark LAN dead when consecutive LAN failures reach LAN_FAIL_LIMIT.
+        if ((self._lanFailures || 0) >= LAN_FAIL_LIMIT) {
+          self._lanDead = true;
+          if (!self._lanDeadAt) self._lanDeadAt = self._clock();
+        }
       },
       ahead: function () {
         if (self._lan && !self._lanDead && self._lanVerified) return LAN_AHEAD;
@@ -2261,7 +2433,11 @@
       },
       preloadLimit: function () { return self._preloadDepth || 0; },
       gpuRoom: function () { return Math.max(0, GPU_CAP - (self._gpuBytes || 0)); },
-      materialize: function (payload, done) {
+      materialize: function (payload, done, live) {
+        if (live && !live()) {
+          done(new Error("cancelled"), null);
+          return;
+        }
         self._diagReceived = (self._diagReceived || 0) + 1;
         if (self._injectImage) {
           var injected = self._injectImage(payload);
@@ -2274,6 +2450,11 @@
           }
         }
         self._enqueueDecode(payload, function (err, img) {
+          if (live && !live()) {
+            if (img && session.hooks.dropImage) session.hooks.dropImage(img);
+            done(new Error("cancelled"), null);
+            return;
+          }
           if (err || !img) {
             self._diagErrors = (self._diagErrors || 0) + 1;
             self._diagNote = err ? String(err.message || err) : "decode failed";
@@ -2284,7 +2465,7 @@
           }
           self._sendDiag();
           done(err, img);
-        });
+        }, live, !!session.standby);
       },
       view: function () {
         var live = self._lodView();
@@ -2311,7 +2492,11 @@
         };
       },
       onEntry: function (entry) { self._ensureBase(entry); },
-      upload: function (img, tile, done) {
+      upload: function (img, tile, done, live) {
+        if (live && !live()) {
+          if (typeof done === "function") done(null);
+          return;
+        }
         if (tile && tile._overview) {
           var overviewTex = self._installOverview(img, tile, session.entry);
           self._noteUploaded(overviewTex);
@@ -2320,9 +2505,14 @@
         }
         if (isGpuSource(img) || self._uploadDelayMs > 0) {
           self._enqueueUpload(img, tile, !!session.standby, function (tex) {
+            if (live && !live()) {
+              if (tex) self._deleteTex(tex);
+              if (typeof done === "function") done(null);
+              return;
+            }
             self._noteUploaded(tex);
             if (typeof done === "function") done(tex);
-          });
+          }, live);
           return;
         }
         var uploaded = self._uploadTile(img, tile, !!session.standby);
@@ -2509,7 +2699,7 @@
     if (this._readyPool(entry.id) || this._incomingPool(entry.id)) return;
     if (this.session && this.session.entry && entry && this.session.entry.id === entry.id) return;
     var standby = this._standby;
-    if (!standby || !standby.entry || (!standby.pending && !(standby.loaded && standby.loaded.length))) {
+    if (!standby || !standby.entry || (!standby.pending && !(standby.loaded && standby.loaded.length) && !standby._overviewReady && !standby._overviewPending && !(standby._inFlight && standby._inFlight() > 0))) {
       if (standby) standby.dispose();
       this._standby = this._newSession();
       this._standby.preload(entry);
@@ -2536,6 +2726,7 @@
     pool.standby = false;
     pool.budgetFull = false;
     pool.preloadCapped = false;
+    pool._reqCount = {};
   };
 
   Player.prototype._requestIndex = function (at) {
@@ -2627,6 +2818,7 @@
     pool.standby = false;
     pool.budgetFull = false;
     pool.preloadCapped = false;
+    pool._reqCount = {};
     if (pool === this._standby) this._standby = null;
     if (pool === this._back) this._back = null;
     var previous = this.session;
@@ -2714,11 +2906,13 @@
     }
     // The photo already on screen keeps drawing. Off-screen tiles can leave
     // to make room. The frame is not released until the next view can draw.
-    this._evictOffscreen();
+    var freed = this._evictOffscreen();
     pool.standby = true;
-    pool.preloadCapped = false;
-    pool.budgetFull = false;
-    pool.resume();
+    if (freed > 0 || (this._gpuBytes || 0) < GPU_CAP - 16 * 1024 * 1024) {
+      pool.preloadCapped = false;
+      pool.budgetFull = false;
+      pool.resume();
+    }
   };
 
   Player.prototype._releaseShownGpu = function () {
@@ -3899,6 +4093,7 @@
     play: 1, pause: 1, next: 1, previous: 1, stop: 1,
     heartbeat: 1, speed: 1, aim: 1, chunk: 1, fetchError: 1,
     retile: 1, fov: 1, pace: 1, fade: 1, hello: 1, debug: 1,
+    "soft-reset": 1, softReset: 1,
   };
 
   function acceptAimSocket(url) {
@@ -4531,6 +4726,8 @@
     this.live = [];
     this.loaded = [];
     this.assemblers = {};
+    this._materializing = {};
+    this._reqCount = {};
     this.entry = null;
     this.tileIndex = 0;
     this.attempt = 0;
@@ -4558,6 +4755,8 @@
     this._releaseAll();
     this.loaded = [];
     this.assemblers = {};
+    this._materializing = {};
+    this._reqCount = {};
     this.pending = null;
     this.entry = null;
     this.waitingShrink = false;
@@ -4565,6 +4764,8 @@
     this._openTokens = {};
     this._overviewPending = false;
     this._overviewReady = false;
+    this.preloadCapped = false;
+    this.budgetFull = false;
   };
 
   PhotoSession.prototype.open = function (entry) {
@@ -4594,7 +4795,7 @@
 
   PhotoSession.prototype.preload = function (entry) {
     if (!entry || !entry.tiles || !entry.tiles.length) return;
-    if (this.entry && this.entry.id === entry.id && (this.loaded.length || this.pending)) return;
+    if (this.entry && this.entry.id === entry.id && (this.loaded.length || this.pending || this._overviewReady || this._overviewPending || this.budgetFull || this.preloadCapped || this._inFlight() > 0)) return;
     this.dispose();
     this.token = 0;
     this.standby = true;
@@ -4669,15 +4870,19 @@
   PhotoSession.prototype.quietStop = function () {
     this.generation += 1;
     this.token += 1;
+    this._tokenEpoch = (this._tokenEpoch || 0) + 1;
+    this._openTokens = {};
     this.pending = null;
     this.assemblers = {};
+    this._materializing = {};
     this.budgetFull = false;
   };
 
   PhotoSession.prototype.resume = function () {
     if (!this.entry || this.pending) return;
-    if (!this.budgetFull && this.shown) return;
+    if (!this.budgetFull && !this.preloadCapped && this.shown) return;
     this.budgetFull = false;
+    this.preloadCapped = false;
     var done = this.tileOrder ? this.orderPos >= this.tileOrder.length : this.tileIndex >= this.entry.tiles.length;
     if (done) return;
     this._requestCurrent();
@@ -4734,13 +4939,25 @@
     else this.tileIndex = pos;
   };
 
+  PhotoSession.prototype._tileBusy = function (id) {
+    return !!((this.assemblers && this.assemblers[id]) || (this._materializing && this._materializing[id]));
+  };
+
   PhotoSession.prototype._inFlight = function () {
     var n = 0;
-    if (!this.assemblers) return 0;
-    for (var id in this.assemblers) {
-      var box = this.assemblers[id];
-      if (!box || (box.tile && box.tile._overview)) continue;
-      n += 1;
+    if (this.assemblers) {
+      for (var id in this.assemblers) {
+        var box = this.assemblers[id];
+        if (!box || (box.tile && box.tile._overview)) continue;
+        n += 1;
+      }
+    }
+    if (this._materializing) {
+      for (var mid in this._materializing) {
+        var mbox = this._materializing[mid];
+        if (!mbox || (mbox.tile && mbox.tile._overview)) continue;
+        n += 1;
+      }
     }
     return n;
   };
@@ -4786,7 +5003,7 @@
       if (wrap < dist) dist = wrap;
       if (stats.cols === 2 && (tile.col | 0) !== viewCol) dist = 1;
       if (dist > 1) continue;
-      if (this.assemblers[tile.id] || this._tileReady(tile.id)) continue;
+      if (this._tileBusy(tile.id) || this._tileReady(tile.id)) continue;
       return true;
     }
     return false;
@@ -4805,7 +5022,11 @@
     var bestRank = 1e15;
     for (var i = 0; i < masters.length; i++) {
       var tile = masters[i];
-      if (!tile || tile._skip || this.assemblers[tile.id] || this._tileReady(tile.id)) continue;
+      if (!tile || tile._skip || this._tileBusy(tile.id) || this._tileReady(tile.id)) continue;
+      if (this._reqCount && (this._reqCount[tile.id] | 0) >= 1 + TILE_RETRIES) {
+        if (this.standby) this.budgetFull = true;
+        continue;
+      }
       if (deferPoles && Math.abs((tile.row | 0) - anchor) > 1) continue;
       // The column under the lens finishes its visible bands before the
       // other hemisphere is requested. Pole caps wait until that lookahead.
@@ -4844,9 +5065,22 @@
     return (token | 0) === 1 && !!(box.tile && this._isOpeningStrip(box.tile));
   };
 
-  PhotoSession.prototype._issue = function (tile) {
+  PhotoSession.prototype._issue = function (tile, opts) {
     var entry = this.entry;
     if (!entry || !tile) return false;
+    if (!tile._overview && !tile._base) {
+      if (!this._reqCount) this._reqCount = {};
+      var reqs = this._reqCount[tile.id] | 0;
+      if (reqs >= 1 + TILE_RETRIES) {
+        if (this.standby) {
+          this.budgetFull = true;
+          return false;
+        }
+        tile._skip = true;
+        return false;
+      }
+      this._reqCount[tile.id] = reqs + 1;
+    }
     var token;
     if (this._leadToken(tile)) {
       token = 1;
@@ -4878,7 +5112,7 @@
       _epoch: this._tokenEpoch || 0,
     };
     this._syncPending();
-    if (this.hooks.request) this.hooks.request(tile.id, token);
+    if (this.hooks.request) this.hooks.request(tile.id, token, opts);
     return true;
   };
 
@@ -4996,7 +5230,11 @@
       var index = order ? order[s] : s;
       var tile = entry.tiles[index];
       if (!tile || tile._skip) continue;
-      if (this.assemblers[tile.id] || this._tileReady(tile.id)) continue;
+      if (this._tileBusy(tile.id) || this._tileReady(tile.id)) continue;
+      if (this._reqCount && (this._reqCount[tile.id] | 0) >= 1 + TILE_RETRIES) {
+        if (this.standby) this.budgetFull = true;
+        continue;
+      }
       return tile;
     }
     return null;
@@ -5004,7 +5242,7 @@
 
   PhotoSession.prototype._requestCurrent = function () {
     var entry = this.entry;
-    if (!entry || !entry.tiles || this.budgetFull) return;
+    if (!entry || !entry.tiles || this.budgetFull || this.preloadCapped) return;
     if (this._preloadCapped()) {
       this.preloadCapped = true;
       return;
@@ -5018,7 +5256,7 @@
       this._syncPending();
       if (this._inFlight() > 0) return;
       var listed = this._pickListed();
-      if (listed && !this.assemblers[listed.id]) this._issue(listed);
+      if (listed && !this._tileBusy(listed.id)) this._issue(listed);
       return;
     }
     this._releaseStale();
@@ -5030,9 +5268,14 @@
     if (!(ahead > 0)) ahead = AHEAD_REQUESTS;
     while (this._inFlight() < ahead && guard < ahead) {
       guard += 1;
+      if (this.budgetFull || this.preloadCapped) return;
+      if (this._preloadCapped()) {
+        this.preloadCapped = true;
+        return;
+      }
       var tile = this._pickTile(false);
       if (!tile) return;
-      if (!this.assemblers[tile.id]) this._issue(tile);
+      if (!this._tileBusy(tile.id)) this._issue(tile);
     }
   };
 
@@ -5177,6 +5420,11 @@
     var token = box.token;
     var gen = box.gen;
     var epoch = box._epoch || 0;
+    var live = function () { return self._tokenLive(token, gen, epoch); };
+    if (box && box.id != null) {
+      if (!this._materializing) this._materializing = {};
+      this._materializing[box.id] = box;
+    }
     var accepted = false;
     var settled = false;
     var finish = function (err, image) {
@@ -5188,11 +5436,13 @@
       accepted = true;
       if (!self._tokenLive(token, gen, epoch)) {
         settled = true;
+        if (box && box.id != null && self._materializing) delete self._materializing[box.id];
         if (image && self.hooks.dropImage) self.hooks.dropImage(image);
         return;
       }
       if (err || !image) {
         settled = true;
+        if (box && box.id != null && self._materializing) delete self._materializing[box.id];
         if (image && self.hooks.dropImage) self.hooks.dropImage(image);
         self._skipTile(box, err || "load");
         return;
@@ -5200,6 +5450,7 @@
       function apply(tex) {
         if (settled) return;
         settled = true;
+        if (box && box.id != null && self._materializing) delete self._materializing[box.id];
         if (!self._tokenLive(token, gen, epoch)) {
           if (image && self.hooks.dropImage) self.hooks.dropImage(image);
           if (tex && self.hooks.release) self.hooks.release(tex);
@@ -5217,6 +5468,9 @@
         if (deferred && self.standby) {
           // The cursor stays on this tile. resume() asks for it again
           // instead of skipping a placeholder that was never uploaded.
+          if (box && box.tile && (payload || (image && image._spsPayload))) {
+            box.tile._deferredPayload = payload || (image && image._spsPayload);
+          }
           if (self.hooks.release) self.hooks.release(tex);
           self.budgetFull = true;
           return;
@@ -5292,9 +5546,10 @@
       function startUpload() {
         var returned;
         try {
-          returned = self.hooks.upload ? self.hooks.upload(image, box.tile, apply) : null;
+          returned = self.hooks.upload ? self.hooks.upload(image, box.tile, apply, live) : null;
         } catch (error) {
           settled = true;
+          if (box && box.id != null && self._materializing) delete self._materializing[box.id];
           if (self.hooks.dropImage) self.hooks.dropImage(image);
           if (isOom(error)) self._oom(box.photoId);
           else self._skipTile(box, error);
@@ -5319,7 +5574,7 @@
             if (!mipErr && mipImg) image._levels[mipIndex + 1] = mipImg;
             leftMips -= 1;
             if (leftMips <= 0) startUpload();
-          });
+          }, live);
         });
       }
     };
@@ -5329,7 +5584,7 @@
       finish(null, ready);
       return;
     }
-    if (this.hooks.materialize) this.hooks.materialize(payload, finish);
+    if (this.hooks.materialize) this.hooks.materialize(payload, finish, live);
     else finish(new Error("no materialize"));
   };
 
@@ -5346,7 +5601,10 @@
 
   PhotoSession.prototype._skipTile = function (box, reason) {
     this._releaseHold(box);
-    if (box && box.id) delete this.assemblers[box.id];
+    if (box && box.id) {
+      delete this.assemblers[box.id];
+      if (this._materializing) delete this._materializing[box.id];
+    }
     this._syncPending();
     var tile = box && box.tile;
     if (tile && (tile._overview || tile._base)) {
@@ -5356,10 +5614,10 @@
     }
     if (tile) {
       tile._retries = (tile._retries || 0) + 1;
-      if (tile._retries <= TILE_RETRIES) {
+      if (tile._retries <= TILE_RETRIES && (!this._reqCount || (this._reqCount[tile.id] | 0) < 1 + TILE_RETRIES)) {
         if (this.hooks.onTileRetry) this.hooks.onTileRetry(tile, tile._retries);
         if (this.hooks.onLog) this.hooks.onLog("retry " + tile.id);
-        this._issue(tile);
+        this._issue(tile, { forceCast: true });
         return;
       }
       tile._skip = true;
@@ -5390,6 +5648,8 @@
     this._releaseAll();
     this.loaded = [];
     this.assemblers = {};
+    this._materializing = {};
+    this._reqCount = {};
     this.pending = null;
     this.tileIndex = 0;
     if (this.attempt < 1 && entry) {
@@ -5421,6 +5681,7 @@
     this._tokenEpoch = (this._tokenEpoch || 0) + 1;
     this._openTokens = {};
     this.assemblers = {};
+    this._materializing = {};
     this.pending = null;
     this.waitingShrink = false;
     var covered = this.entry && this.loaded.length && coversSphere(
