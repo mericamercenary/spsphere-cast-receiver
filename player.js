@@ -50,8 +50,12 @@
   var LOOKAHEAD_FLOOR_S = 3;
   var LOOKAHEAD_LATENCY_FALLBACK_MS = 1500;
   var AHEAD_REQUESTS = 4;
-  // How long a sharp tile takes to pull into focus over the soft overview.
-  var FOCUS_MS = 500;
+  // How long one sharp tile eases in. The geometric bloom is longer, so the
+  // circle at the middle of the screen has time to widen toward the poles.
+  var FOCUS_MS = 700;
+  var GEO_MS = 1600;
+  var INTRO_FADE_MS = 700;
+  var INTRO_CAP_MS = 8000;
   // createImageBitmap on some Cast WebViews never settles. Fall back before
   // that holds the decode queue.
   var DECODE_FALLBACK_MS = 1200;
@@ -292,7 +296,19 @@
     if (this._useTiles) {
       this.images = entries.map(function () { return null; });
       this._busy = false;
+      this._intro = "hold";
+      this._introAlpha = 1;
+      this._introSince = this._clock();
+      this._geoAt = 0;
+      this._diagRequested = 0;
+      this._diagReceived = 0;
+      this._diagDecoded = 0;
+      this._diagUploaded = 0;
+      this._diagErrors = 0;
+      this._diagNote = "";
+      this._diagKey = "";
       this._markBusy();
+      this._paintMark();
       if (this.items.length) this._openCurrent();
     } else {
       this._busy = false;
@@ -421,12 +437,14 @@
   };
 
   Player.prototype._mark = function () {
+    if (typeof document === "undefined") return;
     var icon = document.getElementById("hold");
     if (!icon) return;
     icon.hidden = true;
   };
 
   Player.prototype._markBusy = function () {
+    if (typeof document === "undefined") return;
     var el = document.getElementById("busy");
     if (!el) return;
     if (this._busy) el.classList.add("on");
@@ -439,15 +457,164 @@
     if (window.__castSend) window.__castSend({ type: "log", message: String(message) });
   };
 
+  Player.prototype._clock = function () {
+    if (typeof this._focusNow === "function") return this._focusNow();
+    return Date.now();
+  };
+
   Player.prototype._revealOf = function (piece) {
     if (!piece || !piece.tex) return 0;
-    var born = piece._focusAt || 0;
-    if (!(born > 0)) return 1;
-    var now = this._focusNow ? this._focusNow() : Date.now();
-    var t = (now - born) / FOCUS_MS;
+    // A tile with no birth stamp used to jump straight to 1. Stamp it and
+    // ease, so the first draw is the start of the fade rather than a pop.
+    if (!(piece._focusAt > 0)) piece._focusAt = this._clock();
+    return revealProgress(piece._focusAt, this._clock(), FOCUS_MS);
+  };
+
+  Player.prototype._photoSpan = function () {
+    // Tiles are stored in photo pixels. Drawing them before the photo is
+    // marked shown used a span of 1, so every sharp fragment was discarded
+    // and the fade ran on a tile the TV never displayed.
+    var w = this._tileW;
+    var h = this._tileH;
+    var entry = this.session && this.session.entry;
+    if (!(w > 0) && entry && entry.width > 0) w = entry.width;
+    if (!(h > 0) && entry && entry.height > 0) h = entry.height;
+    return { w: w > 0 ? w : 1, h: h > 0 ? h : 1 };
+  };
+
+  Player.prototype._geoLinear = function () {
+    if (!(this._geoAt > 0)) return 0;
+    var t = (this._clock() - this._geoAt) / GEO_MS;
     if (t < 0) return 0;
     if (t > 1) return 1;
     return t;
+  };
+
+  Player.prototype._restampFocus = function (now) {
+    var lists = [this._tileDraw, this.session && this.session.loaded];
+    for (var n = 0; n < lists.length; n++) {
+      var list = lists[n];
+      if (!list) continue;
+      for (var i = 0; i < list.length; i++) {
+        var piece = list[i];
+        if (!piece || !piece.tex) continue;
+        if (piece._base || (piece.tile && piece.tile._base)) continue;
+        piece._focusAt = now;
+      }
+    }
+  };
+
+  Player.prototype._armBloom = function () {
+    var now = this._clock();
+    if (this._geoAt > 0 && now - this._geoAt < 40) return;
+    this._geoAt = now;
+    this._restampFocus(now);
+  };
+
+  Player.prototype._noteUploaded = function (tex) {
+    if (tex && (tex._spsUploaded || tex._mip === true) && !tex.deferred && !tex.oom && !tex._evicted) {
+      this._diagUploaded = (this._diagUploaded || 0) + 1;
+    } else {
+      this._diagErrors = (this._diagErrors || 0) + 1;
+      this._diagNote = "texture upload failed";
+      this._reportTv(this._diagNote);
+    }
+    this._sendDiag();
+  };
+
+  Player.prototype._sendDiag = function (force) {
+    var msg = {
+      type: "diag",
+      requested: this._diagRequested || 0,
+      received: this._diagReceived || 0,
+      decoded: this._diagDecoded || 0,
+      uploaded: this._diagUploaded || 0,
+      errors: this._diagErrors || 0,
+      note: this._diagNote || "",
+    };
+    var key = [msg.requested, msg.received, msg.decoded, msg.uploaded, msg.errors, msg.note].join(":");
+    var now = this._clock();
+    if (!force && key === this._diagKey && now - (this._diagSentAt || 0) < 2000) return;
+    this._diagKey = key;
+    this._diagSentAt = now;
+    if (window.__castSend) window.__castSend(msg);
+  };
+
+  Player.prototype._pieceReadyId = function (session, id) {
+    var loaded = session && session.loaded;
+    if (!loaded) return false;
+    for (var i = 0; i < loaded.length; i++) {
+      var piece = loaded[i];
+      if (!piece || !piece.tile || piece.tile.id !== id) continue;
+      if (pieceReady(piece)) return true;
+    }
+    return false;
+  };
+
+  Player.prototype._photoFrontReady = function (session) {
+    if (!session || !session._overviewReady || !session.entry) return false;
+    var entry = session.entry;
+    var tiles = entry.tiles || [];
+    if (!tiles.length) return true;
+    var view = this._lodView();
+    var order = tileLoadOrder(tiles, entry.width, entry.height, view);
+    var cap = 0;
+    var need = Math.min(4, tiles.length);
+    for (var i = 0; i < order.length && cap < need; i++) {
+      var tile = tiles[order[i]];
+      if (!tile || tile._skip) continue;
+      if (!tileInView(tile, entry.width, entry.height, view)) continue;
+      cap += 1;
+      if (!this._pieceReadyId(session, tile.id)) return false;
+    }
+    return cap > 0;
+  };
+
+  Player.prototype._markWanted = function () {
+    if (!this._useTiles || !this.items || !this.items.length) return false;
+    if (this._introSince && this.session && this.session._overviewReady &&
+        this._clock() - this._introSince > INTRO_CAP_MS) return false;
+    if (this._awaitingSwap && this.entries && this._awaitIndex != null) {
+      var entry = this.entries[this._awaitIndex];
+      var pool = entry && (this._readyPool(entry.id) || this._incomingPool(entry.id));
+      if (pool && this._photoFrontReady(pool)) return false;
+      return true;
+    }
+    if (this._intro === "off" && this._presented) return false;
+    return !this._photoFrontReady(this.session);
+  };
+
+  Player.prototype._syncMark = function (dt) {
+    var want = this._markWanted();
+    if (want) {
+      this._intro = "hold";
+      this._introAlpha = 1;
+      if (!this._introSince) this._introSince = this._clock();
+    } else if (this._intro === "hold" || this._intro === "out") {
+      if (this._intro !== "out") {
+        this._intro = "out";
+        this._armBloom();
+      }
+      var step = (dt > 0 ? dt : 16) / INTRO_FADE_MS;
+      this._introAlpha = Math.max(0, (this._introAlpha == null ? 1 : this._introAlpha) - step);
+      if (this._introAlpha <= 0) {
+        this._intro = "off";
+        this._introSince = 0;
+      }
+    } else if (!(this._geoAt > 0) && this._photoFrontReady(this.session)) {
+      this._armBloom();
+    }
+    this._paintMark();
+  };
+
+  Player.prototype._paintMark = function () {
+    if (typeof document === "undefined") return;
+    var el = document.getElementById("mark");
+    if (!el) return;
+    var show = this._intro === "hold" || (this._intro === "out" && this._introAlpha > 0);
+    el.hidden = !show;
+    if (!show || !el.style) return;
+    el.style.opacity = String(this._intro === "hold" ? 1 : this._introAlpha);
   };
 
   Player.prototype._neighborReveal = function (tile, dRow, dCol) {
@@ -1096,6 +1263,7 @@
   Player.prototype._pumpFrame = function (dt) {
     var raw = dt > 0 ? dt : 0;
     this._mediaMs = (this._mediaMs || 0) + raw;
+    this._syncMark(raw);
     this._uploadsThisFrame = 0;
     if (raw > 0) {
       if (!this._dtRing) this._dtRing = new Float64Array(240);
@@ -1128,6 +1296,11 @@
     this._releaseOutsideBand();
     if (this.session && this.session.entry) this.session._requestCurrent();
     if (this._standby && this._standby.entry) this._standby._requestCurrent();
+    this._diagAcc = (this._diagAcc || 0) + raw;
+    if (this._diagAcc >= 1000) {
+      this._diagAcc = 0;
+      this._sendDiag(true);
+    }
   };
 
   Player.prototype._clearQueues = function () {
@@ -1253,6 +1426,10 @@
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.indices, gl.STATIC_DRAW);
     this._bindMesh(gl, prog);
     gl.disable(gl.CULL_FACE);
+    // Tiles sit on the same sphere as the overview. The default depth test
+    // kept the overview and rejected every sharp tile on a real GPU.
+    gl.disable(gl.DEPTH_TEST);
+    if (gl.depthMask) gl.depthMask(false);
     gl.clearColor(0.04, 0.05, 0.07, 1);
     if (!this._glHooks && this.canvas.addEventListener) {
       this._glHooks = true;
@@ -1673,22 +1850,36 @@
     var self = this;
     var session;
     session = new PhotoSession({
+      now: function () { return self._clock(); },
       request: function (id, token) {
+        self._diagRequested = (self._diagRequested || 0) + 1;
+        self._sendDiag();
         if (window.__castSend) window.__castSend({ type: "fetch", id: id, token: token });
       },
       preloadLimit: function () { return self._preloadDepth || 0; },
       gpuRoom: function () { return Math.max(0, GPU_CAP - (self._gpuBytes || 0)); },
       materialize: function (payload, done) {
+        self._diagReceived = (self._diagReceived || 0) + 1;
         if (self._injectImage) {
           var injected = self._injectImage(payload);
           if (injected) {
             if (!injected._spsPayload) injected._spsPayload = payload;
+            self._diagDecoded = (self._diagDecoded || 0) + 1;
+            self._sendDiag();
             done(null, injected);
             return;
           }
         }
         self._enqueueDecode(payload, function (err, img) {
-          if (img && !img._spsPayload) img._spsPayload = payload;
+          if (err || !img) {
+            self._diagErrors = (self._diagErrors || 0) + 1;
+            self._diagNote = err ? String(err.message || err) : "decode failed";
+            self._reportTv(self._diagNote);
+          } else {
+            self._diagDecoded = (self._diagDecoded || 0) + 1;
+            if (img && !img._spsPayload) img._spsPayload = payload;
+          }
+          self._sendDiag();
           done(err, img);
         });
       },
@@ -1716,14 +1907,20 @@
       upload: function (img, tile, done) {
         if (tile && tile._overview) {
           var overviewTex = self._installOverview(img, tile);
+          self._noteUploaded(overviewTex);
           if (typeof done === "function") done(overviewTex);
           return;
         }
         if (isGpuSource(img) || self._uploadDelayMs > 0) {
-          self._enqueueUpload(img, tile, !!session.standby, done);
+          self._enqueueUpload(img, tile, !!session.standby, function (tex) {
+            self._noteUploaded(tex);
+            if (typeof done === "function") done(tex);
+          });
           return;
         }
-        return self._uploadTile(img, tile, !!session.standby);
+        var uploaded = self._uploadTile(img, tile, !!session.standby);
+        self._noteUploaded(uploaded);
+        return uploaded;
       },
       dropImage: function (img) {
         if (!img) return;
@@ -1787,6 +1984,8 @@
       if (want && sess.entry.id === want.id) this._commitIndex(this._awaitIndex, sess);
     }
     if (sess !== this.session || sess.standby || !pieceReady(piece)) return;
+    if (sess.entry && sess.entry.width > 0 && !(this._tileW > 0)) this._tileW = sess.entry.width;
+    if (sess.entry && sess.entry.height > 0 && !(this._tileH > 0)) this._tileH = sess.entry.height;
     if (!this._tileDraw) this._tileDraw = [];
     var id = piece.tile && piece.tile.id;
     for (var i = 0; i < this._tileDraw.length; i++) {
@@ -2046,6 +2245,17 @@
       this._advanceMarked = false;
     }
     if (this._snapOn && resident.length) this._snapReveal = true;
+    this._geoAt = 0;
+    if (this._intro === "hold") {
+      this._intro = "out";
+      this._armBloom();
+    } else {
+      this._intro = "off";
+      this._introAlpha = 0;
+      this._introSince = 0;
+      this._armBloom();
+    }
+    this._paintMark();
     if (!this._holdFrame) this.draw();
     if (resident.length && window.__castSend) window.__castSend({ type: "photo", id: entry.id, ok: true });
     this._preloadNeighbors();
@@ -2106,6 +2316,8 @@
       this._awaitingSwap = false;
       this._awaitIndex = null;
       this._ensureSession();
+      if (entry.width > 0) this._tileW = entry.width;
+      if (entry.height > 0) this._tileH = entry.height;
       this.session.open(entry);
       return;
     }
@@ -2171,6 +2383,10 @@
   };
 
   Player.prototype.noteFetchError = function (msg) {
+    this._diagErrors = (this._diagErrors || 0) + 1;
+    this._diagNote = (msg && msg.message) || "fetch failed";
+    this._reportTv(this._diagNote);
+    this._sendDiag();
     if (this._standby && this._standby.accepts(msg)) {
       this._standby.noteFetchError(msg);
       return;
@@ -2223,6 +2439,7 @@
     var w = source.width || 0;
     var h = source.height || 0;
     this._finishSampler(gl, tex, w, h, source);
+    tex._spsUploaded = true;
     return tex;
   };
 
@@ -2468,7 +2685,16 @@
   Player.prototype._installTileProgram = function (gl) {
     var sources = this._sources || glSources(this._webgl2, this._prec || "highp", this._grad !== false);
     var prog = compileProgram(gl, sources.tileVs, sources.tileFs);
-    if (!prog) return;
+    if (!prog) {
+      var plain = glSources(!!this._webgl2, "mediump", false);
+      prog = compileProgram(gl, plain.tileVs, plain.tileFs);
+    }
+    if (!prog) {
+      this._diagErrors = (this._diagErrors || 0) + 1;
+      this._diagNote = lastShaderError ? ("tile shader: " + lastShaderError) : "tile shader did not compile";
+      this._reportTv(this._diagNote);
+      return;
+    }
     this._tileProg = prog;
     this._tileLoc = {
       mvp: gl.getUniformLocation(prog, "uMvp"),
@@ -2489,10 +2715,10 @@
       kind: gl.getUniformLocation(prog, "uKind"),
       debug: gl.getUniformLocation(prog, "uDebug"),
       reveal: gl.getUniformLocation(prog, "uReveal"),
-      cu: gl.getUniformLocation(prog, "uCu"),
-      cv: gl.getUniformLocation(prog, "uCv"),
-      halfU: gl.getUniformLocation(prog, "uHalfU"),
-      halfV: gl.getUniformLocation(prog, "uHalfV"),
+      geo: gl.getUniformLocation(prog, "uGeo"),
+      viewU: gl.getUniformLocation(prog, "uViewU"),
+      viewV: gl.getUniformLocation(prog, "uViewV"),
+      anchorV: gl.getUniformLocation(prog, "uAnchorV"),
       nL: gl.getUniformLocation(prog, "uNL"),
       nR: gl.getUniformLocation(prog, "uNR"),
       nU: gl.getUniformLocation(prog, "uNU"),
@@ -2504,6 +2730,7 @@
   Player.prototype._drawTiles = function () {
     var gl = this._gl;
     if (!gl || (gl.isContextLost && gl.isContextLost())) return;
+    gl.disable(gl.DEPTH_TEST);
     this._followView();
     var w = this.canvas.width;
     var h = this.canvas.height;
@@ -2536,7 +2763,8 @@
       }
       return out;
     }
-    var drawable = collect(this._tileDraw, this._drawKeep, this._tileW || 1, this._tileH || 1);
+    var span = this._photoSpan();
+    var drawable = collect(this._tileDraw, this._drawKeep, span.w, span.h);
     var oldDrawable = this._fading ? collect(this._fadeFrom, this._oldKeep, this._fadeW || 1, this._fadeH || 1) : this._oldKeep;
     if (!this._fading && this._oldKeep) this._oldKeep.length = 0;
     var basePiece = this._activeBase();
@@ -2605,20 +2833,26 @@
           nD = self._neighborReveal(tile, 1, 0);
         }
         if (loc.reveal) gl.uniform1f(loc.reveal, reveal);
-        if (loc.cu) gl.uniform1f(loc.cu, (tile.srcX + tile.srcW / 2) / spanW);
-        if (loc.cv) gl.uniform1f(loc.cv, (tile.srcY + tile.srcH / 2) / spanH);
-        if (loc.halfU) gl.uniform1f(loc.halfU, Math.max(tile.srcW / spanW / 2, 1e-4));
-        if (loc.halfV) gl.uniform1f(loc.halfV, Math.max(tile.srcH / spanH / 2, 1e-4));
         if (loc.nL) gl.uniform1f(loc.nL, nL);
         if (loc.nR) gl.uniform1f(loc.nR, nR);
         if (loc.nU) gl.uniform1f(loc.nU, nU);
         if (loc.nD) gl.uniform1f(loc.nD, nD);
         gl.uniform1i(loc.tex, 0);
         bindTex(gl, gl.TEXTURE0, tex);
-        self._drawPatch(gl, tile, spanW, spanH);
+        // The overview is the whole photo. A tile patch can miss the lower
+        // hemisphere; the sphere mesh cannot.
+        if (overview) self._drawMesh(gl);
+        else self._drawPatch(gl, tile, spanW, spanH);
       }
     }
     this._focusAnim = false;
+    var geoT = this._geoLinear();
+    if (geoT < 1) this._focusAnim = true;
+    var anchorV = Math.abs(view.pitch || 0) > 28 ? view.v : 0.5;
+    if (loc.geo) gl.uniform1f(loc.geo, geoT);
+    if (loc.viewU) gl.uniform1f(loc.viewU, view.u);
+    if (loc.viewV) gl.uniform1f(loc.viewV, view.v);
+    if (loc.anchorV) gl.uniform1f(loc.anchorV, anchorV);
     gl.disable(gl.BLEND);
     if (paintBase) {
       var baseEntry = this._showingEntry();
@@ -2635,7 +2869,7 @@
     if (drawable.length && alphas.newAlpha > 0.001) {
       gl.enable(gl.BLEND);
       gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-      paint(drawable, this._tileW || 1, this._tileH || 1, alphas.newAlpha, true);
+      paint(drawable, span.w, span.h, alphas.newAlpha, true);
       gl.disable(gl.BLEND);
     }
     if (this._snapOn && this._snapTex) {
@@ -2753,6 +2987,7 @@
 
   Player.prototype._beginStrip = function (gl, tex, source) {
     if (!gl || !tex || !source || !source.width || !source.height) return false;
+    if (!shouldStripUpload(source.width, source.height)) return false;
     if (!gl.texSubImage2D || typeof document === "undefined") return false;
     var rows = this._stripRows(source.width);
     if (source.height <= rows) return false;
@@ -2769,28 +3004,57 @@
     return !!this._strip || tex._mip === true;
   };
 
+  Player.prototype._abortStrip = function (job, error) {
+    this._strip = null;
+    this._diagErrors = (this._diagErrors || 0) + 1;
+    this._diagNote = "strip upload failed; sending the whole tile";
+    this._reportTv(this._diagNote + (error && error.message ? " " + error.message : ""));
+    var tex = job && job.tex;
+    try {
+      if (job && job.gl && tex && job.source) {
+        job.gl.bindTexture(job.gl.TEXTURE_2D, tex);
+        job.gl.texImage2D(job.gl.TEXTURE_2D, 0, job.gl.RGBA, job.gl.RGBA, job.gl.UNSIGNED_BYTE, job.source);
+        this._finishSampler(job.gl, tex, job.w, job.h, job.source);
+        tex._spsUploaded = true;
+      } else {
+        tex = null;
+      }
+    } catch (err) {
+      tex = null;
+      this._diagNote = "texture upload failed";
+      this._reportTv(this._diagNote);
+    }
+    if (job && job.done) job.done(tex);
+  };
+
   Player.prototype._uploadStripSlice = function () {
     var job = this._strip;
     if (!job) return;
     var rows = Math.min(job.rows, job.h - job.y);
-    if (!this._stripCanvas) this._stripCanvas = document.createElement("canvas");
-    if (this._stripCanvas.width !== job.w) this._stripCanvas.width = job.w;
-    if (this._stripCanvas.height !== rows) this._stripCanvas.height = rows;
-    var ctx = this._stripCanvas.getContext("2d");
-    if (!ctx) {
-      this._strip = null;
+    try {
+      if (!this._stripCanvas) this._stripCanvas = document.createElement("canvas");
+      if (this._stripCanvas.width !== job.w) this._stripCanvas.width = job.w;
+      if (this._stripCanvas.height !== rows) this._stripCanvas.height = rows;
+      var ctx = this._stripCanvas.getContext("2d");
+      if (!ctx) {
+        this._abortStrip(job, new Error("no canvas"));
+        return;
+      }
+      ctx.drawImage(job.source, 0, job.y, job.w, rows, 0, 0, job.w, rows);
+      job.gl.bindTexture(job.gl.TEXTURE_2D, job.tex);
+      job.gl.texSubImage2D(job.gl.TEXTURE_2D, 0, 0, job.y, job.gl.RGBA, job.gl.UNSIGNED_BYTE, this._stripCanvas);
+      job.y += rows;
+    } catch (error) {
+      this._abortStrip(job, error);
       return;
     }
-    ctx.drawImage(job.source, 0, job.y, job.w, rows, 0, 0, job.w, rows);
-    job.gl.bindTexture(job.gl.TEXTURE_2D, job.tex);
-    job.gl.texSubImage2D(job.gl.TEXTURE_2D, 0, 0, job.y, job.gl.RGBA, job.gl.UNSIGNED_BYTE, this._stripCanvas);
-    job.y += rows;
     if (job.y < job.h) return;
     var tex = job.tex;
     var source = job.source;
     var done = job.done;
     this._strip = null;
     this._finishSampler(job.gl, tex, job.w, job.h, source);
+    tex._spsUploaded = true;
     if (done) done(tex);
   };
 
@@ -3250,7 +3514,7 @@
         "    vec2 ost=vec2(u,clamp(v,0.5/max(uTexH,1.0),1.0-0.5/max(uTexH,1.0)));\n" +
         "    " + color + "=overviewColor(ost);\n" +
         "    if(uDebug>0.5)" + color + ".rgb*=vec3(0.45,0.62,1.0);\n" +
-        "    " + color + ".a*=uAlpha;\n" +
+        "    " + color + ".a=uAlpha;\n" +
         "  } else {\n" +
         "  float spanU=max(uU1-uU0,1e-6);\n" +
         "  float spanV=max(uV1-uV0,1e-6);\n" +
@@ -3283,7 +3547,7 @@
         "  float edgePx=min(min(sx,1.0-sx)*uSrcW,min(sy,1.0-sy)*uSrcH);\n" +
         "  if(edgePx<3.0) " + color + "=" + sampleExpr + ";\n" +
         "  else " + color + "=" + (webgl2 ? "texture" : "texture2D") + "(uTex,st);\n" +
-        "  " + color + ".a*=uAlpha*focusMask(u,v);\n" +
+        "  " + color + ".a=uAlpha*focusMask(u,v);\n" +
         "  float slopU=0.5*spanU/max(uSrcW,1.0);\n" +
         "  float slopV=0.5*spanV/max(uSrcH,1.0);\n" +
         "  if(uDebug>0.5)" + color + ".rgb*=vec3(1.05,0.78,0.42);\n" +
@@ -3294,7 +3558,7 @@
         "    vec2 ost=vec2(uv.x,clamp(uv.y,0.5/max(uTexH,1.0),1.0-0.5/max(uTexH,1.0)));\n" +
         "    " + color + "=overviewColor(ost);\n" +
         "    if(uDebug>0.5)" + color + ".rgb*=vec3(0.45,0.62,1.0);\n" +
-        "    " + color + ".a*=uAlpha;\n" +
+        "    " + color + ".a=uAlpha;\n" +
         "  } else {\n" +
         "  float spanU=max(uU1-uU0,1e-6);\n" +
         "  float spanV=max(uV1-uV0,1e-6);\n" +
@@ -3304,7 +3568,7 @@
         "  vec2 halfTex=vec2(0.5/max(uTexW,1.0),0.5/max(uTexH,1.0));\n" +
         "  st=clamp(st,halfTex,vec2(1.0)-halfTex);\n" +
         "  " + color + "=" + (webgl2 ? "texture" : "texture2D") + "(uTex,st);\n" +
-        "  " + color + ".a*=uAlpha*focusMask(uv.x,uv.y);\n" +
+        "  " + color + ".a=uAlpha*focusMask(uv.x,uv.y);\n" +
         "  float slopU=0.5*spanU/max(uSrcW,1.0);\n" +
         "  float slopV=0.5*spanV/max(uSrcH,1.0);\n" +
         "  if(uDebug>0.5)" + color + ".rgb*=vec3(1.05,0.78,0.42);\n" +
@@ -3316,33 +3580,37 @@
       "uniform float uU0;uniform float uU1;uniform float uV0;uniform float uV1;\n" +
       "uniform float uPadL;uniform float uPadT;uniform float uSrcW;uniform float uSrcH;uniform float uTexW;uniform float uTexH;\n" +
       "uniform float uKind;uniform float uDebug;\n" +
-      "uniform float uReveal;uniform float uCu;uniform float uCv;uniform float uHalfU;uniform float uHalfV;\n" +
+      "uniform float uReveal;uniform float uGeo;uniform float uViewU;uniform float uViewV;uniform float uAnchorV;\n" +
       "uniform float uNL;uniform float uNR;uniform float uNU;uniform float uND;\n" +
       "vec4 overviewColor(vec2 ost){\n" +
-      "  vec2 px=vec2(1.5/max(uTexW,1.0),1.5/max(uTexH,1.0));\n" +
-      "  vec4 c=" + (webgl2 ? "texture" : "texture2D") + "(uTex,ost)*0.36;\n" +
-      "  c+=" + (webgl2 ? "texture" : "texture2D") + "(uTex,ost+vec2(px.x,0.0))*0.16;\n" +
-      "  c+=" + (webgl2 ? "texture" : "texture2D") + "(uTex,ost+vec2(-px.x,0.0))*0.16;\n" +
-      "  c+=" + (webgl2 ? "texture" : "texture2D") + "(uTex,ost+vec2(0.0,px.y))*0.16;\n" +
-      "  c+=" + (webgl2 ? "texture" : "texture2D") + "(uTex,ost+vec2(0.0,-px.y))*0.16;\n" +
-      "  return c;\n" +
+      "  return " + (webgl2 ? "texture" : "texture2D") + "(uTex,ost);\n" +
+      "}\n" +
+      "float ease01(float t){t=clamp(t,0.0,1.0);return t*t*(3.0-2.0*t);}\n" +
+      "float reachFall(float dist,float reach,float feather){\n" +
+      "  float inner=max(reach-feather,0.0);float outer=reach+feather;\n" +
+      "  float x=clamp((dist-inner)/max(outer-inner,1e-4),0.0,1.0);\n" +
+      "  return 1.0-x*x*(3.0-2.0*x);\n" +
       "}\n" +
       "float focusMask(float su,float sv){\n" +
-      "  float du=su-uCu;du=mod(du+0.5,1.0)-0.5;float dv=sv-uCv;\n" +
-      "  float dist=sqrt(pow(du/max(uHalfU,1e-4),2.0)+pow(dv/max(uHalfV,1e-4),2.0));\n" +
-      "  float radius=uReveal*3.4;float feather=1.7;\n" +
-      "  float inner=radius-feather;float outer=radius+feather;\n" +
-      "  float fx=clamp((dist-inner)/max(outer-inner,1e-4),0.0,1.0);\n" +
-      "  float herm=fx*fx*(3.0-2.0*fx);\n" +
-      "  float radial=(1.0-herm)*smoothstep(0.02,0.2,uReveal);\n" +
+      "  float e=ease01(uGeo);\n" +
+      "  float radialT=ease01(clamp(e/0.62,0.0,1.0));\n" +
+      "  float bandT=e<0.28?0.0:ease01((e-0.28)/0.72);\n" +
+      "  float rad=radialT*220.0;float band=bandT*110.0;\n" +
+      "  float du=su-uViewU;du=mod(du+0.5,1.0)-0.5;\n" +
+      "  float lon=abs(du)*360.0;float dv=(sv-uViewV)*180.0;\n" +
+      "  float ang=sqrt(lon*lon+dv*dv);\n" +
+      "  float radial=reachFall(ang,rad,18.0);\n" +
+      "  float lat=abs(sv-uAnchorV)*180.0;\n" +
+      "  float bandMask=reachFall(lat,band,12.0)*reachFall(lon,rad,18.0);\n" +
+      "  float geo=max(radial,bandMask);\n" +
       "  float sx=clamp((su-uU0)/max(uU1-uU0,1e-4),0.0,1.0);\n" +
       "  float sy=clamp((sv-uV0)/max(uV1-uV0,1e-4),0.0,1.0);\n" +
-      "  float eL=mix(smoothstep(0.0,0.46,sx),1.0,uNL);\n" +
-      "  float eR=mix(smoothstep(0.0,0.46,1.0-sx),1.0,uNR);\n" +
-      "  float eU=mix(smoothstep(0.0,0.46,sy),1.0,uNU);\n" +
-      "  float eD=mix(smoothstep(0.0,0.46,1.0-sy),1.0,uND);\n" +
-      "  float mask=radial*eL*eR*eD*eU;\n" +
-      "  float done=smoothstep(0.9,1.0,uReveal)*min(min(uNL,uNR),min(uND,uNU));\n" +
+      "  float eL=mix(smoothstep(0.0,0.35,sx),1.0,uNL);\n" +
+      "  float eR=mix(smoothstep(0.0,0.35,1.0-sx),1.0,uNR);\n" +
+      "  float eU=mix(smoothstep(0.0,0.35,sy),1.0,uNU);\n" +
+      "  float eD=mix(smoothstep(0.0,0.35,1.0-sy),1.0,uND);\n" +
+      "  float mask=uReveal*geo*eL*eR*eU*eD;\n" +
+      "  float done=step(0.995,uReveal)*step(0.995,uGeo);\n" +
       "  return mix(mask,1.0,done);\n" +
       "}\n" +
       "const float PI=3.141592653589793;const float TWO_PI=6.283185307179586;\n" +
@@ -3391,12 +3659,17 @@
     };
   }
 
+  var lastShaderError = "";
+
   function link(gl, vsSrc, fsSrc) {
     function sh(type, src) {
       var s = gl.createShader(type);
       gl.shaderSource(s, src);
       gl.compileShader(s);
-      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) warn("shader", gl.getShaderInfoLog(s));
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+        lastShaderError = String(gl.getShaderInfoLog(s) || "shader");
+        warn("shader", lastShaderError);
+      }
       return s;
     }
     var p = gl.createProgram();
@@ -3410,7 +3683,8 @@
     var prog = link(gl, vsSrc, fsSrc);
     if (!prog || !gl.getProgramParameter(prog, gl.LINK_STATUS)) {
       if (prog) {
-        warn("shader link", gl.getProgramInfoLog(prog));
+        lastShaderError = String(gl.getProgramInfoLog(prog) || "link");
+        warn("shader link", lastShaderError);
         gl.deleteProgram(prog);
       }
       return null;
@@ -4736,45 +5010,83 @@
   }
 
   function tileLoadOrder(tiles, width, height, view) {
-    var directed = !!(view && (view.lookaheadDeg > 0 || view.panSign === 1 || view.panSign === -1));
-    var sign = view && view.panSign < 0 ? -1 : 1;
-    var pitch = view && view.pitch ? view.pitch : 0;
+    view = view || {};
+    var directed = !!(view.lookaheadDeg > 0 || view.panSign === 1 || view.panSign === -1);
+    var sign = view.panSign < 0 ? -1 : 1;
+    var pitch = view.pitch || 0;
     var lookPole = pitch > 28 ? "north" : (pitch < -28 ? "south" : "");
-    var vu = view && view.u != null ? view.u : 0.5;
-    var vv = view && view.v != null ? view.v : 0.5;
+    var vu = view.u != null ? view.u : 0.5;
+    var vv = view.v != null ? view.v : 0.5;
+    var spanW = Math.max(width, 1);
+    var spanH = Math.max(height, 1);
     var order = [];
     for (var i = 0; i < tiles.length; i++) {
       var tile = tiles[i];
-      var u0 = tile.srcX / width;
-      var u1 = (tile.srcX + tile.srcW) / width;
-      var v0 = tile.srcY / height;
-      var v1 = (tile.srcY + tile.srcH) / height;
-      var centerU = (u0 + u1) / 2;
-      var centerV = (v0 + v1) / 2;
-      var contains = vu >= u0 && vu <= u1 && vv >= v0 && vv <= v1;
-      var hits = !!(view && tileInView(tile, width, height, view));
-      var pole = tilePole(tile, height);
-      var lead = directed && view ? panLeadDeg(centerU, vu, sign) : 0;
-      var dist = uDist(centerU, vu) + Math.abs(centerV - vv);
-      var looking = !!lookPole;
-      var rank = looking ? 4 : 3;
-      if (lookPole && pole === lookPole) rank = 0;
-      else if (contains || hits) rank = looking ? 1 : 0;
-      else if (!pole && lead >= -0.5) rank = looking ? 2 : 1;
-      else if (!pole) rank = looking ? 3 : 2;
-      var sortLead = dist;
-      if (rank === 1) sortLead = lead >= 0 ? lead : lead + 360;
-      else if (rank === 2) sortLead = lead < 0 ? -lead : lead;
-      else if (rank === 3) sortLead = Math.abs(centerV - 0.5);
-      order.push({ index: i, rank: rank, lead: sortLead, dist: dist });
+      var cu = (tile.srcX + tile.srcW / 2) / spanW;
+      var cv = (tile.srcY + tile.srcH / 2) / spanH;
+      var du = uDist(cu, vu) * 360;
+      var dv = Math.abs(cv - vv) * 180;
+      var ang = Math.sqrt(du * du + dv * dv);
+      var contains = vu >= tile.srcX / spanW && vu <= (tile.srcX + tile.srcW) / spanW &&
+        vv >= tile.srcY / spanH && vv <= (tile.srcY + tile.srcH) / spanH;
+      // Horizon rows near the screen center come first. Latitude then costs
+      // more, so the next bands step toward the poles instead of jumping there.
+      var horizonPenalty = lookPole ? 0 : Math.abs(cv - 0.5) * 180 * 1.15;
+      var lead = directed ? panLeadDeg(cu, vu, sign) : 0;
+      var inView = !!(view && tileInView(tile, spanW, spanH, view));
+      var ahead = 0;
+      // The tile under the screen center is not pushed aside for the pan.
+      // Lookahead only reorders the tiles around it.
+      if (directed && !contains) {
+        if (!inView && lead < -0.5) ahead = 90;
+        else if (lead > 0) ahead = -Math.min(lead, 40) * 0.15;
+      }
+      var pole = tilePole(tile, spanH);
+      var poleRank = lookPole ? (pole === lookPole ? 0 : 1) : 0;
+      order.push({
+        index: i,
+        poleRank: poleRank,
+        score: (contains ? -1000 : 0) + ang + horizonPenalty + ahead,
+        ang: ang,
+      });
     }
     order.sort(function (a, b) {
-      if (a.rank !== b.rank) return a.rank - b.rank;
-      if (a.lead !== b.lead) return a.lead - b.lead;
-      if (a.dist !== b.dist) return a.dist - b.dist;
+      if (a.poleRank !== b.poleRank) return a.poleRank - b.poleRank;
+      if (a.score !== b.score) return a.score - b.score;
+      if (a.ang !== b.ang) return a.ang - b.ang;
       return a.index - b.index;
     });
     return order.map(function (item) { return item.index; });
+  }
+
+  function easeInOut(t) {
+    if (t <= 0) return 0;
+    if (t >= 1) return 1;
+    return t * t * (3 - 2 * t);
+  }
+
+  function revealProgress(born, now, duration) {
+    if (!(born > 0)) return 0;
+    var span = duration > 0 ? duration : FOCUS_MS;
+    return easeInOut((now - born) / span);
+  }
+
+  function geoRadii(t) {
+    var e = easeInOut(t);
+    var radialT = easeInOut(Math.min(1, e / 0.62));
+    var bandT = e < 0.28 ? 0 : easeInOut((e - 0.28) / 0.72);
+    return { rad: radialT * 220, band: bandT * 110 };
+  }
+
+  function shouldStripUpload(width, height) {
+    var w = width | 0;
+    var h = height | 0;
+    if (w <= 0 || h <= 0) return false;
+    // The 256×128 overview and the 512px tiles fit in one texImage2D.
+    // A 64-row strip left the south half of that overview uninitialized,
+    // and a failed texSubImage2D held the upload queue so sharp tiles never moved.
+    if (Math.max(w, h) <= 512) return false;
+    return h > 64;
   }
 
   function smoothstep(edge0, edge1, x) {
@@ -4785,35 +5097,39 @@
     return t * t * (3 - 2 * t);
   }
 
-  function focusMask(u, v, tile, spanW, spanH, reveal, neighbors) {
+  function focusMask(u, v, tile, spanW, spanH, reveal, neighbors, geo) {
     neighbors = neighbors || {};
+    geo = geo || {};
     var left = neighbors.left == null ? 1 : neighbors.left;
     var right = neighbors.right == null ? 1 : neighbors.right;
     var up = neighbors.up == null ? 1 : neighbors.up;
     var down = neighbors.down == null ? 1 : neighbors.down;
+    var tileA = reveal > 0 ? reveal : 0;
+    if (tileA > 1) tileA = 1;
+    var viewU = geo.viewU != null ? geo.viewU : 0.5;
+    var viewV = geo.viewV != null ? geo.viewV : 0.5;
+    var anchorV = geo.anchorV != null ? geo.anchorV : (Math.abs(geo.pitch || 0) > 28 ? viewV : 0.5);
+    var radii = geoRadii(geo.t != null ? geo.t : 1);
+    var rad = geo.rad != null ? geo.rad : radii.rad;
+    var band = geo.band != null ? geo.band : radii.band;
+    var du = u - viewU;
+    du = ((du + 0.5) % 1 + 1) % 1 - 0.5;
+    var lon = Math.abs(du) * 360;
+    var dv = (v - viewV) * 180;
+    var ang = Math.sqrt(lon * lon + dv * dv);
+    function falloff(dist, reach, feather) {
+      var inner = Math.max(reach - feather, 0);
+      var outer = reach + feather;
+      return 1 - smoothstep(inner, outer, dist);
+    }
+    var radial = falloff(ang, rad, 18);
+    var lat = Math.abs(v - anchorV) * 180;
+    var bandMask = falloff(lat, band, 12) * falloff(lon, rad, 18);
+    var geoA = radial > bandMask ? radial : bandMask;
     var u0 = tile.srcX / spanW;
     var u1 = (tile.srcX + tile.srcW) / spanW;
     var v0 = tile.srcY / spanH;
     var v1 = (tile.srcY + tile.srcH) / spanH;
-    var cu = (u0 + u1) / 2;
-    var cv = (v0 + v1) / 2;
-    var halfU = Math.max((u1 - u0) / 2, 1e-4);
-    var halfV = Math.max((v1 - v0) / 2, 1e-4);
-    var du = u - cu;
-    du = ((du + 0.5) % 1 + 1) % 1 - 0.5;
-    var dv = v - cv;
-    var dist = Math.sqrt(Math.pow(du / halfU, 2) + Math.pow(dv / halfV, 2));
-    var t = reveal > 0 ? reveal : 0;
-    if (t > 1) t = 1;
-    var radius = t * 3.4;
-    var feather = 1.7;
-    var inner = radius - feather;
-    var outer = radius + feather;
-    var fx = (dist - inner) / Math.max(outer - inner, 1e-4);
-    if (fx < 0) fx = 0;
-    if (fx > 1) fx = 1;
-    var herm = fx * fx * (3 - 2 * fx);
-    var radial = (1 - herm) * smoothstep(0.02, 0.2, t);
     var sx = (u - u0) / Math.max(u1 - u0, 1e-4);
     var sy = (v - v0) / Math.max(v1 - v0, 1e-4);
     if (sx < 0) sx = 0;
@@ -4821,10 +5137,11 @@
     if (sy < 0) sy = 0;
     if (sy > 1) sy = 1;
     function edge(x, open) {
-      return smoothstep(0, 0.46, x) * (1 - open) + open;
+      return smoothstep(0, 0.35, x) * (1 - open) + open;
     }
-    var mask = radial * edge(sx, left) * edge(1 - sx, right) * edge(sy, up) * edge(1 - sy, down);
-    var done = smoothstep(0.9, 1, t) * Math.min(left, right, up, down);
+    var mask = tileA * geoA * edge(sx, left) * edge(1 - sx, right) * edge(sy, up) * edge(1 - sy, down);
+    var geoDone = geo.t == null ? 1 : (geo.t >= 0.995 ? 1 : 0);
+    var done = tileA >= 0.995 && geoDone === 1 && Math.min(left, right, up, down) >= 0.995 ? 1 : 0;
     return mask * (1 - done) + done;
   }
 
@@ -5278,6 +5595,11 @@
     CROSSFADE_MS: CROSSFADE_MS,
     TILE_FADE_MS: TILE_FADE_MS,
     FOCUS_MS: FOCUS_MS,
+    GEO_MS: GEO_MS,
+    easeInOut: easeInOut,
+    revealProgress: revealProgress,
+    geoRadii: geoRadii,
+    shouldStripUpload: shouldStripUpload,
     focusMask: focusMask,
     tilePole: tilePole,
     materializeJpeg: materializeJpeg,

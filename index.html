@@ -15,6 +15,42 @@
       position: fixed; inset: 0; z-index: 2; display: none; pointer-events: none;
     }
     #busy.on { display: block; }
+    #mark {
+      position: fixed; inset: 0; z-index: 4;
+      background: #0b0d10;
+      display: grid; place-items: center;
+      pointer-events: none;
+    }
+    #mark[hidden] { display: none; }
+    #mark .orb {
+      position: relative;
+      width: 92px; height: 92px; border-radius: 50%;
+      background:
+        radial-gradient(circle at 34% 30%, #f7f4ee 0%, #c5ccd4 22%, #5c6772 48%, #1b2128 72%, #0b0d10 80%);
+      box-shadow: 0 0 48px rgba(196, 208, 216, 0.28);
+      animation: spsphere-orb 7.5s ease-in-out infinite;
+    }
+    #mark .orb::before,
+    #mark .orb::after {
+      content: "";
+      position: absolute; left: 50%; top: 50%;
+      border-radius: 50%;
+      border: 1px solid rgba(232, 236, 240, 0.35);
+    }
+    #mark .orb::before {
+      width: 140px; height: 140px; margin: -70px 0 0 -70px;
+      animation: spsphere-ring 9s linear infinite;
+    }
+    #mark .orb::after {
+      width: 188px; height: 188px; margin: -94px 0 0 -94px;
+      border-color: rgba(232, 236, 240, 0.16);
+      animation: spsphere-ring 14s linear infinite reverse;
+    }
+    @keyframes spsphere-orb {
+      0%, 100% { transform: scale(0.94); }
+      50% { transform: scale(1); }
+    }
+    @keyframes spsphere-ring { to { transform: rotate(360deg); } }
     #busy::after {
       content: "";
       position: absolute; left: 50%; top: 50%;
@@ -29,6 +65,7 @@
 </head>
 <body>
   <canvas id="view"></canvas>
+  <div id="mark" hidden><div class="orb"></div></div>
   <div id="busy"></div>
   <script src="player.js"></script>
   <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
