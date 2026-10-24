@@ -95,6 +95,78 @@
     return url;
   }
 
+  function privateLanHost(url) {
+    var match = /^http:\/\/([^\/:]+)/i.exec(url || "");
+    if (!match) return false;
+    var host = match[1];
+    if (host === "localhost" || host === "127.0.0.1") return true;
+    if (/^10\./.test(host) || /^192\.168\./.test(host)) return true;
+    return /^172\.(1[6-9]|2\d|3[0-1])\./.test(host);
+  }
+
+  function shouldTryLan(lan, dead, url) {
+    return !!lan && !dead && privateLanHost(url);
+  }
+
+  function loadHttpJpeg(url, timeoutMs, done) {
+    var finished = false;
+    var timer = 0;
+    function finish(err, img) {
+      if (finished) return;
+      finished = true;
+      if (timer && typeof clearTimeout === "function") clearTimeout(timer);
+      done(err, img);
+    }
+    if (typeof setTimeout === "function") {
+      timer = setTimeout(function () { finish(new Error("lan timeout")); }, timeoutMs > 0 ? timeoutMs : 2200);
+    }
+    function fromImage(blob) {
+      if (typeof Image === "undefined" || typeof URL === "undefined" || !URL.createObjectURL) {
+        finish(new Error("no image"));
+        return;
+      }
+      var img = new Image();
+      var objectUrl = "";
+      try { objectUrl = URL.createObjectURL(blob); } catch (error) { finish(error); return; }
+      img.onload = function () {
+        try { URL.revokeObjectURL(objectUrl); } catch (error) {}
+        finish(null, img);
+      };
+      img.onerror = function () {
+        try { URL.revokeObjectURL(objectUrl); } catch (error) {}
+        finish(new Error("image"));
+      };
+      img.src = objectUrl;
+    }
+    function fromBlob(blob) {
+      if (typeof createImageBitmap === "function") {
+        var pending;
+        try { pending = createImageBitmap(blob); } catch (error) { fromImage(blob); return; }
+        pending.then(function (bitmap) {
+          if (!bitmap || !(bitmap.width > 0) || !(bitmap.height > 0)) {
+            try { if (bitmap && bitmap.close) bitmap.close(); } catch (error) {}
+            fromImage(blob);
+            return;
+          }
+          finish(null, bitmap);
+        }, function () { fromImage(blob); });
+        return;
+      }
+      fromImage(blob);
+    }
+    if (typeof fetch !== "function") {
+      finish(new Error("no fetch"));
+      return;
+    }
+    var pendingFetch;
+    try { pendingFetch = fetch(url, { mode: "cors", cache: "no-store", credentials: "omit" }); }
+    catch (error) { finish(error); return; }
+    pendingFetch.then(function (res) {
+      if (!res || !res.ok) throw new Error("lan");
+      return res.blob();
+    }).then(fromBlob, function (err) { finish(err || new Error("lan")); });
+  }
+
   function isNewer(seq, last) {
     if (last < 0) return true;
     return (((seq - last) | 0) > 0);
@@ -305,8 +377,11 @@
       this._diagDecoded = 0;
       this._diagUploaded = 0;
       this._diagErrors = 0;
-      this._diagNote = "";
-      this._diagKey = "";
+    this._diagNote = "";
+    this._diagKey = "";
+    // setLan() runs before setQueue(). A new show retries Wi-Fi, and it
+    // keeps the flag the queue message just set.
+    this._lanDead = false;
       this._markBusy();
       this._paintMark();
       if (this.items.length) this._openCurrent();
@@ -618,6 +693,13 @@
   };
 
   Player.prototype._neighborReveal = function (tile, dRow, dCol) {
+    var found = this._neighborPiece(tile, dRow, dCol);
+    if (found === 1) return 1;
+    if (!found) return 0;
+    return this._mergeAmount(found);
+  };
+
+  Player.prototype._neighborPiece = function (tile, dRow, dCol) {
     if (!tile || !this.session || !this.session.entry) return 1;
     var row = (tile.row | 0) + dRow;
     var col = (tile.col | 0) + dCol;
@@ -626,7 +708,6 @@
     var exists = false;
     var minCol = tile.col | 0;
     var maxCol = tile.col | 0;
-    var match = null;
     for (var i = 0; i < tiles.length; i++) {
       var spec = tiles[i];
       if (!spec || spec._base) continue;
@@ -648,10 +729,33 @@
     for (var j = 0; j < loaded.length; j++) {
       var other = loaded[j] && loaded[j].tile;
       if (!other || other._skip) continue;
-      if ((other.row | 0) === row && (other.col | 0) === col) match = loaded[j];
+      if ((other.row | 0) === row && (other.col | 0) === col) return loaded[j];
     }
-    if (!match) return 0;
-    return this._revealOf(match);
+    return null;
+  };
+
+  // 1 when this tile and every tile that touches it have finished opening.
+  // The circle stays inside the rectangle until then, so a finished tile
+  // does not cut a straight edge into a neighbor that is still soft.
+  Player.prototype._mergeAmount = function (piece) {
+    if (!piece || !piece.tile || this._revealOf(piece) < 1) {
+      if (piece) piece._mergeAt = 0;
+      return 0;
+    }
+    var deltas = [[0, -1], [0, 1], [-1, 0], [1, 0]];
+    for (var i = 0; i < deltas.length; i++) {
+      var side = this._neighborPiece(piece.tile, deltas[i][0], deltas[i][1]);
+      if (side === 1) continue;
+      if (!side || this._revealOf(side) < 1) {
+        piece._mergeAt = 0;
+        return 0;
+      }
+    }
+    if (!(piece._mergeAt > 0)) piece._mergeAt = this._clock();
+    var t = (this._clock() - piece._mergeAt) / 360;
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    return easeInOut(t);
   };
 
   Player.prototype.setFov = function (fov) {
@@ -734,6 +838,58 @@
     revokeTrackedUrls();
     this._gpuBytes = 0;
     if (this._resident) this._resident.length = 0;
+  };
+
+  Player.prototype.setLan = function (on) {
+    this._lan = !!on;
+    this._lanDead = false;
+  };
+
+  Player.prototype._urlFor = function (id) {
+    var want = String(id);
+    var pools = [this.session, this._standby, this._back];
+    for (var p = 0; p < pools.length; p++) {
+      var entry = pools[p] && pools[p].entry;
+      if (!entry) continue;
+      if (entry.overview && String(entry.overview.id) === want && entry.overview.url) return entry.overview.url;
+      var tiles = entry.tiles || [];
+      for (var i = 0; i < tiles.length; i++) {
+        if (tiles[i] && String(tiles[i].id) === want && tiles[i].url) return tiles[i].url;
+      }
+    }
+    return "";
+  };
+
+  Player.prototype._poolWithToken = function (id, token) {
+    var pools = [this.session, this._standby, this._back];
+    for (var i = 0; i < pools.length; i++) {
+      var pool = pools[i];
+      if (pool && pool.accepts && pool.accepts({ id: id, token: token })) return pool;
+    }
+    return null;
+  };
+
+  Player.prototype._loadLan = function (id, token, url) {
+    var self = this;
+    loadHttpJpeg(url, 2200, function (err, img) {
+      if (err || !img) {
+        self._lanDead = true;
+        self._diagErrors = (self._diagErrors || 0) + 1;
+        self._diagNote = "LAN JPEG unreachable; using Cast messages";
+        self._reportTv(self._diagNote);
+        try { if (img && img.close) img.close(); } catch (error) {}
+        if (window.__castSend) window.__castSend({ type: "fetch", id: id, token: token, reason: "lan" });
+        return;
+      }
+      var pool = self._poolWithToken(id, token);
+      if (!pool || !pool.noteImage(id, token, img)) {
+        try { if (img.close) img.close(); } catch (error) {}
+        return;
+      }
+      self._diagReceived = (self._diagReceived || 0) + 1;
+      self._diagDecoded = (self._diagDecoded || 0) + 1;
+      self._sendDiag();
+    });
   };
 
   Player.prototype.noteSender = function () {
@@ -1854,7 +2010,15 @@
       request: function (id, token) {
         self._diagRequested = (self._diagRequested || 0) + 1;
         self._sendDiag();
+        var url = self._urlFor(id);
+        if (shouldTryLan(self._lan, self._lanDead, url)) {
+          self._loadLan(id, token, url);
+          return;
+        }
         if (window.__castSend) window.__castSend({ type: "fetch", id: id, token: token });
+      },
+      ahead: function () {
+        return (self._lan && !self._lanDead) ? 6 : AHEAD_REQUESTS;
       },
       preloadLimit: function () { return self._preloadDepth || 0; },
       gpuRoom: function () { return Math.max(0, GPU_CAP - (self._gpuBytes || 0)); },
@@ -3126,6 +3290,12 @@
       this._snapHave = true;
       return;
     }
+    // A full-frame copy every vsync on a Mali TV runs the GPU out of memory
+    // after about a minute and the picture glitches. A fresh copy a few times
+    // a second is enough for the next-photo crossfade.
+    var now = this._clock();
+    if (this._snapCopiedAt && now - this._snapCopiedAt < 400) return;
+    this._snapCopiedAt = now;
     var w = Math.min(gl.drawingBufferWidth || this.canvas.width || SNAP_W, SNAP_W);
     var h = Math.min(gl.drawingBufferHeight || this.canvas.height || SNAP_H, SNAP_H);
     if (w < 2 || h < 2) return;
@@ -3586,32 +3756,26 @@
       "  return " + (webgl2 ? "texture" : "texture2D") + "(uTex,ost);\n" +
       "}\n" +
       "float ease01(float t){t=clamp(t,0.0,1.0);return t*t*(3.0-2.0*t);}\n" +
-      "float reachFall(float dist,float reach,float feather){\n" +
-      "  float inner=max(reach-feather,0.0);float outer=reach+feather;\n" +
-      "  float x=clamp((dist-inner)/max(outer-inner,1e-4),0.0,1.0);\n" +
-      "  return 1.0-x*x*(3.0-2.0*x);\n" +
-      "}\n" +
       "float focusMask(float su,float sv){\n" +
-      "  float e=ease01(uGeo);\n" +
-      "  float radialT=ease01(clamp(e/0.62,0.0,1.0));\n" +
-      "  float bandT=e<0.28?0.0:ease01((e-0.28)/0.72);\n" +
-      "  float rad=radialT*220.0;float band=bandT*110.0;\n" +
-      "  float du=su-uViewU;du=mod(du+0.5,1.0)-0.5;\n" +
-      "  float lon=abs(du)*360.0;float dv=(sv-uViewV)*180.0;\n" +
-      "  float ang=sqrt(lon*lon+dv*dv);\n" +
-      "  float radial=reachFall(ang,rad,18.0);\n" +
-      "  float lat=abs(sv-uAnchorV)*180.0;\n" +
-      "  float bandMask=reachFall(lat,band,12.0)*reachFall(lon,rad,18.0);\n" +
-      "  float geo=max(radial,bandMask);\n" +
-      "  float sx=clamp((su-uU0)/max(uU1-uU0,1e-4),0.0,1.0);\n" +
-      "  float sy=clamp((sv-uV0)/max(uV1-uV0,1e-4),0.0,1.0);\n" +
-      "  float eL=mix(smoothstep(0.0,0.35,sx),1.0,uNL);\n" +
-      "  float eR=mix(smoothstep(0.0,0.35,1.0-sx),1.0,uNR);\n" +
-      "  float eU=mix(smoothstep(0.0,0.35,sy),1.0,uNU);\n" +
-      "  float eD=mix(smoothstep(0.0,0.35,1.0-sy),1.0,uND);\n" +
-      "  float mask=uReveal*geo*eL*eR*eU*eD;\n" +
-      "  float done=step(0.995,uReveal)*step(0.995,uGeo);\n" +
-      "  return mix(mask,1.0,done);\n" +
+      "  float e=ease01(uReveal);\n" +
+      "  float spanU=max(uU1-uU0,1e-4);\n" +
+      "  float spanV=max(uV1-uV0,1e-4);\n" +
+      "  float sx=clamp((su-uU0)/spanU,0.0,1.0);\n" +
+      "  float sy=clamp((sv-uV0)/spanV,0.0,1.0);\n" +
+      "  float degU=spanU*360.0;float degV=spanV*180.0;\n" +
+      "  float dx=(sx-0.5)*degU;float dy=(sy-0.5)*degV;\n" +
+      "  float dist=sqrt(dx*dx+dy*dy);\n" +
+      "  float halfU=degU*0.5;float halfV=degV*0.5;\n" +
+      "  float inscribed=max(min(halfU,halfV),0.001);\n" +
+      "  float feather=inscribed*0.42;\n" +
+      "  float safeR=max(inscribed-feather,0.001);\n" +
+      "  float corner=sqrt(halfU*halfU+halfV*halfV);\n" +
+      "  float ready=min(min(ease01(uNL),ease01(uNR)),min(ease01(uNU),ease01(uND)));\n" +
+      "  float grow=e>0.999?ready:0.0;\n" +
+      "  float rad=mix(max(safeR*max(e,0.001),0.001),max(corner*2.2,0.001),grow);\n" +
+      "  float inner=rad*0.55;float outer=rad*1.45;\n" +
+      "  float x=clamp((dist-inner)/max(outer-inner,1e-4),0.0,1.0);\n" +
+      "  return e*(1.0-x*x*(3.0-2.0*x));\n" +
       "}\n" +
       "const float PI=3.141592653589793;const float TWO_PI=6.283185307179586;\n" +
       pose + "\nvoid main(){\n" + body + "}";
@@ -4153,7 +4317,9 @@
     var view = this.hooks.view ? this.hooks.view() : null;
     if (!view || !(view.lookaheadDeg > 0)) return;
     var guard = 0;
-    while (this._inFlight() < AHEAD_REQUESTS && guard < AHEAD_REQUESTS) {
+    var ahead = this.hooks.ahead ? (this.hooks.ahead() | 0) : AHEAD_REQUESTS;
+    if (!(ahead > 0)) ahead = AHEAD_REQUESTS;
+    while (this._inFlight() < ahead && guard < ahead) {
       guard += 1;
       if (this._preloadCapped()) {
         this.preloadCapped = true;
@@ -4464,8 +4630,25 @@
         });
       }
     };
+    if (box._readyImage) {
+      var ready = box._readyImage;
+      box._readyImage = null;
+      finish(null, ready);
+      return;
+    }
     if (this.hooks.materialize) this.hooks.materialize(payload, finish);
     else finish(new Error("no materialize"));
+  };
+
+  PhotoSession.prototype.noteImage = function (id, token, image) {
+    var box = this.assemblers[id];
+    if (!box || box.gen !== this.generation) return false;
+    if ((token | 0) !== box.token) return false;
+    if (image && box.tile && box.tile.url && !image._spsUrl) image._spsUrl = box.tile.url;
+    delete this.assemblers[id];
+    box._readyImage = image;
+    this._materialize(box, "");
+    return true;
   };
 
   PhotoSession.prototype._skipTile = function (box, reason) {
@@ -5106,47 +5289,53 @@
     var down = neighbors.down == null ? 1 : neighbors.down;
     var tileA = reveal > 0 ? reveal : 0;
     if (tileA > 1) tileA = 1;
-    var viewU = geo.viewU != null ? geo.viewU : 0.5;
-    var viewV = geo.viewV != null ? geo.viewV : 0.5;
-    var anchorV = geo.anchorV != null ? geo.anchorV : (Math.abs(geo.pitch || 0) > 28 ? viewV : 0.5);
-    var radii = geoRadii(geo.t != null ? geo.t : 1);
-    var rad = geo.rad != null ? geo.rad : radii.rad;
-    var band = geo.band != null ? geo.band : radii.band;
-    var du = u - viewU;
-    du = ((du + 0.5) % 1 + 1) % 1 - 0.5;
-    var lon = Math.abs(du) * 360;
-    var dv = (v - viewV) * 180;
-    var ang = Math.sqrt(lon * lon + dv * dv);
-    function falloff(dist, reach, feather) {
-      var inner = Math.max(reach - feather, 0);
-      var outer = reach + feather;
-      return 1 - smoothstep(inner, outer, dist);
-    }
-    var radial = falloff(ang, rad, 18);
-    var lat = Math.abs(v - anchorV) * 180;
-    var bandMask = falloff(lat, band, 12) * falloff(lon, rad, 18);
-    var geoA = radial > bandMask ? radial : bandMask;
+    // A global bloom clock used to hit 1 before a late tile arrived, and the
+    // rectangle then faded in as a square. The circle is this tile's own
+    // reveal, measured from the tile center in degrees on the sphere.
+    // Corners stay dark until the neighbors are open too, so a finished
+    // tile does not cut a straight edge into a neighbor that is still soft.
+    // geo is accepted so older callers still parse, and it does not fill the square.
+    void geo;
+    var e = easeInOut(tileA);
     var u0 = tile.srcX / spanW;
     var u1 = (tile.srcX + tile.srcW) / spanW;
     var v0 = tile.srcY / spanH;
     var v1 = (tile.srcY + tile.srcH) / spanH;
-    var sx = (u - u0) / Math.max(u1 - u0, 1e-4);
-    var sy = (v - v0) / Math.max(v1 - v0, 1e-4);
+    var spanU = Math.max(u1 - u0, 1e-4);
+    var spanV = Math.max(v1 - v0, 1e-4);
+    var sx = (u - u0) / spanU;
+    var sy = (v - v0) / spanV;
     if (sx < 0) sx = 0;
     if (sx > 1) sx = 1;
     if (sy < 0) sy = 0;
     if (sy > 1) sy = 1;
-    function edge(x, open) {
-      return smoothstep(0, 0.35, x) * (1 - open) + open;
-    }
-    var mask = tileA * geoA * edge(sx, left) * edge(1 - sx, right) * edge(sy, up) * edge(1 - sy, down);
-    var geoDone = geo.t == null ? 1 : (geo.t >= 0.995 ? 1 : 0);
-    var done = tileA >= 0.995 && geoDone === 1 && Math.min(left, right, up, down) >= 0.995 ? 1 : 0;
-    return mask * (1 - done) + done;
+    var degU = spanU * 360;
+    var degV = spanV * 180;
+    var dx = (sx - 0.5) * degU;
+    var dy = (sy - 0.5) * degV;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+    var halfU = degU * 0.5;
+    var halfV = degV * 0.5;
+    var inscribed = Math.max(Math.min(halfU, halfV), 0.001);
+    var feather = inscribed * 0.42;
+    var safeR = Math.max(inscribed - feather, 0.001);
+    var corner = Math.sqrt(halfU * halfU + halfV * halfV);
+    var ready = Math.min(easeInOut(left), easeInOut(right), easeInOut(up), easeInOut(down));
+    var grow = e > 0.999 ? ready : 0;
+    var rad = (safeR * Math.max(e, 0.001)) * (1 - grow) + (corner * 2.2) * grow;
+    if (rad < 0.001) rad = 0.001;
+    return e * (1 - smoothstep(rad * 0.55, rad * 1.45, dist));
   }
 
   function standbyAllowance(cap, used) {
     return Math.max(0, cap - (used || 0));
+  }
+
+  function armSenderGrace(grace, lastSender, now, senderCount, timeoutMs) {
+    if (senderCount > 0) return 0;
+    var windowMs = timeoutMs > 0 ? timeoutMs : SENDER_TIMEOUT_MS;
+    if (lastSender && now - lastSender < windowMs) return 0;
+    return grace || now;
   }
 
   function receiverStartup() {
@@ -5601,6 +5790,9 @@
     geoRadii: geoRadii,
     shouldStripUpload: shouldStripUpload,
     focusMask: focusMask,
+    armSenderGrace: armSenderGrace,
+    shouldTryLan: shouldTryLan,
+    loadHttpJpeg: loadHttpJpeg,
     tilePole: tilePole,
     materializeJpeg: materializeJpeg,
     SNAP_FADE_MS: SNAP_FADE_MS,

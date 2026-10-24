@@ -10,6 +10,7 @@ Host these next to each other:
 
 - `index.html` — the receiver page registered in the Cast console
 - `player.js` — the sphere player, loaded with a relative URL
+- `logo.png` — the loading mark, the same bitmap as the Android launcher icon
 
 `preview.html` and `samples/` are for a desktop check. The TV does not request them. Do not add a `<base href>` that points at another directory. The Cast SDK script is the only absolute URL, and it is `https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js`.
 
@@ -35,6 +36,8 @@ The queue message from the phone carries those URLs, plus `ws://<phone-lan-ip>:<
 
 Custom messages are checked before they refresh the sender timer. A message larger than 2 MB, a binary frame larger than 64 KB, malformed JSON, or an unknown `type` is dropped. The aim socket is accepted only as `ws://` or `wss://` to an IP or localhost, on the `/c/<token>/aim` path. Photo URLs have to be `http` or `https`. Nothing on the page is written with `innerHTML`, so a title cannot become markup.
 
+The phone encodes every tile of the photo on screen, and the next photo in an album, on a pool of workers as soon as that photo is queued. Tile JPEGs are quality 95. The softened overview is quality 93. Both stay in phone RAM. The TV reads those bytes; it does not wait for the phone to slice or compress a tile when the request arrives. While the show is running the phone holds a partial wake lock plus Wi-Fi locks `WIFI_MODE_FULL_HIGH_PERF` and, on Android 10 and later, `WIFI_MODE_FULL_LOW_LATENCY`, so the radio does not power-save between requests. Image responses send `Connection: keep-alive`.
+
 The phone answers every image response, including the CORS preflight, with:
 
 - `Access-Control-Allow-Origin: *`
@@ -45,7 +48,9 @@ The phone answers every image response, including the CORS preflight, with:
 
 The page loads each JPEG with `crossorigin="anonymous"` and `referrerpolicy="no-referrer"`, so WebGL can read the pixels and Chrome's private-network check can succeed. `data:` and `blob:` URLs skip CORS.
 
-That does not turn off mixed content. An HTTPS page asking for `http://192.168.x.x` is insecure content. Chromecast can allow it per application (`ALLOW_INSECURE_CONTENT` in the device config). A Google TV Cast WebView may still block the request or refuse to upgrade an IP address to HTTPS. There is no header the phone can send that overrides that. The live show does not depend on that HTTP fetch. The queue sets `chunks: true` and `lan: false`, and the TV loads each tile over Cast custom messages. The LAN URLs stay on the queue item as a fallback address. The same rule applies to `ws://`: the page tries the LAN socket first, and if it never opens, aim, previous, and next still arrive as Cast custom messages on `urn:x-cast:com.cameron.viewer360`.
+That does not turn off mixed content. An HTTPS page asking for `http://192.168.x.x` is insecure content. Chromecast can allow it per application (`ALLOW_INSECURE_CONTENT` in the device config). A Google TV Cast WebView may still block the request or refuse to upgrade an IP address to HTTPS. There is no header the phone can send that overrides that. The queue sets `chunks: true` and `lan: true`. The TV tries each private `http://` JPEG first, with a 2.2 second timeout. The first miss turns that path off and the same tile is requested as `{type:"fetch", id, token, reason:"lan"}`. Later tiles then use Cast messages immediately, so a blocked LAN does not add a timeout to every tile. `lan: false`, an `https` URL, or a public host never tries the phone. The same rule applies to `ws://`: the page tries the LAN socket first, and if it never opens, aim, previous, and next still arrive as Cast custom messages on `urn:x-cast:com.cameron.viewer360`.
+
+The first frame is the app icon, `logo.png` (the launcher bitmap), on the dark background. There is no title and no spinner text. It crossfades once the overview and the tiles in front are up. Each sharp tile then opens as a circle from its own center. The circle stays inside the tile rectangle until the neighboring tiles are open, so a tile that arrives after the old global bloom clock has finished does not fade in as a square.
 
 Do not add `upgrade-insecure-requests`. That would rewrite the phone URLs to HTTPS, and the phone does not serve TLS.
 
