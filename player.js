@@ -51,7 +51,7 @@
   // Seconds of pan to keep queued even before a slow upload has been timed.
   var LOOKAHEAD_FLOOR_S = 3;
   var LOOKAHEAD_LATENCY_FALLBACK_MS = 1500;
-  var AHEAD_REQUESTS = 3;
+  var AHEAD_REQUESTS = 2;
   // How long one strip eases from the master edge toward the far edge.
   // The next band does not fade until this one has finished, but its JPEG
   // starts as soon as this strip has been received.
@@ -158,17 +158,36 @@
       }
       fromImage(blob);
     }
-    if (typeof fetch !== "function") {
-      finish(new Error("no fetch"));
+    function fromRemoteImage() {
+      // fetch() of http:// from an https receiver is mixed active content and
+      // fails immediately. An image element is mixed passive content and is
+      // the path Chromium may still allow.
+      if (typeof Image === "undefined") {
+        finish(new Error("no image"));
+        return;
+      }
+      var img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = function () { finish(null, img); };
+      img.onerror = function () { finish(new Error("image")); };
+      img.src = url;
+    }
+    var pageHttps = false;
+    try {
+      pageHttps = typeof location !== "undefined" && location && location.protocol === "https:" &&
+        /^http:\/\//i.test(String(url || ""));
+    } catch (error) { pageHttps = false; }
+    if (pageHttps || typeof fetch !== "function") {
+      fromRemoteImage();
       return;
     }
     var pendingFetch;
     try { pendingFetch = fetch(url, { mode: "cors", cache: "no-store", credentials: "omit" }); }
-    catch (error) { finish(error); return; }
+    catch (error) { fromRemoteImage(); return; }
     pendingFetch.then(function (res) {
       if (!res || !res.ok) throw new Error("lan");
       return res.blob();
-    }).then(fromBlob, function (err) { finish(err || new Error("lan")); });
+    }).then(fromBlob, function () { fromRemoteImage(); });
   }
 
   function isNewer(seq, last) {
@@ -335,7 +354,12 @@
   Player.prototype.setQueue = function (urls) {
     var entries = normalizeEntries(urls);
     var self = this;
-    if (this.session) this.session.dispose();
+    if (this.session) {
+      this.session.dispose();
+      // The phone pushes the overview and the front strip at token 1
+      // immediately after this queue message.
+      this.session.token = 0;
+    }
     this._dropStandby();
     this._clearQueues();
     this._fading = false;
@@ -915,6 +939,9 @@
     var self = this;
     loadHttpJpeg(url, 2200, function (err, img) {
       if (err || !img) {
+        // One miss means this show stays on Cast chunks. A later queue
+        // calls setLan() and tries the phone again.
+        self._lan = false;
         self._lanDead = true;
         self._diagErrors = (self._diagErrors || 0) + 1;
         self._diagNote = "LAN JPEG unreachable; using Cast messages";
@@ -2684,8 +2711,13 @@
   Player.prototype._finishSampler = function (gl, tex, width, height, source) {
     var uploadW = width;
     var uploadH = height;
+    var large = Math.max(width | 0, height | 0) > 512;
     var pot = isPow2(width) && isPow2(height);
-    if (!this._webgl2 && !pot && source) {
+    // A full-resolution strip is already CLAMP_TO_EDGE and about one screen
+    // tall. WebGL 1 and 2 both sample an NPOT texture that way with LINEAR.
+    // Padding it out to a power of two and building a mip chain copied the
+    // bitmap again and stalled the fade for a second or more.
+    if (!large && !this._webgl2 && !pot && source) {
       var padded = potPadSource(source);
       if (padded && padded.width && (padded.width !== width || padded.height !== height)) {
         try {
@@ -2711,7 +2743,7 @@
         tex._mip = true;
         tex._explicitMips = true;
       }
-    } else if (this._webgl2 || pot) {
+    } else if (!large && (this._webgl2 || pot)) {
       var mipOk = true;
       try {
         gl.generateMipmap(gl.TEXTURE_2D);
@@ -4403,11 +4435,27 @@
     return best;
   };
 
+  PhotoSession.prototype._leadToken = function (tile) {
+    // Only the first wave of a session. Later opens keep climbing so a
+    // stale token-1 chunk cannot assemble as the next photo.
+    if (!tile || (this.token | 0) > 1) return false;
+    if (tile._overview || tile._base) return true;
+    if ((tile.col | 0) !== 0) return false;
+    var stats = gridStats(this.entry && this.entry.tiles);
+    return (tile.row | 0) === Math.floor(stats.rows / 2);
+  };
+
   PhotoSession.prototype._issue = function (tile) {
     var entry = this.entry;
     if (!entry || !tile) return false;
-    this.token += 1;
-    var token = this.token;
+    var token;
+    if (this._leadToken(tile)) {
+      token = 1;
+      if (this.token < 1) this.token = 1;
+    } else {
+      this.token += 1;
+      token = this.token;
+    }
     if (!this._openTokens) this._openTokens = {};
     this._openTokens[token] = true;
     this.assemblers[tile.id] = {
@@ -4453,6 +4501,19 @@
   PhotoSession.prototype._tokenLive = function (token, gen) {
     if (gen !== this.generation) return false;
     return !!(this._openTokens && this._openTokens[token]);
+  };
+
+  PhotoSession.prototype._releaseToken = function (token) {
+    if (!this._openTokens) return;
+    // The overview and the front strip are both token 1. Finishing one
+    // must not retire the other transfer that is still open.
+    if (this.assemblers) {
+      for (var id in this.assemblers) {
+        var box = this.assemblers[id];
+        if (box && (box.token | 0) === (token | 0)) return;
+      }
+    }
+    delete this._openTokens[token];
   };
 
   PhotoSession.prototype._pieceFor = function (tile) {
@@ -4680,7 +4741,7 @@
     if (msg.token != null && (msg.token | 0) !== box.token) return;
     if (box.tile && box.tile._overview) {
       delete this.assemblers[msg.id];
-      if (this._openTokens) delete this._openTokens[box.token];
+      this._releaseToken(box.token);
       this._overviewPending = false;
       this._syncPending();
       this._requestCurrent();
@@ -4721,7 +4782,7 @@
           if (tex && self.hooks.release) self.hooks.release(tex);
           return;
         }
-        if (self._openTokens) delete self._openTokens[token];
+        self._releaseToken(token);
         if (image && self.hooks.dropImage) self.hooks.dropImage(image);
         if (!tex || tex.oom) {
           if (tex && self.hooks.release) self.hooks.release(tex);
@@ -4758,11 +4819,14 @@
         else self.loaded.push(stored);
         self._syncCursor();
         if (self.hooks.onTile) self.hooks.onTile(self, self.loaded[self.loaded.length - 1]);
+        // Refill the pipe before deciding the photo is shown, so the next
+        // strip is already requested while another one is still arriving.
+        self._requestCurrent();
         var finished = !self.entry || (self.tileOrder
           ? self.orderPos >= self.tileOrder.length
           : self.tileIndex >= self.entry.tiles.length);
         var band = self._bandLoaded();
-        if (self.pending) return;
+        if (self.pending && !band && !finished) return;
         if (finished || band) {
           var resident = self.loaded.filter(function (piece) {
             return piece.tex && !piece.tex.deferred && !piece.tex._evicted;
@@ -4793,7 +4857,6 @@
           }
           return;
         }
-        self._requestCurrent();
       }
       function startUpload() {
         var returned;
@@ -4851,7 +4914,7 @@
   };
 
   PhotoSession.prototype._skipTile = function (box, reason) {
-    if (box && this._openTokens) delete this._openTokens[box.token];
+    if (box) this._releaseToken(box.token);
     if (box && box.id) delete this.assemblers[box.id];
     this._syncPending();
     var text = String((reason && reason.message) || reason || "tile skipped");
@@ -4950,7 +5013,7 @@
       var stalled = this.assemblers[this.pending.id];
       if (stalled && stalled.tile) stalled.tile._skip = true;
       if (stalled) delete this.assemblers[stalled.id];
-      if (stalled && this._openTokens) delete this._openTokens[stalled.token];
+      if (stalled) this._releaseToken(stalled.token);
       this._syncPending();
       if (this.hooks.onLog) this.hooks.onLog("A tile stalled and was skipped");
       this._requestCurrent();
@@ -5101,7 +5164,7 @@
       var u1 = (tile.srcX + tile.srcW) / width;
       var v0 = tile.srcY / height;
       var v1 = (tile.srcY + tile.srcH) / height;
-      var contains = view.u >= u0 && view.u <= u1 && view.v >= v0 && view.v <= v1;
+      var contains = stripContainsU(u0, u1, view.u) && view.v >= v0 && view.v <= v1;
       var hits = tileInView(tile, width, height, view);
       var dist = uDist((u0 + u1) / 2, view.u) + Math.abs((v0 + v1) / 2 - view.v);
       order.push({ index: i, contains: contains, hits: hits, dist: dist });
@@ -5179,10 +5242,11 @@
     var u1 = (tile.srcX + tile.srcW) / width;
     var v0 = tile.srcY / height;
     var v1 = (tile.srcY + tile.srcH) / height;
-    if (u < u0 || u > u1 || v < v0 || v > v1) return null;
+    var uu = unwrapStripU(u, u0, u1);
+    if (uu < u0 || uu > u1 || v < v0 || v > v1) return null;
     var du = u1 - u0;
     var dv = v1 - v0;
-    var sx = du ? (u - u0) / du : 0;
+    var sx = du ? (uu - u0) / du : 0;
     var sy = dv ? (v - v0) / dv : 0;
     return {
       x: (tile.padL + sx * tile.srcW) / tile.texW,
@@ -5434,7 +5498,7 @@
       if (!tile || tile._base) continue;
       var u0 = tile.srcX / span;
       var u1 = (tile.srcX + tile.srcW) / span;
-      if (uu >= u0 - 1e-6 && uu <= u1 + 1e-6) {
+      if (stripContainsU(u0, u1, uu)) {
         // An exact seam stays with the lower column, the strip the view is
         // still in. The next column is the pan-direction neighbor.
         if (!found || (tile.col | 0) < best) best = tile.col | 0;
@@ -5494,6 +5558,7 @@
     if (!sample) return false;
     var span = Math.max(width, 1);
     var cu = (sample.srcX + sample.srcW / 2) / span;
+    cu = cu - Math.floor(cu);
     var vu = view && view.u != null ? view.u : 0.5;
     var sign = view && view.panSign < 0 ? -1 : 1;
     var lead = panLeadDeg(cu, vu, sign);
@@ -5503,7 +5568,7 @@
     var half = ((view && view.halfU) || 0.12) * 360;
     if (near <= 0 && far >= 0) return true;
     // Behind the camera only stays a master when it still clips the frustum.
-    // Ahead, start the next 120° strip while it is still short of the screen edge.
+    // Ahead, start the next 180° strip while it is still short of the screen edge.
     if (far < 0) return -far <= half + 8;
     var extra = STRIP_LOOKAHEAD_DEG;
     if (view && view.lookaheadDeg > 0) extra = Math.max(extra, Math.min(view.lookaheadDeg, 90));
@@ -5588,11 +5653,15 @@
     var w = width | 0;
     var h = height | 0;
     if (w <= 0 || h <= 0) return false;
-    // The 256×128 overview and the 512px tiles fit in one texImage2D.
-    // A 64-row strip left the south half of that overview uninitialized,
-    // and a failed texSubImage2D held the upload queue so sharp tiles never moved.
-    if (Math.max(w, h) <= 512) return false;
-    return h > 64;
+    // A decoded strip goes up in one texImage2D. Slicing it across frames
+    // left _spsUploaded false for a second and blocked every other strip.
+    return w > 4096 || h > 2048;
+  }
+
+  function stripContainsU(u0, u1, u) {
+    if (!(u1 > u0)) return false;
+    var uu = unwrapStripU(u, u0, u1);
+    return uu >= u0 - 1e-6 && uu <= u1 + 1e-6;
   }
 
   function smoothstep(edge0, edge1, x) {
@@ -6022,7 +6091,8 @@
       if (atNorth) inV = v0 <= 1e-4;
       if (atSouth) inV = v1 >= 1 - 1e-4;
       if (!inV) continue;
-      var inU = atNorth || atSouth || (uv.u >= u0 - 1e-4 && uv.u <= u1 + 1e-4);
+      var uu = unwrapStripU(uv.u, u0, u1);
+      var inU = atNorth || atSouth || (uu >= u0 - 1e-4 && uu <= u1 + 1e-4);
       if (!inU) continue;
       if (tileInView(tile, width, height, view)) return true;
     }
