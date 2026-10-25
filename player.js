@@ -829,12 +829,13 @@
    * The picture stays. Queues, the next-photo preload, and a dead Wi-Fi
    * flag are dropped so the show can ask for what it is missing again.
    */
-  Player.prototype.softReset = function (reason) {
+  Player.prototype.softReset = function (reason, detail) {
     var now = this._clock();
+    var label = (reason === "phone" ? (detail || "phone") : (reason || "auto"));
     this._softResetAt = now;
     this._lastSoftResetAt = now;
     this._softResets = (this._softResets || 0) + 1;
-    this._logSwitch("soft-reset", reason || "auto");
+    this._logSwitch("soft-reset", label);
     this._decodeQueue = [];
     this._decodeBusy = false;
     this._decoding = 0;
@@ -897,13 +898,18 @@
         if (session._requestCurrent) session._requestCurrent();
       }
     }
-    if (reason !== "phone" && window.__castSend) {
+    var doneLabel = (reason === "phone" ? (detail || "phone") : (reason || "manual"));
+    if (reason === "phone") {
+      if (typeof console !== "undefined" && console.info) {
+        console.info("tv soft-reset complete (" + doneLabel + ")");
+      }
+    } else if (window.__castSend) {
       window.__castSend({ type: "soft-reset", reason: reason || "watchdog", index: this.index });
     }
     this._diagErrors = 0;
     this._diagNote = "";
     this._sendDiag(true);
-    this._send({ type: "log", message: "tv soft-reset complete (" + (reason || "manual") + ")" });
+    this._send({ type: "log", message: "tv soft-reset complete (" + doneLabel + ")" });
     return true;
   };
 

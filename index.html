@@ -91,7 +91,7 @@
 
     function connectAim(url) {
       var safe = SpsphereCast.acceptAimSocket(url);
-      if (!safe || safe === aimUrl) return;
+      if (!safe || (safe === aimUrl && aimSocket && (aimSocket.readyState === 0 || aimSocket.readyState === 1))) return;
       aimUrl = safe;
       url = safe;
       if (aimSocket) {
@@ -120,7 +120,13 @@
         if (socket.readyState === 1) socket.send(player.encodeEcho(sample.seq, sample.ts));
       };
       socket.onclose = function () {
-        if (socket === aimSocket) aimSocket = null;
+        if (socket !== aimSocket) return;
+        aimSocket = null;
+        if (aimUrl && player && player.items && player.items.length) {
+          setTimeout(function () {
+            if (!aimSocket) connectAim(aimUrl);
+          }, 600);
+        }
       };
     }
 
@@ -267,6 +273,7 @@
         player.noteFetchError(msg);
       } else if (msg.type === "retile") {
         player.retile(msg.id, msg.item);
+        if (msg.ws) connectAim(msg.ws);
       } else if (msg.type === "fov") {
         player.setFov(msg.fov);
       } else if (msg.type === "pace") {
@@ -290,7 +297,7 @@
       } else if (msg.type === "lan") {
         player.setLan(msg.enabled !== false);
       } else if (msg.type === "soft-reset" || msg.type === "softReset") {
-        player.softReset(msg.reason || "phone");
+        player.softReset("phone", msg.reason);
       } else if (msg.type === "debug") {
         player.setDebugTint(msg.on);
       }

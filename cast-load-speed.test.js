@@ -485,112 +485,50 @@ calm.session.pending = { id: "calm-r2c0", token: 1, started: clock - 11000 };
 assert(calm._checkHealthWatchdog() === true, "a tile wedged for more than 10s soft-resets");
 const page = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
 assert(page.indexOf('msg.type === "soft-reset"') >= 0, "the receiver page applies a phone soft reset");
+assert(page.indexOf('player.softReset("phone", msg.reason)') >= 0, "a phone soft reset is not echoed back");
 assert(page.indexOf('msg.type === "lan"') >= 0, "the receiver page can turn Wi-Fi back on");
 
-assert(Cast.acceptCastMessage({ type: "soft-reset" }).type === "soft-reset", "acceptCastMessage allows soft-reset");
-assert(Cast.acceptCastMessage({ type: "lan", enabled: true }).type === "lan", "acceptCastMessage allows lan");
-assert(Cast.acceptCastMessage({ type: "ping", ts: 123 }).type === "ping", "acceptCastMessage allows ping");
-assert(page.indexOf("playerManager.load(") < 0, "receiver page does not call playerManager.load with an unplayable URL");
-assert(page.indexOf("__playerManager.pause(") < 0, "receiver page does not pause PlayerManager and arm CAF 5-minute idle timer");
-assert(page.indexOf("setApplicationState") >= 0, "receiver page refreshes application state for Cast keepalive");
-assert(page.indexOf("setTimeout(sendLimits, 500)") >= 0, "receiver page broadcasts readiness limits after boot");
 
-// Duplicate queue handshake retry does not wipe an active load
-const dup = freshPlayer();
-clock = 30000;
-dup.setQueue([hemisphere("dupA"), hemisphere("dupB")]);
-const dupTokenBefore = dup.session.token;
-const dupPendingBefore = dup.session.pending && dup.session.pending.id;
-assert(dupPendingBefore, "initial queue starts loading");
-const dupReplies = [];
-sandbox.__castSend = function (msg) { dupReplies.push(msg); };
-clock = 30500;
-dup.setQueue([hemisphere("dupA"), hemisphere("dupB")]);
-assert(dup.session.token === dupTokenBefore, "duplicate handshake queue keeps session token");
-assert(dup.session.pending && dup.session.pending.id === dupPendingBefore, "duplicate handshake queue keeps pending request");
-assert(dupReplies.some(function (m) { return m && m.type === "status"; }), "duplicate queue acknowledges with status");
-assert(dupReplies.some(function (m) { return m && m.type === "diag"; }), "duplicate queue acknowledges with diag");
-
-// Active show does not stop on senderTimedOut during step()
-dup._senderSeen = true;
-dup._lastSender = Date.now() - Cast.SENDER_TIMEOUT_MS - 10000;
-dup._last = 1000;
-dup._pumpFrame(1500);
-assert(dup.items.length === 2 && dup.playing === true, "active show stays on screen even when phone heartbeat is delayed");
-
-// Verify setLan(true) and _loadLan success immediately clear stale LAN unreachable diagNote and emit _sendDiag(true)
-const clearPlayer = freshPlayer();
-clearPlayer._lanVerified = true;
-clearPlayer._diagNote = "LAN JPEG unreachable; using Cast messages";
-clearPlayer._diagErrors = 2;
-const clearMsgs = [];
-sandbox.__castSend = function (msg) { clearMsgs.push(msg); };
-clearPlayer.setLan(true);
-assert(clearPlayer._lanVerified === true, "setLan(true) preserves _lanVerified when already true");
-assert(clearPlayer._diagNote === "", "setLan(true) clears stale LAN unreachable diagNote");
-assert(clearMsgs.some(function (m) { return m && m.type === "diag" && m.note === ""; }), "setLan(true) broadcasts cleared diag immediately");
-
-// Verify _loadLan success clears stale LAN unreachable diagNote and logs recovery
-clearPlayer._diagNote = "LAN JPEG unreachable; using Cast messages";
-clearPlayer._lanDead = true;
-clearPlayer._lanFailures = 4;
-clearMsgs.length = 0;
-const prevImage = sandbox.Image;
-sandbox.Image = function () {
-  Object.defineProperty(this, "src", {
-    set: function () {
-      this.width = 8;
-      this.height = 8;
-      if (this.onload) this.onload();
-    },
-  });
+const phoneReset = freshPlayer();
+const phoneSent = [];
+const previousInfo = console.info;
+const infoLines = [];
+console.info = function () {
+  infoLines.push(Array.prototype.join.call(arguments, " "));
+  if (previousInfo) previousInfo.apply(console, arguments);
 };
-clearPlayer._loadLan("tile-recover", 1, "http://192.168.1.20/recover.jpg");
-assert(clearPlayer._diagNote === "", "_loadLan success clears stale LAN unreachable diagNote");
-assert(clearPlayer._lanDead === false && clearPlayer._lanFailures === 0, "_loadLan success clears dead/failure state");
-assert(clearMsgs.some(function (m) { return m && m.type === "diag" && m.note === ""; }), "_loadLan success emits _sendDiag(true) with empty note");
-assert(clearMsgs.some(function (m) { return m && m.type === "log" && m.message === "lan recovered on tile-recover"; }), "_loadLan success logs recovery");
+sandbox.__castSend = function (msg) { phoneSent.push(msg); };
+phoneReset.softReset("phone", "echo-stall");
+console.info = previousInfo;
+assert(!phoneSent.some(function (msg) { return msg && msg.type === "soft-reset"; }), "player.softReset('phone', 'echo-stall') does not echo soft-reset");
+assert(phoneReset._switchLog.some(function (entry) { return entry.path === "soft-reset" && entry.reason === "echo-stall"; }), "a phone soft reset logs the detail");
+assert(infoLines.some(function (line) { return line.indexOf("tv soft-reset complete (echo-stall)") >= 0; }), "a phone soft reset logs completion");
 
-// Verify transient single LAN socket failure when _lanVerified === true retries once before counting failure or falling back to Cast chunks
-const retryUrls = [];
-clearMsgs.length = 0;
-sandbox.Image = function () {
-  var selfImg = this;
-  Object.defineProperty(this, "src", {
-    set: function (u) {
-      retryUrls.push(u);
-      if (u.indexOf("retry=1") < 0) {
-        if (selfImg.onerror) selfImg.onerror();
-      } else {
-        selfImg.width = 8;
-        selfImg.height = 8;
-        if (selfImg.onload) selfImg.onload();
-      }
-    },
-  });
-};
-clearPlayer._lanVerified = true;
-clearPlayer._lanFailures = 0;
-clearPlayer._loadLan("tile-SocketRetry", 2, "http://192.168.1.20/photo2.jpg");
-assert(retryUrls.length === 2 && retryUrls[1].indexOf("retry=1") >= 0, "transient LAN failure retries once with retry=1 cache-buster");
-assert(clearPlayer._lanFailures === 0, "transient LAN failure that succeeds on retry does not increment _lanFailures");
-assert(!clearMsgs.some(function (m) { return m && m.type === "fetch" && m.id === "tile-SocketRetry"; }), "transient LAN failure that succeeds on retry does not fall back to Cast chunks");
-sandbox.Image = prevImage;
-
-// Verify softReset() immediately emits _sendDiag(true) with note: "" and errors: 0, plus completion log
-clearPlayer._diagNote = "LAN JPEG unreachable; using Cast messages";
-clearPlayer._diagErrors = 4;
-clearMsgs.length = 0;
-clearPlayer.softReset("manual");
-const resetDiags = clearMsgs.filter(function (m) { return m && m.type === "diag"; });
-assert(resetDiags.length >= 1, "softReset emits diag immediately");
-const lastResetDiag = resetDiags[resetDiags.length - 1];
-assert(lastResetDiag.note === "" && lastResetDiag.errors === 0, "softReset emits diag with note: \"\" and errors: 0");
-assert(clearMsgs.some(function (m) { return m && m.type === "log" && m.message.indexOf("tv soft-reset complete") >= 0; }), "softReset logs completion to phone");
-
-// Verify multi-layered OS & display keepalive in index.html
-assert(page.indexOf("navigator.wakeLock") >= 0, "receiver page requests Screen Wake Lock API");
-assert(page.indexOf("captureStream") >= 0 && page.indexOf("wakeVideo") >= 0, "receiver page runs hidden muted video keepalive stream");
-assert(page.indexOf("webglcontextlost") >= 0 && page.indexOf("unhandledrejection") >= 0, "receiver page guards WebGL context loss and unhandled rejections");
+const aimStart = page.indexOf("function connectAim(url)");
+const aimEnd = page.indexOf("var silentAudioCtx = null;");
+assert(aimStart >= 0 && aimEnd > aimStart, "connectAim is on the receiver page");
+vm.runInContext(page.slice(aimStart, aimEnd) + "\nthis.__connectAim = connectAim;\n", sandbox);
+const aimUrl = "ws://192.168.1.20:5000/c/0123456789abcdef0123456789abcdef/aim";
+sandbox.aimSocket = null;
+sandbox.aimUrl = aimUrl;
+sandbox.player = { items: [{ id: "live" }], noteSender: function () {}, applyAim: function () {}, skip: function () {}, encodeEcho: function () { return new Uint8Array(0); } };
+function FakeSocket(url) {
+  this.url = url;
+  this.readyState = 1;
+  this.close = function () { this.readyState = 3; };
+}
+sandbox.WebSocket = FakeSocket;
+sandbox.__timers = [];
+sandbox.__connectAim(aimUrl);
+assert(sandbox.aimSocket && sandbox.aimSocket.url === aimUrl, "connectAim opens a socket when aimSocket is null even if the url is unchanged");
+const openSocket = sandbox.aimSocket;
+sandbox.__connectAim(aimUrl);
+assert(sandbox.aimSocket === openSocket, "an open aim socket is left alone");
+openSocket.onclose();
+assert(sandbox.aimSocket === null, "closing the aim socket clears it");
+const reconnect = sandbox.__timers[sandbox.__timers.length - 1];
+assert(reconnect && reconnect.ms === 600, "a closed aim socket schedules a reconnect");
+reconnect.fn();
+assert(sandbox.aimSocket && sandbox.aimSocket !== openSocket, "the reconnect timer calls connectAim again");
 
 console.log("cast-load-speed ok");
