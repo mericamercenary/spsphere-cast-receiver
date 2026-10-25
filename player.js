@@ -597,7 +597,7 @@
 
   Player.prototype.pause = function (held) {
     this.playing = false;
-    this._anchored = false;
+    if (!this.manual) this._anchored = false;
     if (held) this.held = true;
     if (this._standby && (this._standby.pending || (this._standby._inFlight && this._standby._inFlight() > 0))) {
       this._standby.quietStop();

@@ -272,6 +272,7 @@
       } else if (msg.type === "speed") {
         player.setSpeed(msg.speed);
       } else if (msg.type === "aim") {
+        if (aimSocket && aimSocket.readyState === 1 && msg.anchor && player.manual && player._anchored && player._lastSeq >= (msg.seq >>> 0)) return;
         if (player.applyAim(msg)) echoCast(msg.seq, msg.ts);
       } else if (msg.type === "chunk") {
         player.noteChunk(msg);
