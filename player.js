@@ -597,6 +597,7 @@
 
   Player.prototype.pause = function (held) {
     this.playing = false;
+    this._anchored = false;
     if (held) this.held = true;
     if (this._standby && (this._standby.pending || (this._standby._inFlight && this._standby._inFlight() > 0))) {
       this._standby.quietStop();
@@ -778,6 +779,24 @@
     this._sendDiag();
   };
 
+  Player.prototype._syncDiagToSession = function () {
+    var s = this.session;
+    if (!s || !s.entry) return;
+    var uploaded = 0;
+    var loaded = s.loaded || [];
+    for (var i = 0; i < loaded.length; i++) {
+      if (pieceReady(loaded[i])) uploaded += 1;
+    }
+    if (s._overviewReady) uploaded += 1;
+    var inflight = (s._inFlight ? s._inFlight() : 0) + (s._overviewPending ? 1 : 0);
+    this._diagRequested = uploaded + inflight;
+    this._diagReceived = uploaded;
+    this._diagDecoded = uploaded;
+    this._diagUploaded = uploaded;
+    this._diagErrors = 0;
+    this._diagKey = "";
+  };
+
   Player.prototype._sendDiag = function (force) {
     var msg = {
       type: "diag",
@@ -873,6 +892,7 @@
         if (pieceReady(this._tileDraw[d])) kept += 1;
       }
     }
+    this._lastSeq = -1;
     this._diagRequested = kept;
     this._diagReceived = kept;
     this._diagDecoded = kept;
@@ -1114,6 +1134,12 @@
     this._lastQueueAt = 0;
     this._shownFirstPhoto = false;
     this._diagRequested = 0;
+    this._diagReceived = 0;
+    this._diagDecoded = 0;
+    this._diagUploaded = 0;
+    this._diagErrors = 0;
+    this._diagNote = "";
+    this._diagKey = "";
     this._busy = false;
     this._markBusy();
     this.draw();
@@ -1544,6 +1570,11 @@
     var next = entry || (this.entries && this.entries[this.index]);
     this.yaw = startingYawForEntry(next);
     this._panBlend = 1;
+    if (this.manual) {
+      this._anchored = false;
+      this._tyaw = this.yaw;
+      this._vy = 0;
+    }
   };
 
   Player.prototype._skipTo = function (at) {
@@ -1605,6 +1636,7 @@
       this.session.standby = false;
       this.session.resume();
     }
+    this._syncDiagToSession();
     if (!this.manual && this.items.length) {
       this.playing = true;
       this._kick();
@@ -1813,7 +1845,7 @@
       return false;
     }
     var seq = num(msg.seq, 0) >>> 0;
-    if (!isNewer(seq, this._lastSeq)) return false;
+    if (!msg.anchor && !isNewer(seq, this._lastSeq)) return false;
     this._lastSeq = seq;
     var yaw = num(msg.yaw, 0);
     var pitch = num(msg.pitch, 0);
@@ -1881,7 +1913,9 @@
         return true;
       });
     }
+    var hadStandby = !!((this._standby && this._standby.entry) || (this._back && this._back.entry));
     this._dropStandby();
+    if (hadStandby) this._syncDiagToSession();
   };
 
   Player.prototype._pruneQueues = function () {
@@ -2973,6 +3007,7 @@
     }
     this.session = pool;
     this._tileDraw = resident;
+    this._syncDiagToSession();
     var canFade = !held && hadFrame && previous && previous !== pool && oldDraw.length;
     if (canFade) {
       // Keep the photo that is on screen and fade the new one in on top.
@@ -3115,6 +3150,7 @@
 
   Player.prototype._preloadNeighbors = function () {
     if (!this._useTiles || !this.entries || this.entries.length < 2) return;
+    if (this._controllerMode()) return;
     // The overview makes session.shown true after the first strip. The next
     // photo still waits until this one has nothing left to request.
     if (!this._awaitingSwap && this._activeBusy()) return;
@@ -3130,6 +3166,7 @@
 
   Player.prototype._preloadBack = function () {
     if (!this._useTiles || !this.entries || this.entries.length < 2) return;
+    if (this._controllerMode()) return;
     var prevAt = stepIndex(this.index, this.entries.length, -1, true);
     var nextAt = stepIndex(this.index, this.entries.length, 1, true);
     if (prevAt == null || prevAt === nextAt) return;

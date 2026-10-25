@@ -116,8 +116,9 @@
         }
         var sample = SpsphereCast.decodeAim(event.data);
         if (!sample) return;
-        player.applyAim(sample);
-        if (socket.readyState === 1) socket.send(player.encodeEcho(sample.seq, sample.ts));
+        if (player.applyAim(sample) && socket.readyState === 1) {
+          socket.send(player.encodeEcho(sample.seq, sample.ts));
+        }
       };
       socket.onclose = function () {
         if (socket !== aimSocket) return;
@@ -253,6 +254,11 @@
       } else if (msg.type === "previous") {
         player.previous();
       } else if (msg.type === "stop") {
+        aimUrl = "";
+        if (aimSocket) {
+          try { aimSocket.close(); } catch (e) {}
+          aimSocket = null;
+        }
         player.stop();
         if (window.__idle) window.__idle.stop();
       } else if (msg.type === "heartbeat" || msg.type === "ping") {

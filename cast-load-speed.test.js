@@ -531,4 +531,50 @@ assert(reconnect && reconnect.ms === 600, "a closed aim socket schedules a recon
 reconnect.fn();
 assert(sandbox.aimSocket && sandbox.aimSocket !== openSocket, "the reconnect timer calls connectAim again");
 
+
+const multiDiag = freshPlayer();
+clock = 30000;
+multiDiag.setQueue([hemisphere("m1"), hemisphere("m2"), hemisphere("m3"), hemisphere("m4"), hemisphere("m5")]);
+for (let step = 0; step < 5; step++) {
+  while (multiDiag.session && multiDiag.session.pending) {
+    stamp(multiDiag.session);
+    clock += STRIP_MS;
+    if (!deliverOne(multiDiag.session)) break;
+  }
+  multiDiag._feedPreload();
+  while (multiDiag._standby && multiDiag._standby.pending) {
+    stamp(multiDiag._standby);
+    clock += STRIP_MS;
+    if (!deliverOne(multiDiag._standby)) break;
+  }
+  assert(multiDiag._checkHealthWatchdog(clock) === false, "photo " + step + " + standby never triggers a false request-storm, requested=" + multiDiag._diagRequested);
+  if (step < 4) multiDiag.next();
+}
+assert(multiDiag._diagRequested <= 18, "switching across 5 photos scopes _diagRequested to the active photo, got " + multiDiag._diagRequested);
+
+multiDiag.applyAim({ seq: 50, yaw: 45, pitch: 10, roll: 0, fov: 75, anchor: true, ts: clock });
+assert(multiDiag._standby == null, "controller aim drops standby");
+assert(multiDiag._diagRequested <= 11, "dropping standby syncs _diagRequested back to the active photo, got " + multiDiag._diagRequested);
+const fetchesDuringController = multiDiag.fetches.length;
+multiDiag._presentShown({
+  id: multiDiag.session.entry.id,
+  width: multiDiag.session.entry.width,
+  height: multiDiag.session.entry.height,
+  tiles: multiDiag.session.loaded.slice(),
+});
+assert(multiDiag._standby == null && multiDiag.fetches.length === fetchesDuringController, "_presentShown does not start standby preload while in controller mode");
+assert(multiDiag.applyAim({ seq: 50, yaw: 60, pitch: 5, roll: 0, fov: 75, anchor: true, ts: clock }) === true, "resynced anchor aim with same seq is accepted");
+assert(multiDiag.applyAim({ seq: 1, yaw: 75, pitch: 0, roll: 0, fov: 75, anchor: true, ts: clock }) === true, "new session anchor aim with lower seq is accepted");
+assert(multiDiag.applyAim({ seq: 1, yaw: 90, pitch: 0, roll: 0, fov: 75, anchor: false, ts: clock }) === false, "non-anchor duplicate seq is still rejected");
+
+multiDiag.stop();
+assert(
+  multiDiag._diagRequested === 0 &&
+  multiDiag._diagReceived === 0 &&
+  multiDiag._diagDecoded === 0 &&
+  multiDiag._diagUploaded === 0 &&
+  multiDiag._diagErrors === 0,
+  "stop() zeroes all diag counters",
+);
+
 console.log("cast-load-speed ok");
