@@ -469,7 +469,8 @@
     // keeps the flag the queue message just set. The probe starts over.
     this._lanDead = false;
     this._lanFailures = 0;
-    this._lanVerified = false;
+    this._lanDeadSince = 0;
+    this._lanVerified = !!this._lanVerified;
       this._markBusy();
       this._paintMark();
       if (this.items.length) this._openCurrent();
@@ -622,10 +623,14 @@
     else el.classList.remove("on");
   };
 
+  Player.prototype._send = function (msg) {
+    if (window.__castSend) window.__castSend(msg);
+  };
+
   Player.prototype._reportTv = function (message) {
     if (!message) return;
     warn(message);
-    if (window.__castSend) window.__castSend({ type: "log", message: String(message) });
+    this._send({ type: "log", message: String(message) });
   };
 
   Player.prototype._clock = function () {
@@ -741,9 +746,30 @@
     this._restampFocus(now);
   };
 
+  Player.prototype._finishSession = function (session) {
+    var s = session || this.session;
+    var entry = s && s.entry;
+    var total = (entry && entry.tiles) ? entry.tiles.length : 0;
+    var uploaded = 0;
+    if (s && s.loaded && s.loaded.length) {
+      for (var i = 0; i < s.loaded.length; i++) {
+        if (pieceReady(s.loaded[i])) uploaded += 1;
+      }
+    } else {
+      uploaded = this._diagUploaded || 0;
+    }
+    if ((total <= 0 || uploaded >= total) && this._diagNote === "LAN JPEG unreachable; using Cast messages" && !this._lanDead) {
+      this._diagNote = "";
+      this._sendDiag(true);
+      return true;
+    }
+    return false;
+  };
+
   Player.prototype._noteUploaded = function (tex) {
     if (tex && (tex._spsUploaded || tex._mip === true) && !tex.deferred && !tex.oom && !tex._evicted) {
       this._diagUploaded = (this._diagUploaded || 0) + 1;
+      if (this._finishSession(this.session)) return;
     } else {
       this._diagErrors = (this._diagErrors || 0) + 1;
       this._diagNote = "texture upload failed";
@@ -839,7 +865,7 @@
     this._lanFailures = 0;
     this._lanDeadSince = 0;
     this._lanDeadAt = 0;
-    this._lanVerified = false;
+    this._lanVerified = !!this._lanVerified;
     var kept = 0;
     if (this._tileDraw) {
       for (var d = 0; d < this._tileDraw.length; d++) {
@@ -851,7 +877,7 @@
     this._diagDecoded = kept;
     this._diagUploaded = kept;
     this._diagErrors = 0;
-    this._diagNote = "Soft-reset: restored normal mode";
+    this._diagNote = "";
     this._diagKey = "";
     var session = this.session;
     if (session) {
@@ -874,7 +900,10 @@
     if (reason !== "phone" && window.__castSend) {
       window.__castSend({ type: "soft-reset", reason: reason || "watchdog", index: this.index });
     }
-    this._sendDiag(false);
+    this._diagErrors = 0;
+    this._diagNote = "";
+    this._sendDiag(true);
+    this._send({ type: "log", message: "tv soft-reset complete (" + (reason || "manual") + ")" });
     return true;
   };
 
@@ -1124,10 +1153,16 @@
 
   Player.prototype.setLan = function (on) {
     this._lan = !!on;
+    this._lanEnabled = !!on;
     this._lanDead = false;
     this._lanFailures = 0;
     this._lanDeadSince = 0;
-    this._lanVerified = false;
+    if (!on) {
+      this._lanVerified = false;
+    } else if (this._diagNote === "LAN JPEG unreachable; using Cast messages") {
+      this._diagNote = "";
+      this._sendDiag(true);
+    }
   };
 
   Player.prototype._urlFor = function (id) {
@@ -1160,36 +1195,63 @@
 
   Player.prototype._loadLan = function (id, token, url) {
     var self = this;
+    var tileId = (id && typeof id === "object") ? id.id : id;
+    var tileUrl = url || ((id && typeof id === "object") ? id.url : "");
     var probing = !self._lanVerified;
-    loadHttpJpeg(url, probing ? LAN_PROBE_TIMEOUT_MS : LAN_TIMEOUT_MS, function (err, img) {
-      if (err || !img) {
-        // This strip goes over Cast. LAN stays up until four misses in a row,
-        // so one hiccup does not drag the rest of the photo through the phone.
-        self._lanFailures = (self._lanFailures || 0) + 1;
-        if (self._lanFailures >= LAN_FAIL_LIMIT) {
-          self._lanDead = true;
-          if (!self._lanDeadSince) self._lanDeadSince = self._clock();
-          self._diagNote = "LAN JPEG unreachable; using Cast messages";
-          self._reportTv(self._diagNote);
+    var retried = false;
+    function attempt(targetUrl) {
+      loadHttpJpeg(targetUrl, probing ? LAN_PROBE_TIMEOUT_MS : LAN_TIMEOUT_MS, function (err, img) {
+        if (err || !img) {
+          try { if (img && img.close) img.close(); } catch (error) {}
+          if (self._lanVerified && !retried) {
+            retried = true;
+            var base = String(tileUrl || "");
+            var retryUrl = base + (base.indexOf("?") >= 0 ? "&" : "?") + "retry=1";
+            attempt(retryUrl);
+            return;
+          }
+          // This strip goes over Cast. LAN stays up until four misses in a row,
+          // so one hiccup does not drag the rest of the photo through the phone.
+          self._lanFailures = (self._lanFailures || 0) + 1;
+          if (self._lanFailures >= LAN_FAIL_LIMIT) {
+            self._lanDead = true;
+            if (!self._lanDeadSince) self._lanDeadSince = self._clock();
+            self._diagNote = "LAN JPEG unreachable; using Cast messages";
+            self._reportTv(self._diagNote);
+          }
+          self._diagErrors = (self._diagErrors || 0) + 1;
+          self._send({
+            type: "log",
+            message: "lan fetch failed id=" + tileId + " failures=" + self._lanFailures + " dead=" + self._lanDead + " url=" + tileUrl,
+          });
+          self._send({ type: "fetch", id: tileId, token: token, reason: "lan" });
+          self._sendDiag();
+          return;
         }
-        self._diagErrors = (self._diagErrors || 0) + 1;
-        try { if (img && img.close) img.close(); } catch (error) {}
-        if (window.__castSend) window.__castSend({ type: "fetch", id: id, token: token, reason: "lan" });
-        return;
-      }
-      self._lanVerified = true;
-      self._lanFailures = 0;
-      self._lanDead = false;
-      self._lanDeadSince = 0;
-      var pool = self._poolWithToken(id, token);
-      if (!pool || !pool.noteImage(id, token, img)) {
-        try { if (img.close) img.close(); } catch (error) {}
-        return;
-      }
-      self._diagReceived = (self._diagReceived || 0) + 1;
-      self._diagDecoded = (self._diagDecoded || 0) + 1;
-      self._sendDiag();
-    });
+        var hadTrouble = !!(self._lanDead || (self._lanFailures || 0) > 0);
+        var hadUnreachableNote = self._diagNote === "LAN JPEG unreachable; using Cast messages";
+        self._lanVerified = true;
+        self._lanFailures = 0;
+        self._lanDead = false;
+        self._lanDeadSince = 0;
+        if (hadUnreachableNote) {
+          self._diagNote = "";
+          self._sendDiag(true);
+        }
+        if (hadTrouble) {
+          self._send({ type: "log", message: "lan recovered on " + tileId });
+        }
+        var pool = self._poolWithToken(tileId, token);
+        if (!pool || !pool.noteImage(tileId, token, img)) {
+          try { if (img.close) img.close(); } catch (error) {}
+          return;
+        }
+        self._diagReceived = (self._diagReceived || 0) + 1;
+        self._diagDecoded = (self._diagDecoded || 0) + 1;
+        self._sendDiag(hadUnreachableNote);
+      });
+    }
+    attempt(tileUrl);
   };
 
   Player.prototype.noteSender = function (now) {
@@ -2074,6 +2136,7 @@
         lostSelf._resident = [];
         lostSelf._gpuBytes = 0;
         warn("webgl context lost");
+        lostSelf._send({ type: "log", message: "webglcontextlost" });
       }, false);
       this.canvas.addEventListener("webglcontextrestored", function () {
         lostSelf._glLost = false;
@@ -2082,6 +2145,7 @@
         lostSelf._lodHold = null;
         lostSelf._promoting = false;
         warn("webgl context restored");
+        lostSelf._send({ type: "log", message: "webglcontextrestored" });
         if (lostSelf.session && lostSelf.session.loaded) {
           lostSelf.session.loaded.forEach(function (piece) {
             var payload = piece.payload || (piece.tex && piece.tex._spsPayload);

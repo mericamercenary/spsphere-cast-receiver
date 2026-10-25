@@ -6,7 +6,7 @@
   <title></title>
   <style>
     html, body { margin: 0; height: 100%; background: #0b0d10; overflow: hidden; }
-    canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; z-index: 1; }
+    canvas#view { position: fixed; inset: 0; width: 100%; height: 100%; display: block; z-index: 1; }
     cast-media-player, touch-controls, tv-overlay {
       display: none !important;
       visibility: hidden !important;
@@ -45,14 +45,43 @@
   <canvas id="view"></canvas>
   <div id="mark" hidden><img class="logo" src="logo.png" alt="" /></div>
   <div id="busy"></div>
+  <video id="wakeVideo" muted loop playsinline autoplay width="2" height="2" style="position:fixed;left:-99px;top:-99px;width:2px;height:2px;opacity:0.01;pointer-events:none"></video>
   <script src="player.js"></script>
   <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
   <script>
     var NAMESPACE = "urn:x-cast:com.cameron.viewer360";
-    var player = SpsphereCast.create(document.getElementById("view"));
+    var viewCanvas = document.getElementById("view");
+    var player = SpsphereCast.create(viewCanvas);
     window.__player = player;
     var aimSocket = null;
     var aimUrl = "";
+
+    function sendLog(message) {
+      try {
+        if (window.__castSend) window.__castSend({ type: "log", message: String(message) });
+      } catch (e) {}
+    }
+
+    window.addEventListener("error", function (event) {
+      var detail = event && (event.message || (event.error && event.error.message)) || "unknown";
+      sendLog("window error: " + detail);
+    });
+    window.addEventListener("unhandledrejection", function (event) {
+      var reason = event && event.reason;
+      var detail = reason && (reason.message || String(reason)) || "unknown";
+      sendLog("unhandledrejection: " + detail);
+    });
+
+    if (viewCanvas && viewCanvas.addEventListener) {
+      viewCanvas.addEventListener("webglcontextlost", function (event) {
+        if (event && event.preventDefault) event.preventDefault();
+        sendLog("webglcontextlost");
+      }, false);
+      viewCanvas.addEventListener("webglcontextrestored", function () {
+        sendLog("webglcontextrestored");
+        if (player && player.softReset) player.softReset("webgl-restored");
+      }, false);
+    }
 
     function echoCast(seq, ts) {
       try {
@@ -96,12 +125,58 @@
     }
 
     var silentAudioCtx = null;
+    var wakeLockSentinel = null;
+    var wakeCanvas = null;
+    var wakeCtx = null;
+    var wakeStream = null;
+    var wakeTick = 0;
+
+    function requestScreenWakeLock() {
+      try {
+        if (navigator && navigator.wakeLock && typeof navigator.wakeLock.request === "function") {
+          if (!wakeLockSentinel || wakeLockSentinel.released === true) {
+            navigator.wakeLock.request("screen").then(function (sentinel) {
+              wakeLockSentinel = sentinel;
+            }).catch(function () {});
+          }
+        }
+      } catch (e) {}
+    }
+
+    function pumpWakeVideo() {
+      try {
+        var wakeVideo = document.getElementById("wakeVideo");
+        if (!wakeVideo) return;
+        if (!wakeCanvas && document.createElement) {
+          wakeCanvas = document.createElement("canvas");
+          wakeCanvas.width = 2;
+          wakeCanvas.height = 2;
+          wakeCtx = wakeCanvas.getContext("2d");
+        }
+        if (wakeCtx) {
+          wakeTick = (wakeTick + 1) & 1;
+          wakeCtx.fillStyle = wakeTick ? "#0b0d10" : "#0c0e11";
+          wakeCtx.fillRect(0, 0, 2, 2);
+        }
+        if (!wakeStream && wakeCanvas && typeof wakeCanvas.captureStream === "function") {
+          wakeStream = wakeCanvas.captureStream(1);
+          wakeVideo.srcObject = wakeStream;
+        }
+        if (wakeVideo.paused && typeof wakeVideo.play === "function") {
+          var p = wakeVideo.play();
+          if (p && typeof p.catch === "function") p.catch(function () {});
+        }
+      } catch (e) {}
+    }
+
     function keepReceiverAwake() {
       try {
         if (context && context.setApplicationState) {
           context.setApplicationState("SPSphere 360");
         }
       } catch (e) {}
+      requestScreenWakeLock();
+      pumpWakeVideo();
       try {
         var AudioCtx = window.AudioContext || window.webkitAudioContext;
         if (AudioCtx && !silentAudioCtx) {
@@ -118,6 +193,12 @@
         }
       } catch (e) {}
     }
+
+    document.addEventListener("visibilitychange", function () {
+      var state = document.visibilityState || "unknown";
+      sendLog("visibilitychange: " + state);
+      if (state === "visible") keepReceiverAwake();
+    });
 
     function handle(msg) {
       var accepted = SpsphereCast.acceptCastMessage(msg);
@@ -194,8 +275,10 @@
         player.setSnapFadeMs(msg.ms);
       } else if (msg.type === "hello") {
         if (player && player.noteSender) player.noteSender(Date.now());
+        keepReceiverAwake();
         sendLimits();
         sendCaps();
+        sendLog("receiver ready (hello ack)");
         if (player && player.items && player.items.length) {
           window.__castSend({
             type: "status",
@@ -276,29 +359,53 @@
       }
     } catch (e) {}
     try {
-      context.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, function () {
-        var senders = [];
-        try { senders = context.getSenders() || []; } catch (e) {}
-        var armed = SpsphereCast.armSenderGrace(
-          player._disconnectGrace,
-          player._lastSender,
-          Date.now(),
-          senders.length,
-          SpsphereCast.SENDER_TIMEOUT_MS
-        );
-        if (!player._disconnectGrace && armed) {
-          if (player._logSwitch) player._logSwitch("sender-disconnect", "grace");
+      var sysEvents = cast.framework.system && cast.framework.system.EventType;
+      if (sysEvents) {
+        if (sysEvents.SENDER_CONNECTED) {
+          context.addEventListener(sysEvents.SENDER_CONNECTED, function (event) {
+            keepReceiverAwake();
+            sendLog("sender connected: " + (event && event.senderId || "unknown"));
+          });
         }
-        player._disconnectGrace = armed;
-      });
+        if (sysEvents.SENDER_DISCONNECTED) {
+          context.addEventListener(sysEvents.SENDER_DISCONNECTED, function (event) {
+            var reason = event && (event.reason || event.senderId) || "unknown";
+            sendLog("sender disconnected: " + reason);
+            var senders = [];
+            try { senders = context.getSenders() || []; } catch (e) {}
+            var armed = SpsphereCast.armSenderGrace(
+              player._disconnectGrace,
+              player._lastSender,
+              Date.now(),
+              senders.length,
+              SpsphereCast.SENDER_TIMEOUT_MS
+            );
+            if (!player._disconnectGrace && armed) {
+              if (player._logSwitch) player._logSwitch("sender-disconnect", "grace");
+            }
+            player._disconnectGrace = armed;
+          });
+        }
+        if (sysEvents.SHUTDOWN) {
+          context.addEventListener(sysEvents.SHUTDOWN, function () {
+            sendLog("systemshutdown");
+          });
+        }
+        if (sysEvents.STANDBY_CHANGED) {
+          context.addEventListener(sysEvents.STANDBY_CHANGED, function (event) {
+            sendLog("standby: " + (event && event.isStandby));
+          });
+        }
+      }
     } catch (e) {}
     context.start(options);
     keepReceiverAwake();
+    sendLog("receiver boot");
     window.__idle = new SpsphereCast.IdleGuard(function () { return Date.now(); });
     var lastAppStateAt = Date.now();
     setInterval(function () {
       var now = Date.now();
-      if (now - lastAppStateAt >= 30000) {
+      if (now - lastAppStateAt >= 15000) {
         lastAppStateAt = now;
         keepReceiverAwake();
       }

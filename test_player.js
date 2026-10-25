@@ -242,10 +242,14 @@ for (let missN = 1; missN <= 3; missN++) {
   const beforeMiss = lanTimers.length;
   miss._loadLan("miss-" + missN, missN + 1, "http://10.1.1.1/m" + missN + ".jpg");
   lanTimers.slice(beforeMiss).filter(function (item) { return item.ms === Cast.LAN_TIMEOUT_MS; }).pop().fn();
+  assert(miss._lanFailures === missN - 1, "verified LAN retries once before counting miss " + missN);
+  lanTimers.slice(beforeMiss).filter(function (item) { return item.ms === Cast.LAN_TIMEOUT_MS; }).pop().fn();
   assert(miss._lanDead === false, "miss " + missN + " on a proven LAN stays on Wi-Fi");
 }
 const beforeFourth = lanTimers.length;
 miss._loadLan("miss-4", 5, "http://10.1.1.1/m4.jpg");
+lanTimers.slice(beforeFourth).filter(function (item) { return item.ms === Cast.LAN_TIMEOUT_MS; }).pop().fn();
+assert(miss._lanFailures === 3 && miss._lanDead === false, "fourth verified LAN miss retries once before killing LAN");
 lanTimers.slice(beforeFourth).filter(function (item) { return item.ms === Cast.LAN_TIMEOUT_MS; }).pop().fn();
 assert(miss._lanFailures === 4 && miss._lanDead === true && miss._lan === true, "the fourth proven miss drops LAN fetches");
 
