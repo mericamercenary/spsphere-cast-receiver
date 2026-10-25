@@ -1106,10 +1106,20 @@
   };
 
   Player.prototype.stop = function () {
+    this.halt();
     this.playing = false;
+    this.manual = false;
     this.held = false;
+    this._userAimed = false;
+    this._controllerHold = false;
     this._panBlend = 1;
     this._mark();
+    this.items = [];
+    this.entries = [];
+    this.ids = [];
+    this.images = [];
+    this.poses = [];
+    this._tex = [];
     this.index = 0;
     this.fromIndex = 0;
     this.phase = "pan";
@@ -1130,6 +1140,10 @@
     this._awaitingSwap = false;
     this._awaitIndex = null;
     this._tileDraw = [];
+    this._presented = false;
+    this._intro = "off";
+    this._introAlpha = 0;
+    this._introSince = 0;
     this._freeGpu();
     this._lastQueueAt = 0;
     this._shownFirstPhoto = false;

@@ -207,6 +207,26 @@
       if (state === "visible") keepReceiverAwake();
     });
 
+    function closeReceiver(reason) {
+      sendLog("closing receiver: " + (reason || "stop"));
+      aimUrl = "";
+      if (aimSocket) {
+        try { aimSocket.close(); } catch (e) {}
+        aimSocket = null;
+      }
+      try {
+        if (wakeVideo && typeof wakeVideo.pause === "function") wakeVideo.pause();
+      } catch (e) {}
+      player.stop();
+      if (window.__idle) window.__idle.stop();
+      try {
+        if (context && typeof context.stop === "function") context.stop();
+      } catch (e) {}
+      try {
+        if (typeof window.close === "function") window.close();
+      } catch (e) {}
+    }
+
     function handle(msg) {
       var accepted = SpsphereCast.acceptCastMessage(msg);
       if (!accepted) return;
@@ -254,13 +274,7 @@
       } else if (msg.type === "previous") {
         player.previous();
       } else if (msg.type === "stop") {
-        aimUrl = "";
-        if (aimSocket) {
-          try { aimSocket.close(); } catch (e) {}
-          aimSocket = null;
-        }
-        player.stop();
-        if (window.__idle) window.__idle.stop();
+        closeReceiver("sender-stop");
       } else if (msg.type === "heartbeat" || msg.type === "ping") {
         if (player && player.noteSender) player.noteSender(Date.now());
         if (window.__idle) {
@@ -387,6 +401,14 @@
             sendLog("sender disconnected: " + reason);
             var senders = [];
             try { senders = context.getSenders() || []; } catch (e) {}
+            var explicitStop = String(reason).toLowerCase().indexOf("requested_by_sender") >= 0 ||
+              (typeof cast !== "undefined" && cast.framework && cast.framework.system &&
+               cast.framework.system.DisconnectReason &&
+               event && event.reason === cast.framework.system.DisconnectReason.REQUESTED_BY_SENDER);
+            if (explicitStop && senders.length === 0) {
+              closeReceiver("requested-by-sender");
+              return;
+            }
             var armed = SpsphereCast.armSenderGrace(
               player._disconnectGrace,
               player._lastSender,
@@ -425,11 +447,14 @@
       }
       var guard = window.__idle;
       if (!guard) return;
+      var activeSenders = [];
+      try { activeSenders = (context && context.getSenders && context.getSenders()) || []; } catch (e) {}
+      if (activeSenders.length === 0 && player._disconnectGrace && now - player._disconnectGrace > SpsphereCast.SENDER_TIMEOUT_MS) {
+        player.onSenderGone("sender-disconnected");
+        closeReceiver("sender-disconnected");
+        return;
+      }
       if (!player.items || !player.items.length) {
-        if (player._disconnectGrace && now - player._disconnectGrace > SpsphereCast.SENDER_TIMEOUT_MS) {
-          player.onSenderGone("sender-disconnected");
-          return;
-        }
         if (player.senderTimedOut(now)) {
           player.onSenderGone("heartbeat-timeout");
           return;
