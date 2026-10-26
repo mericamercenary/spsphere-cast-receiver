@@ -505,17 +505,61 @@
     this._preloadAround();
   };
 
+  Player.prototype._dropBaseForId = function (id) {
+    var key = String(id);
+    if (!this._bases || !this._bases[key]) return;
+    var piece = this._bases[key];
+    delete this._bases[key];
+    if (piece && piece.tex) this._deleteTex(piece.tex);
+    if (this._resident && piece && piece.tile) {
+      var baseId = piece.tile.id;
+      for (var i = this._resident.length - 1; i >= 0; i--) {
+        var r = this._resident[i];
+        if (r && (r.id === baseId || r.tex === piece.tex)) {
+          this._resident.splice(i, 1);
+        }
+      }
+    }
+  };
+
   Player.prototype.removeId = function (id) {
-    var at = this.ids.indexOf(String(id));
+    var targetId = String(id);
+    var at = this.ids.indexOf(targetId);
     if (at < 0 || this.ids.length < 2) return false;
     var current = this.ids[this.index];
+    var awaitId = (this._awaitingSwap && this._awaitIndex != null && this.ids[this._awaitIndex] != null)
+      ? this.ids[this._awaitIndex]
+      : null;
+    if (this._tex && this._tex[at]) this._deleteTex(this._tex[at]);
+    this._dropBaseForId(targetId);
+    if (this._standby && this._standby.entry && String(this._standby.entry.id) === targetId) {
+      this._standby.dispose();
+      this._standby = null;
+    }
+    if (this._back && this._back.entry && String(this._back.entry.id) === targetId) {
+      this._back.dispose();
+      this._back = null;
+    }
     this.ids.splice(at, 1);
     this.items.splice(at, 1);
     this.images.splice(at, 1);
     this.poses.splice(at, 1);
     this._tex.splice(at, 1);
     if (this.entries) this.entries.splice(at, 1);
-    if (current === String(id)) {
+    if (awaitId != null) {
+      if (awaitId === targetId) {
+        this._awaitingSwap = false;
+        this._awaitIndex = null;
+      } else {
+        var nextAwait = this.ids.indexOf(awaitId);
+        if (nextAwait >= 0) this._awaitIndex = nextAwait;
+        else {
+          this._awaitingSwap = false;
+          this._awaitIndex = null;
+        }
+      }
+    }
+    if (current === targetId) {
       this.index = Math.min(at, this.ids.length - 1);
       this.itemDegrees = 0;
       if (this._useTiles) this._openCurrent();
@@ -537,6 +581,9 @@
     to = Math.max(0, Math.min(this.ids.length - 1, to | 0));
     if (from === to) return true;
     var current = this.ids[this.index];
+    var awaitId = (this._awaitingSwap && this._awaitIndex != null && this.ids[this._awaitIndex] != null)
+      ? this.ids[this._awaitIndex]
+      : null;
     function shift(list) {
       var item = list.splice(from, 1)[0];
       list.splice(to, 0, item);
@@ -548,6 +595,14 @@
     shift(this._tex);
     if (this.entries) shift(this.entries);
     this.index = this.ids.indexOf(current);
+    if (awaitId != null) {
+      var nextAwait = this.ids.indexOf(awaitId);
+      if (nextAwait >= 0) this._awaitIndex = nextAwait;
+      else {
+        this._awaitingSwap = false;
+        this._awaitIndex = null;
+      }
+    }
     this.fromIndex = this.index;
     this.phase = "pan";
     this.fadeMs = 0;

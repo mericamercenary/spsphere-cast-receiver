@@ -451,4 +451,19 @@ handoff.session.loaded.forEach(function (piece) {
   assert(handoff._revealOf(piece) === 1, "a preloaded strip is fully sharp on the first frame, got " + handoff._revealOf(piece));
 });
 
+// Fortification regression: removeId and moveId while _awaitingSwap is active
+{
+  const q = Cast.create(bareCanvas());
+  q.setQueue([rowsPhoto("p1"), rowsPhoto("p2"), rowsPhoto("p3")]);
+  q.gotoId("p3");
+  assert(q._awaitingSwap === true && q._awaitIndex === 2, "gotoId(p3) arms swap at index 2");
+  q.removeId("p2");
+  assert(q._awaitingSwap === true && q._awaitIndex === 1, "removing p2 shifts _awaitIndex for p3 to 1, got " + q._awaitIndex);
+  q.moveId("p3", 0);
+  assert(q._awaitingSwap === true && q._awaitIndex === 0, "moving p3 to 0 updates _awaitIndex to 0, got " + q._awaitIndex);
+  q.removeId("p3");
+  assert(q._awaitingSwap === false && q._awaitIndex === null, "removing awaited photo cancels _awaitingSwap");
+  assert(!q._bases || !q._bases.p3, "removing p3 cleans up _bases.p3");
+}
+
 console.log("test_player ok");
