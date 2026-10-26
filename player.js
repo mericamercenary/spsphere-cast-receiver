@@ -650,14 +650,20 @@
     this._kick();
   };
 
+  Player.prototype._isAwaitedPool = function (pool) {
+    if (!this._awaitingSwap || this._awaitIndex == null || !pool || !pool.entry) return false;
+    var want = this.entries && this.entries[this._awaitIndex];
+    return !!(want && String(pool.entry.id) === String(want.id));
+  };
+
   Player.prototype.pause = function (held) {
     this.playing = false;
     if (!this.manual) this._anchored = false;
     if (held) this.held = true;
-    if (this._standby && (this._standby.pending || (this._standby._inFlight && this._standby._inFlight() > 0))) {
+    if (this._standby && !this._isAwaitedPool(this._standby) && (this._standby.pending || (this._standby._inFlight && this._standby._inFlight() > 0))) {
       this._standby.quietStop();
     }
-    if (this._back && (this._back.pending || (this._back._inFlight && this._back._inFlight() > 0))) {
+    if (this._back && !this._isAwaitedPool(this._back) && (this._back.pending || (this._back._inFlight && this._back._inFlight() > 0))) {
       this._back.quietStop();
     }
     if (this._pruneQueues) this._pruneQueues();
@@ -1961,11 +1967,14 @@
   };
 
   Player.prototype._pausePreload = function () {
-    if (this._standby && this._standby.quietStop) this._standby.quietStop();
-    if (this._back && this._back.quietStop) this._back.quietStop();
+    var keepStandby = this._isAwaitedPool(this._standby);
+    var keepBack = this._isAwaitedPool(this._back);
+    if (this._standby && !keepStandby && this._standby.quietStop) this._standby.quietStop();
+    if (this._back && !keepBack && this._back.quietStop) this._back.quietStop();
+    var keepAwait = keepStandby || keepBack;
     if (this._uploadQueue && this._uploadQueue.length) {
       this._uploadQueue = this._uploadQueue.filter(function (job) {
-        if (!job || job.standby || job.cancelled || (job.live && !job.live())) {
+        if (!job || (job.standby && !keepAwait) || job.cancelled || (job.live && !job.live())) {
           if (job && job.done) job.done(null);
           return false;
         }
@@ -1974,7 +1983,7 @@
     }
     if (this._decodeQueue && this._decodeQueue.length) {
       this._decodeQueue = this._decodeQueue.filter(function (job) {
-        if (!job || job.standby || job.cancelled || (job.live && !job.live())) {
+        if (!job || (job.standby && !keepAwait) || job.cancelled || (job.live && !job.live())) {
           if (job) job.cancelled = true;
           if (job && job.done) job.done(new Error("cancelled"));
           return false;
@@ -1982,8 +1991,15 @@
         return true;
       });
     }
-    var hadStandby = !!((this._standby && this._standby.entry) || (this._back && this._back.entry));
-    this._dropStandby();
+    var hadStandby = !!((this._standby && !keepStandby && this._standby.entry) || (this._back && !keepBack && this._back.entry));
+    if (!keepStandby && this._standby) {
+      this._standby.dispose();
+      this._standby = null;
+    }
+    if (!keepBack && this._back) {
+      this._back.dispose();
+      this._back = null;
+    }
     if (hadStandby) this._syncDiagToSession();
   };
 
@@ -2081,7 +2097,7 @@
     this._releaseOutsideBand();
     if (this.session && this.session.entry) this.session._requestCurrent();
     var holdStandby = !this._awaitingSwap && this._activeBusy();
-    if (!holdStandby && !this._controllerMode() && this._standby && this._standby.entry) {
+    if (!holdStandby && (!this._controllerMode() || this._awaitingSwap) && this._standby && this._standby.entry) {
       if (this._awaitingSwap) this._openIncoming(this._standby);
       this._standby._requestCurrent();
     }
@@ -3214,7 +3230,15 @@
     this._switchTick = this._switchTick || nowMs();
     this._ensureIncoming(entry);
     var incoming = this._incomingPool(entry.id);
-    if (incoming && (incoming.budgetFull || incoming.preloadCapped)) this._considerHold(incoming);
+    if (incoming) {
+      this._openIncoming(incoming);
+      if (!incoming.pending) incoming._requestCurrent();
+      if (swapReady(incoming)) {
+        this._commitIndex(this.index, incoming);
+        return;
+      }
+      if ((incoming.budgetFull || incoming.preloadCapped) && !this._holdFrame) this._considerHold(incoming);
+    }
   };
 
   Player.prototype._preloadNeighbors = function () {

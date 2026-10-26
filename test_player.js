@@ -466,4 +466,22 @@ handoff.session.loaded.forEach(function (piece) {
   assert(!q._bases || !q._bases.p3, "removing p3 cleans up _bases.p3");
 }
 
+// Round 2 fortification regression: applyAim / pause while _awaitingSwap is active must not drop _standby
+{
+  const q = Cast.create(bareCanvas());
+  install(q);
+  q.setQueue([rowsPhoto("p1"), rowsPhoto("p2"), rowsPhoto("p3")]);
+  pump(q.session);
+  q.applyAim({ seq: 1, anchor: true, yaw: 15, pitch: 0, roll: 0, fov: 75, ts: 1000 });
+  q.gotoId("p3");
+  assert(q._awaitingSwap === true && q._awaitIndex === 2, "gotoId(p3) in manual mode arms _awaitingSwap");
+  assert(q._standby && q._standby.entry && q._standby.entry.id === "p3", "gotoId(p3) creates _standby for p3");
+  q.applyAim({ seq: 2, anchor: false, yaw: 18, pitch: 2, roll: 0, fov: 75, ts: 1016 });
+  assert(q._standby && q._standby.entry && q._standby.entry.id === "p3", "applyAim during _awaitingSwap preserves awaited _standby");
+  q.pause(true);
+  assert(q._standby && q._standby.entry && q._standby.entry.id === "p3", "pause during _awaitingSwap preserves awaited _standby");
+  pump(q._standby);
+  assert(q.index === 2 && q._awaitingSwap === false, "awaited p3 finishes loading and commits swap even in manual/paused mode");
+}
+
 console.log("test_player ok");
