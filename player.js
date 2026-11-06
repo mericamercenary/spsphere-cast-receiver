@@ -297,6 +297,11 @@
     this._drawKeep = [];
     this._patchCache = {};
     this._strip = null;
+    this._uploadPath = "dom";
+    this._cpuTiles = false;
+    this._typedUploadOk = null;
+    this._domUploadOk = null;
+    this._uploadFailLogs = 0;
     this._preloadDepth = 0;
     this._uploadMsPerMb = 8;
     this._lastSender = 0;
@@ -829,12 +834,20 @@
   };
 
   Player.prototype._noteUploaded = function (tex) {
+    // A Canvas2D tile is on screen because the GPU upload did not succeed.
+    // Counting it as uploaded hid the failure and re-armed the backlog reset.
+    if (tex && tex._cpu) {
+      this._diagErrors = (this._diagErrors || 0) + 1;
+      if (!this._diagNote) this._diagNote = this._cpuReason || "texture upload failed; Canvas2D tiles";
+      this._sendDiag();
+      return;
+    }
     if (tex && (tex._spsUploaded || tex._mip === true) && !tex.deferred && !tex.oom && !tex._evicted) {
       this._diagUploaded = (this._diagUploaded || 0) + 1;
       if (this._finishSession(this.session)) return;
     } else {
       this._diagErrors = (this._diagErrors || 0) + 1;
-      this._diagNote = "texture upload failed";
+      this._diagNote = this._lastUploadFail || "texture upload failed";
       this._reportTv(this._diagNote);
     }
     this._sendDiag();
@@ -850,6 +863,14 @@
     }
     if (s._overviewReady) uploaded += 1;
     var inflight = (s._inFlight ? s._inFlight() : 0) + (s._overviewPending ? 1 : 0);
+    if (this._cpuTiles) {
+      this._diagRequested = uploaded + inflight;
+      this._diagUploaded = 0;
+      if (!(this._diagErrors > 0)) this._diagErrors = uploaded;
+      if (!this._diagNote) this._diagNote = this._cpuReason || "texture upload failed; Canvas2D tiles";
+      this._diagKey = "";
+      return;
+    }
     this._diagRequested = uploaded + inflight;
     this._diagReceived = uploaded;
     this._diagDecoded = uploaded;
@@ -1014,6 +1035,9 @@
       this._lanDeadSince = 0;
     }
     if (!reason) return false;
+    // The bitmap path is already known dead. softReset would ask for the
+    // same tiles and upload them the same way until the sender gives up.
+    if (this._cpuTiles && (reason === "tile-backlog" || reason === "upload-backlog")) return false;
     this.softReset(reason);
     return true;
   };
@@ -2290,6 +2314,7 @@
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([20, 24, 32, 255]));
     this._installQuad(gl);
     this._measureUpload(gl);
+    this._probeUploads(gl);
   };
 
   Player.prototype._upload = function (img) {
@@ -2568,6 +2593,14 @@
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
         if (piece.tex && piece.tex !== uploaded) this._deleteTex(piece.tex);
         tex = uploaded;
+      } else if (this._cpuTiles && img) {
+        img._cpuRetain = true;
+        tex._cpu = true;
+        tex._cpuImage = img;
+        tex._spsUploaded = true;
+        tex._mip = true;
+        tex.deferred = false;
+        tex._evicted = false;
       }
     }
     if (!tex) tex = {};
@@ -2779,7 +2812,7 @@
         return uploaded;
       },
       dropImage: function (img) {
-        if (!img) return;
+        if (!img || img._cpuRetain) return;
         img.onload = null;
         img.onerror = null;
         try {
@@ -3434,30 +3467,114 @@
     else this._preloadNeighbors();
   };
 
-  Player.prototype._texImage = function (gl, source) {
-    var tex = gl.createTexture();
-    if (!tex) return null;
+  Player.prototype._prepareTex = function (gl, tex) {
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
+    if (gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL != null) gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, 0);
+    if (gl.UNPACK_COLORSPACE_CONVERSION_WEBGL != null && gl.NONE != null) {
+      gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
+    }
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    if (this._beginStrip(gl, tex, source)) return tex;
+  };
+
+  Player.prototype._uploadSource = function (gl, tex, source) {
+    if (!gl || !tex || !source) return { ok: false, error: new Error("no source"), gl: "" };
+    this._prepareTex(gl, tex);
+    this._clearGlError(gl);
+    var w = source.width || source.w || 0;
+    var h = source.height || source.h || 0;
     try {
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+      if (source._pixels) {
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, source.data);
+      } else {
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+      }
     } catch (error) {
-      gl.deleteTexture(tex);
-      warn("texture upload failed", error && error.message);
+      return { ok: false, error: error, gl: this._readGlError(gl) };
+    }
+    if (gl.isContextLost && gl.isContextLost()) return { ok: false, error: new Error("context lost"), gl: "CONTEXT_LOST_WEBGL" };
+    var glErr = this._readGlError(gl);
+    if (glErr) return { ok: false, error: null, gl: glErr };
+    return { ok: true };
+  };
+
+  Player.prototype._texImage = function (gl, source) {
+    if (!gl || !source || this._uploadPath === "cpu" || this._cpuTiles) return null;
+    var tex = gl.createTexture();
+    if (!tex) return null;
+    this._prepareTex(gl, tex);
+    var directOk = this._uploadPath !== "pixels" && this._uploadPath !== "canvas" && this._domUploadOk !== false && !source._pixels;
+    if (directOk && this._beginStrip(gl, tex, source)) return tex;
+    var stage = "dom";
+    var current = source;
+    var result = null;
+    if (source._pixels || this._uploadPath === "pixels" || this._domUploadOk === false) {
+      stage = "pixels";
+      current = source._pixels ? source : this._bitmapToPixels(source);
+      result = current ? this._uploadSource(gl, tex, current) : { ok: false, error: new Error("no pixels"), gl: "" };
+    } else if (this._uploadPath === "canvas") {
+      stage = "canvas";
+      current = this._bitmapToCanvas(source) || source;
+      result = this._uploadSource(gl, tex, current);
+      if (!result.ok) {
+        var fromCanvas = this._bitmapToPixels(current);
+        if (fromCanvas) {
+          stage = "pixels";
+          current = fromCanvas;
+          result = this._uploadSource(gl, tex, fromCanvas);
+          if (result.ok) this._uploadPath = "pixels";
+        }
+      }
+    } else {
+      result = this._uploadSource(gl, tex, source);
+      if (!result.ok && !this._domWarned) {
+        this._domWarned = true;
+        this._rememberUploadFailure(gl, source, "dom", result);
+      }
+      if (!result.ok) {
+        var canvas = this._bitmapToCanvas(source);
+        if (canvas) {
+          stage = "canvas";
+          current = canvas;
+          result = this._uploadSource(gl, tex, canvas);
+          if (result.ok) this._uploadPath = "canvas";
+        }
+        if (!result.ok) {
+          var pixels = this._bitmapToPixels(canvas || source);
+          if (pixels) {
+            stage = "pixels";
+            current = pixels;
+            result = this._uploadSource(gl, tex, pixels);
+            if (result.ok) this._uploadPath = "pixels";
+          }
+        }
+      }
+    }
+    if (!result || !result.ok) {
+      try { gl.deleteTexture(tex); } catch (error) {}
+      this._rememberUploadFailure(gl, source, stage, result || { ok: false });
+      if (uploadPathBroken(result)) this._engageCpu(result);
       return null;
     }
-    if (gl.isContextLost && gl.isContextLost()) {
-      warn("webgl context lost");
+    var w = current.width || current.w || 0;
+    var h = current.height || current.h || 0;
+    try {
+      this._finishSampler(gl, tex, w, h, current);
+    } catch (error) {
+      try { gl.deleteTexture(tex); } catch (e) {}
+      this._rememberUploadFailure(gl, current, "sampler", { ok: false, error: error, gl: this._readGlError(gl) });
+      if (uploadPathBroken({ error: error })) this._engageCpu({ error: error });
       return null;
     }
-    var w = source.width || 0;
-    var h = source.height || 0;
-    this._finishSampler(gl, tex, w, h, source);
+    var samplerErr = this._readGlError(gl);
+    if (samplerErr && samplerErr.indexOf("OUT_OF_MEMORY") >= 0) {
+      try { gl.deleteTexture(tex); } catch (e2) {}
+      this._rememberUploadFailure(gl, current, "sampler", { ok: false, gl: samplerErr });
+      return null;
+    }
     tex._contentW = tex._contentW || w;
     tex._contentH = tex._contentH || h;
     tex._spsUploaded = true;
@@ -3473,19 +3590,35 @@
     // tall. WebGL 1 and 2 both sample an NPOT texture that way with LINEAR.
     // Padding it out to a power of two and building a mip chain copied the
     // bitmap again and stalled the fade for a second or more.
-    if (!large && !this._webgl2 && !pot && source) {
+    // A small NPOT strip used to be copied onto a power-of-two canvas and
+    // uploaded a second time. WebGL 1 can sample the original with clamp and
+    // linear. The second upload is skipped when DOM uploads are already unsafe,
+    // and a GL error from the pad puts the original pixels back.
+    var allowPad = source && !source._pixels && this._domUploadOk !== false && this._uploadPath !== "pixels" && this._uploadPath !== "cpu";
+    if (!large && !this._webgl2 && !pot && allowPad) {
       var padded = potPadSource(source);
       if (padded && padded.width && (padded.width !== width || padded.height !== height)) {
         try {
           gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, padded);
+          var padErr = this._readGlError(gl);
+          if (padErr) throw new Error(padErr);
           uploadW = padded.width;
           uploadH = padded.height;
           pot = isPow2(uploadW) && isPow2(uploadH);
         } catch (error) {
           warn("texture pad failed", error && error.message);
+          var restoreErr = "";
+          try {
+            if (source._pixels) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, source.data);
+            else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+            restoreErr = this._readGlError(gl);
+          } catch (again) {
+            restoreErr = String((again && again.message) || again || "restore failed");
+          }
           pot = isPow2(width) && isPow2(height);
           uploadW = width;
           uploadH = height;
+          if (restoreErr) throw new Error(restoreErr);
         }
       }
     }
@@ -3560,6 +3693,7 @@
   };
 
   Player.prototype._uploadTile = function (img, tile, standby) {
+    if ((this._cpuTiles || this._uploadPath === "cpu") && img) return this._acceptCpuTile(img, tile);
     if (this._glLost || !this._gl) this._setup();
     var gl = this._gl;
     if (!gl || (gl.isContextLost && gl.isContextLost())) {
@@ -3629,13 +3763,15 @@
     var attempts = this._resident.length + 1;
     var uploadStarted = nowMs();
     while (attempts-- > 0) {
+      if (this._cpuTiles) break;
       tex = this._texImage(gl, source);
-      if (tex) break;
+      if (tex || this._cpuTiles) break;
       // A failed upload can evict a tile that is outside the view. It cannot
       // drop a tile the frustum still sees, including a pole tile behind the yaw.
       if (!canEvict()) break;
       if (!this._evictDistant(view)) break;
     }
+    if (!tex && this._cpuTiles) return this._acceptCpuTile(source || img, tile);
     if (!tex) return this._deferred(img, tile);
     if (tex._uploadW && tex._uploadH) bytes = tex._uploadW * tex._uploadH * 4;
     tex._bytes = bytes;
@@ -3954,7 +4090,8 @@
   Player.prototype.draw = function () {
     if (this._holdFrame && !this._snapOn) return;
     resize(this.canvas);
-    if (this._mode === "webgl" && this._gl) this._drawGl();
+    if (this._cpuTiles) this._drawCpuTiles();
+    else if (this._mode === "webgl" && this._gl) this._drawGl();
     else this._draw2d();
     if (!this._snapOn && this._tileDraw && this._tileDraw.length) {
       this._snapHave = true;
@@ -3999,7 +4136,10 @@
     var h = this.canvas.height || 540;
     ctx.fillStyle = "#0b0d10";
     ctx.fillRect(0, 0, w, h);
-    if (this._useTiles) return;
+    if (this._useTiles) {
+      this._drawCpuTiles();
+      return;
+    }
     var from = this.images[this.phase === "fade" ? this.fromIndex : this.index];
     var to = this.images[this.index];
     drawStrip(ctx, from, this.yaw, this.pitch, this.fov, w, h, 1);
@@ -4056,6 +4196,7 @@
 
   Player.prototype._beginStrip = function (gl, tex, source) {
     if (!gl || !tex || !source || !source.width || !source.height) return false;
+    if (this._uploadPath === "pixels" || this._uploadPath === "cpu" || this._domUploadOk === false || source._pixels) return false;
     if (!shouldStripUpload(source.width, source.height)) return false;
     if (!gl.texSubImage2D || typeof document === "undefined") return false;
     var rows = this._stripRows(source.width);
@@ -4078,23 +4219,39 @@
 
   Player.prototype._abortStrip = function (job, error) {
     this._strip = null;
-    this._diagErrors = (this._diagErrors || 0) + 1;
-    this._diagNote = "strip upload failed; sending the whole tile";
-    this._reportTv(this._diagNote + (error && error.message ? " " + error.message : ""));
     var tex = job && job.tex;
-    try {
-      if (job && job.gl && tex && job.source) {
-        job.gl.bindTexture(job.gl.TEXTURE_2D, tex);
-        job.gl.texImage2D(job.gl.TEXTURE_2D, 0, job.gl.RGBA, job.gl.RGBA, job.gl.UNSIGNED_BYTE, job.source);
-        this._finishSampler(job.gl, tex, job.w, job.h, job.source);
-        tex._spsUploaded = true;
-      } else {
-        tex = null;
+    var result = { ok: false, error: error || new Error("strip"), gl: "" };
+    if (job && job.gl && tex && job.source && !this._cpuTiles) {
+      result = this._uploadSource(job.gl, tex, job.source);
+      var current = job.source;
+      if (!result.ok) {
+        var canvas = this._bitmapToCanvas(job.source);
+        if (canvas) {
+          current = canvas;
+          result = this._uploadSource(job.gl, tex, canvas);
+        }
       }
-    } catch (err) {
-      tex = null;
-      this._diagNote = "texture upload failed";
-      this._reportTv(this._diagNote);
+      if (!result.ok) {
+        var pixels = this._bitmapToPixels(current || job.source);
+        if (pixels) {
+          current = pixels;
+          result = this._uploadSource(job.gl, tex, pixels);
+          if (result.ok) this._uploadPath = "pixels";
+        }
+      }
+      if (result.ok) {
+        try {
+          this._finishSampler(job.gl, tex, job.w, job.h, current);
+          tex._spsUploaded = true;
+        } catch (err) {
+          result = { ok: false, error: err, gl: this._readGlError(job.gl) };
+        }
+      }
+    }
+    if (!result.ok) {
+      this._rememberUploadFailure(job && job.gl, job && job.source, "strip", result);
+      if (uploadPathBroken(result)) this._engageCpu(result);
+      tex = job && job.source ? this._acceptCpuTile(job.source, null) : null;
     }
     if (job && job.done) job.done(tex);
   };
@@ -4250,6 +4407,280 @@
     var mb = (w * h * 4) / (1024 * 1024);
     this._uploadMsPerMb = ms / mb;
     gl.deleteTexture(tex);
+    this._readGlError(gl);
+  };
+
+  Player.prototype._clearGlError = function (gl) {
+    this._readGlError(gl);
+  };
+
+  Player.prototype._readGlError = function (gl) {
+    if (!gl || typeof gl.getError !== "function") return "";
+    var names = [];
+    for (var i = 0; i < 8; i++) {
+      var code = 0;
+      try { code = gl.getError() | 0; } catch (error) { break; }
+      if (!code) break;
+      names.push(GL_ERROR_NAMES[code] || ("0x" + code.toString(16)));
+    }
+    return names.join("+");
+  };
+
+  Player.prototype._glRenderer = function () {
+    if (this._rendererName != null) return this._rendererName;
+    var gl = this._gl;
+    var name = "";
+    if (gl && gl.getExtension && gl.getParameter) {
+      try {
+        var info = gl.getExtension("WEBGL_debug_renderer_info");
+        if (info) name = String(gl.getParameter(info.UNMASKED_RENDERER_WEBGL) || "");
+      } catch (error) {}
+    }
+    this._rendererName = name;
+    return name;
+  };
+
+  Player.prototype._rememberUploadFailure = function (gl, source, stage, result) {
+    var thrown = result && result.error;
+    var glErr = (result && result.gl) || "";
+    if (!glErr && gl) glErr = this._readGlError(gl);
+    var lost = !!(gl && gl.isContextLost && gl.isContextLost());
+    var w = (source && (source.width || source.w)) || 0;
+    var h = (source && (source.height || source.h)) || 0;
+    var renderer = "";
+    try { renderer = this._glRenderer(); } catch (error) {}
+    var text = "texture upload failed"
+      + " stage=" + (stage || "?")
+      + " gl=" + (glErr || "none")
+      + " lost=" + (lost ? "1" : "0")
+      + " webgl2=" + (this._webgl2 ? "1" : "0")
+      + " size=" + w + "x" + h
+      + " source=" + sourceKind(source)
+      + " path=" + (this._uploadPath || "dom");
+    if (renderer) text += " renderer=" + String(renderer).slice(0, 80);
+    if (thrown && thrown.message) text += " throw=" + String(thrown.message).slice(0, 80);
+    if (text.length > 300) text = text.slice(0, 300);
+    this._lastUploadFail = text;
+    this._uploadFailLogs = (this._uploadFailLogs || 0) + 1;
+    if (this._uploadFailLogs <= 4) this._reportTv(text);
+  };
+
+  Player.prototype._engageCpu = function (result) {
+    var why = this._lastUploadFail || "texture upload failed";
+    if (why.indexOf("Canvas2D") < 0) why += "; Canvas2D tiles";
+    if (why.length > 300) why = why.slice(0, 300);
+    this._cpuReason = why;
+    this._diagNote = why;
+    this._uploadPath = "cpu";
+    if (this._cpuTiles) return;
+    this._cpuTiles = true;
+    this._uploadFailLogs = (this._uploadFailLogs || 0) + 1;
+    if (this._uploadFailLogs <= 4) this._reportTv(why);
+  };
+
+  Player.prototype._acceptCpuTile = function (img, tile) {
+    if (!img) return this._deferred(img, tile);
+    img._cpuRetain = true;
+    var w = img.width || (tile && tile.texW) || 0;
+    var h = img.height || (tile && tile.texH) || 0;
+    return {
+      _cpu: true,
+      _cpuImage: img,
+      _spsUploaded: true,
+      _mip: true,
+      _uploadW: w,
+      _uploadH: h,
+      _contentW: w,
+      _contentH: h,
+      _bytes: 0,
+      _tileId: tile && tile.id,
+      deferred: false,
+      _evicted: false,
+      label: img.label,
+    };
+  };
+
+  Player.prototype._bitmapToCanvas = function (source) {
+    if (!source || source._pixels || !(source.width > 0) || !(source.height > 0)) return null;
+    if (typeof HTMLCanvasElement !== "undefined" && source instanceof HTMLCanvasElement) return source;
+    if (typeof document === "undefined" || !document.createElement) return null;
+    try {
+      var canvas = document.createElement("canvas");
+      canvas.width = source.width;
+      canvas.height = source.height;
+      var ctx = canvas.getContext("2d");
+      if (!ctx) return null;
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(source, 0, 0);
+      return canvas;
+    } catch (error) {
+      return null;
+    }
+  };
+
+  Player.prototype._bitmapToPixels = function (source) {
+    if (!source || !(source.width > 0) || !(source.height > 0)) return null;
+    if (source._pixels && source.data) return source;
+    var canvas = source;
+    if (!(typeof HTMLCanvasElement !== "undefined" && source instanceof HTMLCanvasElement)) {
+      canvas = this._bitmapToCanvas(source);
+    }
+    if (!canvas || !canvas.getContext) return null;
+    try {
+      var ctx = canvas.getContext("2d");
+      if (!ctx || !ctx.getImageData) return null;
+      var data = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      if (!data || !data.data) return null;
+      return { width: canvas.width, height: canvas.height, data: data.data, _pixels: true };
+    } catch (error) {
+      return null;
+    }
+  };
+
+  Player.prototype._probeTypedUpload = function (gl) {
+    var tex = gl.createTexture();
+    if (!tex) return false;
+    var ok = false;
+    this._probeTypedGl = "";
+    try {
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      this._clearGlError(gl);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([8, 12, 16, 255]));
+      var err = this._readGlError(gl);
+      if (err) this._probeTypedGl = err;
+      ok = !err && !(gl.isContextLost && gl.isContextLost());
+    } catch (error) {
+      ok = false;
+      this._probeTypedGl = String(error && error.message || error);
+    }
+    try { gl.deleteTexture(tex); } catch (error) {}
+    return ok;
+  };
+
+  Player.prototype._probeDomUpload = function (gl) {
+    if (typeof document === "undefined" || !document.createElement) return null;
+    var canvas = null;
+    try {
+      canvas = document.createElement("canvas");
+      canvas.width = 1;
+      canvas.height = 1;
+      var ctx = canvas.getContext("2d");
+      if (!ctx) return null;
+      ctx.fillStyle = "#14181c";
+      ctx.fillRect(0, 0, 1, 1);
+    } catch (error) {
+      return null;
+    }
+    var tex = gl.createTexture();
+    if (!tex) return false;
+    var result = this._uploadSource(gl, tex, canvas);
+    try { gl.deleteTexture(tex); } catch (error) {}
+    this._probeDomGl = result && (result.gl || (result.error && result.error.message) || "");
+    return !!(result && result.ok);
+  };
+
+  Player.prototype._probeUploads = function (gl) {
+    if (!gl) return;
+    var typed = this._probeTypedUpload(gl);
+    var dom = this._probeDomUpload(gl);
+    this._typedUploadOk = typed;
+    this._domUploadOk = dom;
+    if (dom === false && typed) this._uploadPath = "pixels";
+    else if (dom === false && typed === false) {
+      this._lastUploadFail = "texture upload failed stage=probe gl=" + (this._probeDomGl || this._probeTypedGl || "none")
+        + " size=1x1 source=canvas path=probe";
+      this._engageCpu({ gl: this._probeDomGl || this._probeTypedGl || "" });
+    } else if (!this._uploadPath) this._uploadPath = "dom";
+    var note = "upload probe typed=" + (typed ? "ok" : "fail")
+      + " dom=" + (dom == null ? "skip" : (dom ? "ok" : "fail"))
+      + " path=" + (this._uploadPath || "dom")
+      + " webgl2=" + (this._webgl2 ? "1" : "0")
+      + " lost=" + (gl.isContextLost && gl.isContextLost() ? "1" : "0");
+    var renderer = this._glRenderer();
+    if (renderer) note += " renderer=" + String(renderer).slice(0, 80);
+    if (this._probeTypedGl) note += " typedGl=" + String(this._probeTypedGl).slice(0, 60);
+    if (this._probeDomGl) note += " domGl=" + String(this._probeDomGl).slice(0, 60);
+    if (note.length > 300) note = note.slice(0, 300);
+    this._probeNote = note;
+    this._send({ type: "log", message: note });
+  };
+
+  Player.prototype._cpuContext = function () {
+    if (this._cpuCtx) return this._cpuCtx;
+    var ctx = null;
+    var overlay = null;
+    if (typeof document !== "undefined" && document.createElement) {
+      try {
+        overlay = document.createElement("canvas");
+        overlay._spsCpu = true;
+        if (overlay.setAttribute) overlay.setAttribute("data-spsphere", "cpu-tiles");
+        if (!overlay.style) overlay.style = {};
+        overlay.style.position = "fixed";
+        overlay.style.inset = "0";
+        overlay.style.top = "0";
+        overlay.style.left = "0";
+        overlay.style.right = "0";
+        overlay.style.bottom = "0";
+        overlay.style.width = "100%";
+        overlay.style.height = "100%";
+        overlay.style.zIndex = "1";
+        overlay.style.pointerEvents = "none";
+        var host = this.canvas;
+        if (host && host.parentNode && host.parentNode.insertBefore) host.parentNode.insertBefore(overlay, host.nextSibling);
+        if (overlay.getContext) ctx = overlay.getContext("2d");
+      } catch (error) {
+        ctx = null;
+      }
+    }
+    if (!ctx && this.canvas && this.canvas.getContext) {
+      try { ctx = this.canvas.getContext("2d"); } catch (error) { ctx = null; }
+      if (ctx) overlay = this.canvas;
+    }
+    this._cpuCanvas = overlay;
+    this._cpuCtx = ctx;
+    return ctx;
+  };
+
+  Player.prototype._drawCpuTiles = function () {
+    var ctx = this._cpuContext();
+    if (!ctx) return 0;
+    var host = this.canvas || this._cpuCanvas;
+    var canvas = this._cpuCanvas || host;
+    var w = (host && host.width) || (canvas && canvas.width) || 1280;
+    var h = (host && host.height) || (canvas && canvas.height) || 720;
+    if (w < 2) w = 1280;
+    if (h < 2) h = 720;
+    if (canvas && canvas !== host) {
+      if (canvas.width !== w) canvas.width = w;
+      if (canvas.height !== h) canvas.height = h;
+    }
+    ctx.fillStyle = "#0b0d10";
+    ctx.fillRect(0, 0, w, h);
+    var span = this._photoSpan();
+    var pose = (this.poses && this.poses[this.index]) || ZERO_POSE;
+    var fadePose = this._fadePose || ZERO_POSE;
+    var oldList = this._fading ? (this._fadeFrom || []) : [];
+    var newList = this._tileDraw || [];
+    var haveOld = oldList.length > 0;
+    var haveNew = newList.length > 0;
+    var alphas = compositeAlphas(this._fadeMs, haveOld, haveNew, this._fadeLimit || TILE_FADE_MS);
+    var posePitch = ((pose.pitch || 0) * 180) / Math.PI;
+    var oldPosePitch = ((fadePose.pitch || 0) * 180) / Math.PI;
+    var drawn = 0;
+    if (haveOld && alphas.oldAlpha > 0) {
+      drawn += paintEquirectTiles(ctx, oldList, this._fadeW || span.w, this._fadeH || span.h, this.yaw, (this.pitch || 0) + oldPosePitch, this.fov, w, h, alphas.oldAlpha);
+    }
+    var base = !haveNew && this._activeBase ? this._activeBase() : null;
+    if (base && ((base.tex && base.tex._cpuImage) || base.canvas)) {
+      var baseImg = (base.tex && base.tex._cpuImage) || base.canvas;
+      var baseEntry = this._showingEntry();
+      drawn += paintEquirectTiles(ctx, [{ tex: { _cpuImage: baseImg }, tile: base.tile }], (baseEntry && baseEntry.width) || span.w, (baseEntry && baseEntry.height) || span.h, this.yaw, (this.pitch || 0) + posePitch, this.fov, w, h, haveNew ? alphas.newAlpha : 1);
+    }
+    if (haveNew && alphas.newAlpha > 0) {
+      drawn += paintEquirectTiles(ctx, newList, span.w, span.h, this.yaw, (this.pitch || 0) + posePitch, this.fov, w, h, alphas.newAlpha);
+    }
+    this._cpuDrawn = (this._cpuDrawn || 0) + drawn;
+    return drawn;
   };
 
   function copyOverview(overview) {
@@ -4466,6 +4897,125 @@
     } catch (e) {
       return true;
     }
+  }
+
+  var GL_ERROR_NAMES = {
+    1280: "INVALID_ENUM",
+    1281: "INVALID_VALUE",
+    1282: "INVALID_OPERATION",
+    1283: "STACK_OVERFLOW",
+    1285: "OUT_OF_MEMORY",
+    1286: "INVALID_FRAMEBUFFER_OPERATION",
+    37442: "CONTEXT_LOST_WEBGL",
+  };
+
+  function uploadPathBroken(result) {
+    if (!result) return true;
+    var gl = String(result.gl || "");
+    if (gl.indexOf("OUT_OF_MEMORY") >= 0) return false;
+    var msg = String((result.error && result.error.message) || "");
+    if (/out of memory/i.test(msg)) return false;
+    return true;
+  }
+
+  function sourceKind(source) {
+    if (!source) return "none";
+    if (source._pixels) return "pixels";
+    try {
+      if (typeof ImageBitmap !== "undefined" && source instanceof ImageBitmap) return "ImageBitmap";
+      if (typeof HTMLCanvasElement !== "undefined" && source instanceof HTMLCanvasElement) return "canvas";
+      if (typeof HTMLImageElement !== "undefined" && source instanceof HTMLImageElement) return "image";
+      if (typeof OffscreenCanvas !== "undefined" && source instanceof OffscreenCanvas) return "offscreencanvas";
+    } catch (error) {}
+    if (source.width && source.height) return "bitmap";
+    return "unknown";
+  }
+
+  function equirectWindow(spanW, spanH, yaw, pitch, fov, viewW, viewH) {
+    var useFov = fov > 1 ? fov : 75;
+    var fovFrac = useFov / 360;
+    var center = ((0.5 + (yaw || 0) / 360) % 1 + 1) % 1;
+    var srcW = spanW * fovFrac;
+    if (!(srcW > 1)) srcW = 1;
+    var srcX = center * spanW - srcW / 2;
+    var aspect = viewW / Math.max(viewH, 1);
+    var vFrac = (useFov / aspect) / 180;
+    var centerV = 0.5 - (pitch || 0) / 180;
+    var srcH = spanH * vFrac;
+    if (!(srcH > 1)) srcH = 1;
+    if (srcH > spanH) srcH = spanH;
+    var srcY = centerV * spanH - srcH / 2;
+    if (srcY < 0) srcY = 0;
+    if (srcY + srcH > spanH) srcY = Math.max(0, spanH - srcH);
+    return { x: srcX, y: srcY, w: srcW, h: srcH };
+  }
+
+  function blitTile(ctx, img, tile, viewX, viewY, viewW, viewH, screenX, screenY, screenW, screenH) {
+    var x0 = tile.srcX > viewX ? tile.srcX : viewX;
+    var y0 = tile.srcY > viewY ? tile.srcY : viewY;
+    var x1 = tile.srcX + tile.srcW;
+    var y1 = tile.srcY + tile.srcH;
+    var viewR = viewX + viewW;
+    var viewB = viewY + viewH;
+    if (x1 > viewR) x1 = viewR;
+    if (y1 > viewB) y1 = viewB;
+    if (!(x1 > x0) || !(y1 > y0)) return false;
+    var imgW = img.width || tile.texW || tile.srcW;
+    var imgH = img.height || tile.texH || tile.srcH;
+    var texW = tile.texW || imgW;
+    var texH = tile.texH || imgH;
+    var scaleX = imgW / texW;
+    var scaleY = imgH / texH;
+    var sx = ((tile.padL || 0) + (x0 - tile.srcX)) * scaleX;
+    var sy = ((tile.padT || 0) + (y0 - tile.srcY)) * scaleY;
+    var sw = (x1 - x0) * scaleX;
+    var sh = (y1 - y0) * scaleY;
+    if (!(sw > 0) || !(sh > 0)) return false;
+    var dx = screenX + ((x0 - viewX) / viewW) * screenW;
+    var dy = screenY + ((y0 - viewY) / viewH) * screenH;
+    var dw = ((x1 - x0) / viewW) * screenW;
+    var dh = ((y1 - y0) / viewH) * screenH;
+    try {
+      ctx.drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh);
+    } catch (error) {
+      return false;
+    }
+    return true;
+  }
+
+  function paintEquirectTiles(ctx, pieces, spanW, spanH, yaw, pitch, fov, viewW, viewH, alpha) {
+    if (!ctx || !(alpha > 0) || !(spanW > 0) || !(spanH > 0) || !pieces || !pieces.length) return 0;
+    var win = equirectWindow(spanW, spanH, yaw, pitch, fov, viewW, viewH);
+    var drawn = 0;
+    if (ctx.save) ctx.save();
+    ctx.globalAlpha = alpha;
+    function paint(photoX, photoW, screenX, screenW) {
+      if (!(photoW > 0) || !(screenW > 0)) return;
+      for (var i = 0; i < pieces.length; i++) {
+        var piece = pieces[i];
+        if (!piece) continue;
+        var tex = piece.tex;
+        var img = (tex && tex._cpuImage) || piece.image || null;
+        var tile = piece.spec || piece.tile || (tex && tex._window);
+        if (!img || !tile || !(tile.srcW > 0) || !(tile.srcH > 0)) continue;
+        if (blitTile(ctx, img, tile, photoX, win.y, photoW, win.h, screenX, 0, screenW, viewH)) drawn += 1;
+      }
+    }
+    var srcX = win.x;
+    var srcW = win.w;
+    if (srcX < 0) {
+      var leftW = -srcX;
+      paint(spanW - leftW, leftW, 0, (leftW / srcW) * viewW);
+      paint(0, srcW - leftW, (leftW / srcW) * viewW, ((srcW - leftW) / srcW) * viewW);
+    } else if (srcX + srcW > spanW) {
+      var right = spanW - srcX;
+      paint(srcX, right, 0, (right / srcW) * viewW);
+      paint(0, srcW - right, (right / srcW) * viewW, ((srcW - right) / srcW) * viewW);
+    } else {
+      paint(srcX, srcW, 0, viewW);
+    }
+    if (ctx.restore) ctx.restore();
+    return drawn;
   }
 
   function drawStrip(ctx, img, yaw, pitch, fov, w, h, alpha) {

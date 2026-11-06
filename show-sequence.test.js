@@ -2430,4 +2430,327 @@ assert(failPlayer._lanDead !== true, "a Cast fallback does not turn LAN off, tri
 assert(afterFallback.length >= 1, "the Cast fallback still asks for the tile");
 sandbox.fetch = undefined;
 
+// A TV whose texImage2D rejects every real bitmap (1x1 probes still pass)
+// has to draw the decoded tile and must not re-request it forever.
+function cpuCanvasFactory(draws) {
+  return function () {
+    const canvas = { width: 1, height: 1, style: {}, _spsCpu: false };
+    let alpha = 1;
+    const stack = [];
+    canvas.getContext = function () {
+      return {
+        fillRect: function () {},
+        fillStyle: "#000",
+        imageSmoothingEnabled: false,
+        save: function () { stack.push(alpha); },
+        restore: function () { if (stack.length) alpha = stack.pop(); },
+        get globalAlpha() { return alpha; },
+        set globalAlpha(v) { alpha = v; },
+        drawImage: function () {
+          draws.push({ canvas: canvas, alpha: alpha, args: Array.prototype.slice.call(arguments) });
+        },
+        getImageData: function (_x, _y, w, h) {
+          return { data: new Uint8ClampedArray((w | 0) * (h | 0) * 4), width: w, height: h };
+        },
+        putImageData: function () {},
+      };
+    };
+    return canvas;
+  };
+}
+
+function makeFailGl(texImage2D) {
+  const gl = {
+    uploads: [],
+    VERTEX_SHADER: 1,
+    FRAGMENT_SHADER: 2,
+    COMPILE_STATUS: 3,
+    LINK_STATUS: 4,
+    ARRAY_BUFFER: 5,
+    ELEMENT_ARRAY_BUFFER: 6,
+    FLOAT: 5126,
+    TRIANGLES: 4,
+    UNSIGNED_SHORT: 5123,
+    UNSIGNED_INT: 5125,
+    TEXTURE_2D: 3553,
+    RGBA: 6408,
+    UNSIGNED_BYTE: 5121,
+    COLOR_BUFFER_BIT: 16384,
+    TEXTURE0: 33984,
+    DEPTH_TEST: 0x0B71,
+    CULL_FACE: 0x0B44,
+    CURRENT_PROGRAM: 0x8B8D,
+    MAX_TEXTURE_SIZE: 0x0D33,
+    UNMASKED_RENDERER_WEBGL: 0x9246,
+    _prog: null,
+    _err: 0,
+    createShader: function () { return {}; },
+    shaderSource: function () {},
+    compileShader: function () {},
+    getShaderParameter: function () { return true; },
+    getShaderInfoLog: function () { return ""; },
+    createProgram: function () { return {}; },
+    attachShader: function () {},
+    linkProgram: function () {},
+    getProgramParameter: function () { return true; },
+    getProgramInfoLog: function () { return ""; },
+    deleteProgram: function () {},
+    useProgram: function (prog) { gl._prog = prog; },
+    getUniformLocation: function (_prog, name) { return name; },
+    getAttribLocation: function () { return 0; },
+    enableVertexAttribArray: function () {},
+    vertexAttribPointer: function () {},
+    createBuffer: function () { return {}; },
+    bindBuffer: function () {},
+    bufferData: function () {},
+    createTexture: function () { return { id: gl.uploads.length + 1 }; },
+    bindTexture: function (_target, tex) { gl._bound = tex; },
+    texParameteri: function () {},
+    pixelStorei: function () {},
+    texImage2D: texImage2D,
+    texSubImage2D: function () { throw new Error("no subimage"); },
+    generateMipmap: function () {},
+    deleteTexture: function () {},
+    getExtension: function (name) {
+      if (name === "WEBGL_debug_renderer_info") return { UNMASKED_RENDERER_WEBGL: gl.UNMASKED_RENDERER_WEBGL };
+      return null;
+    },
+    getShaderPrecisionFormat: function () { return { precision: 23 }; },
+    getParameter: function (name) {
+      if (name === gl.CURRENT_PROGRAM) return gl._prog;
+      if (name === gl.MAX_TEXTURE_SIZE) return 4096;
+      if (name === gl.UNMASKED_RENDERER_WEBGL) return "Mali-G57 onn";
+      return 0;
+    },
+    getError: function () {
+      const code = gl._err || 0;
+      gl._err = 0;
+      return code;
+    },
+    activeTexture: function () {},
+    viewport: function () {},
+    clearColor: function () {},
+    clear: function () {},
+    disable: function () {},
+    enable: function () {},
+    blendFunc: function () {},
+    uniform1f: function () {},
+    uniform1i: function () {},
+    uniformMatrix4fv: function () {},
+    drawElements: function () {},
+    drawArrays: function () {},
+    isContextLost: function () { return false; },
+    finish: function () {},
+    depthMask: function () {},
+  };
+  return gl;
+}
+
+function uploadSize(args) {
+  if (args.length >= 9) return { w: args[3] | 0, h: args[4] | 0, pixels: true };
+  const src = args[5];
+  return { w: (src && src.width) | 0, h: (src && src.height) | 0, pixels: false };
+}
+
+const cpuDraws = [];
+sandbox.document = {
+  createElement: cpuCanvasFactory(cpuDraws),
+  getElementById: function () { return null; },
+};
+const onnBitmap = { width: 566, height: 283, close: function () { onnBitmap.closed = true; } };
+sandbox.createImageBitmap = function () {
+  return { then: function (ok) { ok(onnBitmap); return { catch: function () {} }; } };
+};
+const onnGl = makeFailGl(function () {
+  const info = uploadSize(arguments);
+  onnGl.uploads.push(info);
+  if (info.w <= 1 && info.h <= 1) {
+    onnGl._err = 0;
+    return;
+  }
+  onnGl._err = 0x0502;
+  throw new Error("texImage2D failed");
+});
+const onnCanvas = {
+  width: 1280,
+  height: 720,
+  clientWidth: 1280,
+  clientHeight: 720,
+  style: {},
+  addEventListener: function () {},
+  getContext: function (kind) {
+    if (kind === "webgl2" || kind === "2d") return null;
+    return onnGl;
+  },
+};
+const onnSent = [];
+sandbox.__castSend = function (msg) { onnSent.push(msg); };
+let onnClock = 50000;
+const onn = Cast.create(onnCanvas);
+onn._focusNow = function () { return onnClock; };
+const onnTiles = [{
+  id: "onn-r0c0",
+  url: "http://phone.local/onn-r0c0.jpg",
+  col: 0,
+  row: 0,
+  srcX: 0,
+  srcY: 0,
+  srcW: 2000,
+  srcH: 1000,
+  texW: 566,
+  texH: 283,
+  padL: 0,
+  padT: 0,
+  padR: 0,
+  padB: 0,
+}];
+onn.setQueue([{
+  id: "onn-photo",
+  url: "http://phone.local/onn.jpg",
+  width: 2000,
+  height: 1000,
+  overview: { id: "onn-photo:overview", url: "http://phone.local/onn-overview.jpg", texW: 256, texH: 128 },
+  tiles: onnTiles,
+}]);
+const onnDelivered = {};
+function flushOnn() {
+  const due = deviceTimers.splice(0, deviceTimers.length);
+  due.forEach(function (timer) { timer.fn(); });
+}
+function deliverOnn() {
+  onnSent.filter(function (msg) { return msg && msg.type === "fetch"; }).forEach(function (msg) {
+    const key = msg.id + ":" + msg.token;
+    if (onnDelivered[key]) return;
+    onnDelivered[key] = true;
+    phoneSplit(msg.id, msg.token, deviceJpeg).forEach(function (part) { onn.noteChunk(part); });
+  });
+  flushOnn();
+}
+for (let round = 0; round < 8; round++) {
+  deliverOnn();
+  onn._pumpFrame(16);
+  flushOnn();
+}
+onn._sendDiag(true);
+const onnDiag = onnSent.filter(function (msg) { return msg && msg.type === "diag"; }).pop();
+assert(onnDiag, "the broken GPU still reports diagnostics");
+assert(onnDiag.uploaded === 0, "a failed texImage2D is not counted as uploaded, got " + onnDiag.uploaded);
+assert(onnDiag.errors >= 1, "the failed upload is reported, got " + onnDiag.errors);
+assert(onnDiag.decoded >= 1, "the JPEG was still decoded, got " + onnDiag.decoded);
+assert(onnDiag.note.indexOf("INVALID_OPERATION") >= 0, "the diag names the GL error, got " + onnDiag.note);
+assert(onnDiag.note.indexOf("566x283") >= 0, "the diag names the tile size, got " + onnDiag.note);
+assert(onnDiag.note.indexOf("source=") >= 0, "the diag names the source, got " + onnDiag.note);
+assert(onnDiag.note.indexOf("Canvas2D") >= 0, "the diag says the Canvas2D fallback is in use, got " + onnDiag.note);
+assert(onnDiag.note.indexOf("Mali-G57") >= 0, "the diag names the renderer, got " + onnDiag.note);
+assert(onn._cpuTiles === true, "the receiver leaves the dead bitmap upload path");
+assert(onnBitmap.closed !== true, "the fallback keeps the decoded bitmap");
+const onnShown = cpuDraws.filter(function (call) {
+  return call.canvas && call.canvas._spsCpu && call.args && call.args[0] === onnBitmap;
+});
+assert(onnShown.length >= 1, "Canvas2D drew the decoded tile, calls " + cpuDraws.length);
+const syAtRest = onnShown[onnShown.length - 1].args[2];
+assert(onn.applyAim({ seq: 3, yaw: 12, pitch: 30, roll: 0, fov: 75, anchor: true, ts: onnClock }), "aim is accepted on the fallback");
+for (let step = 0; step < 40; step++) onn.stepAim(16);
+assert(onn.pitch > 20, "aim pitch reaches the phone, got " + onn.pitch);
+const beforeAimDraw = cpuDraws.length;
+onn._drawCpuTiles();
+const aimedTile = cpuDraws.slice(beforeAimDraw).filter(function (call) {
+  return call.canvas && call.canvas._spsCpu && call.args && call.args[0] === onnBitmap;
+});
+assert(aimedTile.length >= 1, "the aimed view redraws the tile");
+assert(Math.abs(aimedTile[0].args[2] - syAtRest) > 1, "pitch moves the equirect sample, " + aimedTile[0].args[2] + " vs " + syAtRest);
+const otherBitmap = { width: 566, height: 283 };
+onn._fadeFrom = (onn._tileDraw || []).slice();
+onn._fadeW = 2000;
+onn._fadeH = 1000;
+onn._fading = true;
+onn._fadeMs = Cast.TILE_FADE_MS / 2;
+onn._fadeLimit = Cast.TILE_FADE_MS;
+onn._tileDraw = [{
+  tex: { _cpu: true, _cpuImage: otherBitmap, _mip: true, _spsUploaded: true },
+  tile: onnTiles[0],
+}];
+const beforeFade = cpuDraws.length;
+onn._drawCpuTiles();
+const faded = cpuDraws.slice(beforeFade).filter(function (call) { return call.canvas && call.canvas._spsCpu; });
+assert(faded.some(function (call) { return call.args[0] === onnBitmap && Math.abs(call.alpha - 1) < 1e-6; }), "the previous photo stays up during the switch");
+assert(faded.some(function (call) { return call.args[0] === otherBitmap && Math.abs(call.alpha - 0.5) < 1e-6; }), "the next photo fades in on the Canvas2D path");
+const fetchesBefore = onnSent.filter(function (msg) { return msg && msg.type === "fetch"; }).length;
+const resetsBefore = onn._softResets || 0;
+if (onn.session) onn.session.pending = null;
+onn._diagRequested = 40;
+onn._diagUploaded = 0;
+assert(onn._checkHealthWatchdog(onnClock + 20000) === false, "a dead upload path does not soft-reset the same tiles");
+assert((onn._softResets || 0) === resetsBefore, "tile-backlog does not fire while Canvas2D is drawing");
+for (let frame = 0; frame < 24; frame++) onn._pumpFrame(32);
+flushOnn();
+const fetchesAfter = onnSent.filter(function (msg) { return msg && msg.type === "fetch"; }).length;
+assert(fetchesAfter === fetchesBefore, "the fallback does not request the same tiles again, grew by " + (fetchesAfter - fetchesBefore));
+assert(onnSent.filter(function (msg) { return msg && msg.type === "log" && String(msg.message).indexOf("upload probe") >= 0; }).length >= 1, "startup probe is logged once");
+
+const pixelDraws = [];
+sandbox.document = {
+  createElement: cpuCanvasFactory(pixelDraws),
+  getElementById: function () { return null; },
+};
+const pixelGl = makeFailGl(function () {
+  const info = uploadSize(arguments);
+  pixelGl.uploads.push(info);
+  if (!info.pixels && info.w > 1) {
+    pixelGl._err = 0x0501;
+    throw new Error("dom texImage2D rejected");
+  }
+  pixelGl._err = 0;
+});
+const pixelCanvas = {
+  width: 1280,
+  height: 720,
+  clientWidth: 1280,
+  clientHeight: 720,
+  style: {},
+  addEventListener: function () {},
+  getContext: function (kind) {
+    if (kind === "webgl2" || kind === "2d") return null;
+    return pixelGl;
+  },
+};
+const pixelBitmap = { width: 566, height: 283, close: function () {} };
+sandbox.createImageBitmap = function () {
+  return { then: function (ok) { ok(pixelBitmap); return { catch: function () {} }; } };
+};
+const pixelSent = [];
+sandbox.__castSend = function (msg) { pixelSent.push(msg); };
+const pixelPlayer = Cast.create(pixelCanvas);
+pixelPlayer._focusNow = function () { return 80000; };
+pixelPlayer.setQueue([{
+  id: "pixel-photo",
+  url: "http://phone.local/pixel.jpg",
+  width: 2000,
+  height: 1000,
+  overview: { id: "pixel-photo:overview", url: "http://phone.local/pixel-overview.jpg", texW: 256, texH: 128 },
+  tiles: [Object.assign({}, onnTiles[0], { id: "pixel-r0c0" })],
+}]);
+const pixelDelivered = {};
+function deliverPixel() {
+  pixelSent.filter(function (msg) { return msg && msg.type === "fetch"; }).forEach(function (msg) {
+    const key = msg.id + ":" + msg.token;
+    if (pixelDelivered[key]) return;
+    pixelDelivered[key] = true;
+    phoneSplit(msg.id, msg.token, deviceJpeg).forEach(function (part) { pixelPlayer.noteChunk(part); });
+  });
+  flushOnn();
+}
+for (let round = 0; round < 8; round++) {
+  deliverPixel();
+  pixelPlayer._pumpFrame(16);
+  flushOnn();
+}
+pixelPlayer._sendDiag(true);
+const pixelDiag = pixelSent.filter(function (msg) { return msg && msg.type === "diag"; }).pop();
+assert(pixelDiag && pixelDiag.uploaded >= 1, "typed pixels count as a real upload, got " + (pixelDiag && pixelDiag.uploaded));
+assert(pixelDiag.errors === 0, "a recovered typed-pixel upload is not an error, got " + pixelDiag.errors + " " + pixelDiag.note);
+assert(pixelPlayer._cpuTiles !== true, "a working typed-pixel path stays on WebGL");
+assert(pixelGl.uploads.some(function (rec) { return rec.pixels && rec.w === 566 && rec.h === 283; }), "the bitmap was uploaded as bytes");
+assert(!pixelDraws.some(function (call) { return call.canvas && call.canvas._spsCpu; }), "WebGL recovery does not also blit Canvas2D tiles");
+
 console.log("show-sequence ok");
