@@ -19,7 +19,7 @@
 (function (root) {
   // Baked into player.js and the script URL. A Cast WebView that cached
   // "player.js" will not reuse that file for "player.js?v=<this>".
-  var RECEIVER_BUILD = "20261108.1";
+  var RECEIVER_BUILD = "20261108.2";
   var ROTATIONS = 2;
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
@@ -717,13 +717,23 @@
   // and a sender that connects later never sees that first send. Repeat the
   // build id and the probe once a sender is actually listening.
   Player.prototype.announceBuild = function () {
+    var now = this._clock ? this._clock() : Date.now();
     this._flushSends();
+    if (this._announcedAt && now - this._announcedAt < 4000) return;
+    this._announcedAt = now;
+    if (!this._probeNote) {
+      this._probeNote = withBuild("upload probe skipped reason=" + (this._setupReason || "not-run"));
+    }
     this._send({ type: "log", message: "receiver build " + RECEIVER_BUILD });
-    if (this._probeNote) this._send({ type: "log", message: this._probeNote });
+    this._send({ type: "log", message: this._probeNote });
   };
 
   Player.prototype._reportTv = function (message) {
     if (!message) return;
+    // Failures are the lines the phone keeps. Repeat the build and probe
+    // beside them; the copies sent at page load often leave before the
+    // sender is recording.
+    if (this.announceBuild) this.announceBuild();
     warn(message);
     this._send({ type: "log", message: String(message) });
   };
@@ -876,10 +886,15 @@
     } else {
       this._diagErrors = (this._diagErrors || 0) + 1;
       if (!this._lastUploadFail) {
-        this._lastUploadFail = "texture upload failed stage=unspecified gl=none"
+        var stage = (tex && tex._deferReason) || "unspecified";
+        var failW = (tex && tex._srcW) || 0;
+        var failH = (tex && tex._srcH) || 0;
+        this._lastUploadFail = "texture upload failed stage=" + stage
+          + " gl=none"
           + " lost=" + (this._glLost ? "1" : "0")
           + " webgl2=" + (this._webgl2 ? "1" : "0")
-          + " size=0x0 source=none path=" + (this._uploadPath || "dom");
+          + " size=" + failW + "x" + failH
+          + " source=none path=" + (this._uploadPath || "dom");
       }
       this._diagNote = withBuild(this._lastUploadFail);
       this._lastUploadFail = this._diagNote;
@@ -1082,7 +1097,7 @@
     if (reason !== "tile-backlog" && reason !== "upload-backlog" && reason !== "request-storm") return false;
     if (this._cpuTiles) return true;
     var note = this._diagNote || "";
-    return (this._diagErrors || 0) > 0 && note.indexOf("texture upload failed") >= 0;
+    return note.indexOf("texture upload failed") >= 0;
   };
 
   Player.prototype._pieceReadyId = function (session, id) {
@@ -2233,7 +2248,7 @@
       try {
         tex = this._uploadTile(job.img, job.tile, job.standby);
       } catch (error) {
-        warn("texture upload failed", error && error.message);
+        tex = this._uploadFailed(job.img, job.tile, "exception", error);
       }
       if (this._strip) {
         this._strip.done = job.done;
@@ -2268,7 +2283,12 @@
     var gl = this.canvas.getContext("webgl2", attrs);
     this._webgl2 = !!gl;
     if (!gl) gl = this.canvas.getContext("webgl", attrs);
-    if (!gl) return;
+    if (!gl) {
+      this._setupReason = "no-webgl";
+      this._probeNote = withBuild("upload probe skipped reason=no-webgl");
+      this._send({ type: "log", message: this._probeNote });
+      return;
+    }
     var prec = this._webgl2 ? "highp" : fragmentPrecision(gl);
     var grad = !!this._webgl2;
     if (!grad) {
@@ -2282,7 +2302,17 @@
       sources = glSources(false, prec, grad);
       prog = compileProgram(gl, sources.vs, sources.fs);
     }
-    if (!prog) return;
+    if (!prog) {
+      this._setupReason = "shader";
+      this._gl = gl;
+      this._probeUploads(gl);
+      if (!this._lastUploadFail) {
+        this._lastUploadFail = withBuild("texture upload failed stage=shader gl=none size=0x0 source=none path="
+          + (this._uploadPath || "dom") + " throw=Error: " + (lastShaderError || "link"));
+      }
+      this._engageCpu({ error: new Error(lastShaderError || "shader") });
+      return;
+    }
     this._prec = prec;
     this._sources = sources;
     this._gl = gl;
@@ -3735,13 +3765,43 @@
     return true;
   };
 
+  Player.prototype._uploadFailed = function (img, tile, stage, error) {
+    var sized = safeBitmap(img, tile);
+    // A texImage2D failure already recorded the GL error. Keep that text
+    // instead of replacing it with a generic no-texture line.
+    if (stage !== "no-texture" || !this._lastUploadFail) {
+      this._rememberUploadFailure(this._gl, sized, stage, {
+        ok: false,
+        error: error || new Error(stage || "upload"),
+        gl: this._gl ? this._readGlError(this._gl) : "",
+      });
+    }
+    if (img) {
+      this._engageCpu({ error: error || new Error(stage || "upload") });
+      return this._acceptCpuTile(img, tile);
+    }
+    var deferred = this._deferred(img, tile);
+    deferred._deferReason = stage || "unspecified";
+    deferred._srcW = sized.width;
+    deferred._srcH = sized.height;
+    return deferred;
+  };
+
   Player.prototype._uploadTile = function (img, tile, standby) {
+    try {
+      return this._uploadTileBody(img, tile, standby);
+    } catch (error) {
+      return this._uploadFailed(img, tile, "exception", error);
+    }
+  };
+
+  Player.prototype._uploadTileBody = function (img, tile, standby) {
     if ((this._cpuTiles || this._uploadPath === "cpu") && img) return this._acceptCpuTile(img, tile);
     if (this._glLost || !this._gl) this._setup();
     var gl = this._gl;
     if (!gl || (gl.isContextLost && gl.isContextLost())) {
-      warn("webgl context lost");
-      return this._deferred(img, tile);
+      var lost = !!(gl && gl.isContextLost && gl.isContextLost());
+      return this._uploadFailed(img, tile, lost ? "context-lost" : "no-gl", new Error(lost ? "context lost" : "no webgl"));
     }
     if (!img) throw new Error("no image");
     var maxEdge = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 4096;
@@ -3764,7 +3824,7 @@
         if (entry.tiles[i].id === tile.id) slot = plan[i];
       }
     }
-    if (slot && !slot.resident) return this._deferred(img, tile);
+    if (slot && !slot.resident) return this._uploadFailed(img, tile, "not-resident", new Error("tile is outside the resident set"));
     var win = slot && slot.window;
     var source = img;
     var upW = img.width || (tile && tile.texW) || 0;
@@ -3772,16 +3832,14 @@
     if (win && !win.full) {
       var cropped = cropSource(img, win.cropX, win.cropY, win.texW, win.texH);
       if (!cropped) {
-        warn("could not keep a full-resolution window", tile && tile.id);
-        return this._deferred(img, tile);
+        return this._uploadFailed(img, tile, "crop", new Error("could not keep a full-resolution window"));
       }
       source = cropped;
       upW = win.texW;
       upH = win.texH;
     }
     if (upW > maxEdge || upH > maxEdge) {
-      warn("tile is larger than MAX_TEXTURE_SIZE", upW + "x" + upH);
-      return this._deferred(img, tile);
+      return this._uploadFailed(img, tile, "max-size", new Error("tile is larger than MAX_TEXTURE_SIZE " + upW + "x" + upH));
     }
     var bytes = upW * upH * 4;
     var spanW = (entry && entry.width) || (tile && tile.srcW) || 1;
@@ -3798,8 +3856,7 @@
         if (!this._evictDistant(view)) break;
       }
       if (this._gpuBytes + bytes > budget) {
-        warn("texture budget", tile && tile.id);
-        return this._deferred(img, tile);
+        return this._uploadFailed(img, tile, "budget", new Error("texture budget"));
       }
     }
     var tex = null;
@@ -3815,7 +3872,7 @@
       if (!this._evictDistant(view)) break;
     }
     if (!tex && this._cpuTiles) return this._acceptCpuTile(source || img, tile);
-    if (!tex) return this._deferred(img, tile);
+    if (!tex) return this._uploadFailed(img, tile, "no-texture", new Error("texImage2D produced no texture"));
     if (tex._uploadW && tex._uploadH) bytes = tex._uploadW * tex._uploadH * 4;
     tex._bytes = bytes;
     tex._window = win && !win.full ? win : null;
@@ -4501,7 +4558,11 @@
       + " source=" + sourceKind(source)
       + " path=" + (this._uploadPath || "dom");
     if (renderer) text += " renderer=" + String(renderer).slice(0, 80);
-    if (thrown && thrown.message) text += " throw=" + String(thrown.message).slice(0, 80);
+    if (thrown) {
+      var thrownName = thrown.name ? String(thrown.name) : "Error";
+      var thrownMessage = thrown.message ? String(thrown.message) : String(thrown);
+      text += " throw=" + (thrownName + ": " + thrownMessage).slice(0, 120);
+    }
     text = withBuild(text);
     this._lastUploadFail = text;
     this._uploadFailLogs = (this._uploadFailLogs || 0) + 1;
@@ -4524,8 +4585,9 @@
   Player.prototype._acceptCpuTile = function (img, tile) {
     if (!img) return this._deferred(img, tile);
     img._cpuRetain = true;
-    var w = img.width || (tile && tile.texW) || 0;
-    var h = img.height || (tile && tile.texH) || 0;
+    var sized = safeBitmap(img, tile);
+    var w = sized.width;
+    var h = sized.height;
     return {
       _cpu: true,
       _cpuImage: img,
@@ -4963,6 +5025,7 @@
 
   function sourceKind(source) {
     if (!source) return "none";
+    if (source._kind) return source._kind;
     if (source._pixels) return "pixels";
     try {
       if (typeof ImageBitmap !== "undefined" && source instanceof ImageBitmap) return "ImageBitmap";
@@ -4970,8 +5033,35 @@
       if (typeof HTMLImageElement !== "undefined" && source instanceof HTMLImageElement) return "image";
       if (typeof OffscreenCanvas !== "undefined" && source instanceof OffscreenCanvas) return "offscreencanvas";
     } catch (error) {}
-    if (source.width && source.height) return "bitmap";
+    try {
+      if (source.width && source.height) return "bitmap";
+    } catch (error) {}
     return "unknown";
+  }
+
+  function safeBitmap(img, tile) {
+    var w = 0;
+    var h = 0;
+    var source = img;
+    try {
+      if (img && img.width) w = img.width;
+      if (img && img.height) h = img.height;
+    } catch (error) {
+      source = null;
+    }
+    if (!(w > 0) && tile) w = tile.texW || tile.srcW || 0;
+    if (!(h > 0) && tile) h = tile.texH || tile.srcH || 0;
+    if (!source) source = { width: w, height: h };
+    else {
+      try {
+        source = { width: w, height: h, _kind: sourceKind(img) };
+      } catch (error) {
+        source = { width: w, height: h };
+      }
+    }
+    source.width = w;
+    source.height = h;
+    return source;
   }
 
   function equirectWindow(spanW, spanH, yaw, pitch, fov, viewW, viewH) {

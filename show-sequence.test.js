@@ -2791,4 +2791,93 @@ assert(pixelPlayer._cpuTiles !== true, "a working typed-pixel path stays on WebG
 assert(pixelGl.uploads.some(function (rec) { return rec.pixels && rec.w === 566 && rec.h === 283; }), "the bitmap was uploaded as bytes");
 assert(!pixelDraws.some(function (call) { return call.canvas && call.canvas._spsCpu; }), "WebGL recovery does not also blit Canvas2D tiles");
 
+// The onn log's stage=unspecified size=0x0 was an exception (or a no-GL
+// return) swallowed before texImage2D. The bitmap has to stay drawable and
+// the note has to name the exception.
+const throwDraws = [];
+sandbox.document = {
+  createElement: cpuCanvasFactory(throwDraws),
+  getElementById: function () { return null; },
+};
+const throwGl = makeFailGl(function () {});
+const throwGetParameter = throwGl.getParameter;
+throwGl.getParameter = function (name) {
+  if (name === throwGl.MAX_TEXTURE_SIZE) throw new TypeError("getParameter MAX_TEXTURE_SIZE");
+  return throwGetParameter.call(throwGl, name);
+};
+const throwCanvas = {
+  width: 1280,
+  height: 720,
+  clientWidth: 1280,
+  clientHeight: 720,
+  style: {},
+  addEventListener: function () {},
+  getContext: function (kind) {
+    if (kind === "webgl2" || kind === "2d") return null;
+    return throwGl;
+  },
+};
+const throwSent = [];
+sandbox.__castSend = function (msg) { throwSent.push(msg); };
+const throwPlayer = Cast.create(throwCanvas);
+throwPlayer._focusNow = function () { return 90000; };
+const throwImg = { width: 566, height: 283 };
+const throwTile = {
+  id: "boom",
+  col: 0,
+  row: 0,
+  srcX: 0,
+  srcY: 0,
+  srcW: 2000,
+  srcH: 1000,
+  texW: 566,
+  texH: 283,
+  padL: 0,
+  padT: 0,
+};
+throwPlayer.session = { entry: { id: "p", width: 2000, height: 1000, tiles: [throwTile] }, loaded: [] };
+const throwTex = throwPlayer._uploadTile(throwImg, throwTile, false);
+assert(throwTex && throwTex._cpu === true && throwTex._cpuImage === throwImg, "an exception before texImage2D keeps the bitmap");
+assert(throwPlayer._cpuTiles === true, "the exception engages Canvas2D");
+assert(throwPlayer._diagNote.indexOf("stage=exception") >= 0, "the note names the exception stage, got " + throwPlayer._diagNote);
+assert(throwPlayer._diagNote.indexOf("TypeError") >= 0, "the note names the exception, got " + throwPlayer._diagNote);
+assert(throwPlayer._diagNote.indexOf("getParameter MAX_TEXTURE_SIZE") >= 0, "the note keeps the exception message, got " + throwPlayer._diagNote);
+assert(throwPlayer._diagNote.indexOf("566x283") >= 0, "the note keeps the bitmap size, got " + throwPlayer._diagNote);
+assert(throwPlayer._diagNote.indexOf("stage=unspecified") < 0, "the swallowed path is no longer unspecified, got " + throwPlayer._diagNote);
+throwPlayer._useTiles = true;
+throwPlayer._tileDraw = [{ tex: throwTex, tile: throwTile }];
+throwPlayer._tileW = 2000;
+throwPlayer._tileH = 1000;
+throwDraws.length = 0;
+throwPlayer._drawCpuTiles();
+assert(throwDraws.some(function (call) {
+  return call.canvas && call.canvas._spsCpu && call.args && call.args[0] === throwImg;
+}), "Canvas2D drew the bitmap that never reached texImage2D");
+throwSent.length = 0;
+throwPlayer._announcedAt = 0;
+throwPlayer._reportTv("marker");
+assert(throwSent.some(function (msg) { return msg && msg.message === "receiver build " + Cast.RECEIVER_BUILD; }), "a failure log repeats the receiver build");
+assert(throwSent.some(function (msg) { return msg && String(msg.message || "").indexOf("upload probe") >= 0; }), "a failure log repeats the upload probe");
+const noneSent = [];
+sandbox.__castSend = function (msg) { noneSent.push(msg); };
+const nonePlayer = Cast.create({
+  width: 320,
+  height: 180,
+  clientWidth: 320,
+  clientHeight: 180,
+  style: {},
+  addEventListener: function () {},
+  getContext: function () { return null; },
+});
+assert(nonePlayer._probeNote.indexOf("upload probe skipped") >= 0 && nonePlayer._probeNote.indexOf("no-webgl") >= 0, "a missing WebGL context records why the probe did not run, got " + nonePlayer._probeNote);
+const noneTex = nonePlayer._uploadTile(throwImg, throwTile, false);
+assert(noneTex && noneTex._cpuImage === throwImg, "no WebGL context keeps the decoded tile for Canvas2D");
+assert(nonePlayer._diagNote.indexOf("stage=no-gl") >= 0, "no WebGL is its own stage, got " + nonePlayer._diagNote);
+assert(nonePlayer._diagNote.indexOf("566x283") >= 0, "the no-GL failure keeps the bitmap size, got " + nonePlayer._diagNote);
+noneSent.length = 0;
+nonePlayer._announcedAt = 0;
+nonePlayer.announceBuild();
+assert(noneSent.some(function (msg) { return msg && msg.message === "receiver build " + Cast.RECEIVER_BUILD; }), "announceBuild sends the build when the probe was skipped");
+assert(noneSent.some(function (msg) { return msg && String(msg.message || "").indexOf("upload probe") >= 0; }), "announceBuild sends the probe line when WebGL never started");
+
 console.log("show-sequence ok");
