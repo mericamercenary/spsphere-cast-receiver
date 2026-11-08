@@ -17,6 +17,9 @@
    overview immediately.
    The screen has no counters. */
 (function (root) {
+  // Baked into player.js and the script URL. A Cast WebView that cached
+  // "player.js" will not reuse that file for "player.js?v=<this>".
+  var RECEIVER_BUILD = "20261108.1";
   var ROTATIONS = 2;
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
@@ -691,7 +694,32 @@
   };
 
   Player.prototype._send = function (msg) {
-    if (window.__castSend) window.__castSend(msg);
+    if (!window.__castSend) {
+      if (!this._outbox) this._outbox = [];
+      this._outbox.push(msg);
+      if (this._outbox.length > 30) this._outbox.shift();
+      return;
+    }
+    window.__castSend(msg);
+  };
+
+  Player.prototype._flushSends = function () {
+    var box = this._outbox || [];
+    this._outbox = [];
+    if (!window.__castSend) {
+      this._outbox = box;
+      return;
+    }
+    for (var i = 0; i < box.length; i++) window.__castSend(box[i]);
+  };
+
+  // The probe runs when the page is parsed, before the Cast channel exists,
+  // and a sender that connects later never sees that first send. Repeat the
+  // build id and the probe once a sender is actually listening.
+  Player.prototype.announceBuild = function () {
+    this._flushSends();
+    this._send({ type: "log", message: "receiver build " + RECEIVER_BUILD });
+    if (this._probeNote) this._send({ type: "log", message: this._probeNote });
   };
 
   Player.prototype._reportTv = function (message) {
@@ -847,7 +875,14 @@
       if (this._finishSession(this.session)) return;
     } else {
       this._diagErrors = (this._diagErrors || 0) + 1;
-      this._diagNote = this._lastUploadFail || "texture upload failed";
+      if (!this._lastUploadFail) {
+        this._lastUploadFail = "texture upload failed stage=unspecified gl=none"
+          + " lost=" + (this._glLost ? "1" : "0")
+          + " webgl2=" + (this._webgl2 ? "1" : "0")
+          + " size=0x0 source=none path=" + (this._uploadPath || "dom");
+      }
+      this._diagNote = withBuild(this._lastUploadFail);
+      this._lastUploadFail = this._diagNote;
       this._reportTv(this._diagNote);
     }
     this._sendDiag();
@@ -888,13 +923,14 @@
       uploaded: this._diagUploaded || 0,
       errors: this._diagErrors || 0,
       note: this._diagNote || "",
+      build: RECEIVER_BUILD,
     };
     var key = [msg.requested, msg.received, msg.decoded, msg.uploaded, msg.errors, msg.note].join(":");
     var now = this._clock();
     if (!force && key === this._diagKey && now - (this._diagSentAt || 0) < 2000) return;
     this._diagKey = key;
     this._diagSentAt = now;
-    if (window.__castSend) window.__castSend(msg);
+    this._send(msg);
     if (force) this._checkHealthWatchdog(now);
   };
 
@@ -1035,11 +1071,18 @@
       this._lanDeadSince = 0;
     }
     if (!reason) return false;
-    // The bitmap path is already known dead. softReset would ask for the
-    // same tiles and upload them the same way until the sender gives up.
-    if (this._cpuTiles && (reason === "tile-backlog" || reason === "upload-backlog")) return false;
+    // A bitmap that will not upload must not be fetched again. That loop is
+    // what ended the onn session: tile-backlog, then the same failures.
+    if (this._repeatUploadReset(reason)) return false;
     this.softReset(reason);
     return true;
+  };
+
+  Player.prototype._repeatUploadReset = function (reason) {
+    if (reason !== "tile-backlog" && reason !== "upload-backlog" && reason !== "request-storm") return false;
+    if (this._cpuTiles) return true;
+    var note = this._diagNote || "";
+    return (this._diagErrors || 0) > 0 && note.indexOf("texture upload failed") >= 0;
   };
 
   Player.prototype._pieceReadyId = function (session, id) {
@@ -4459,16 +4502,16 @@
       + " path=" + (this._uploadPath || "dom");
     if (renderer) text += " renderer=" + String(renderer).slice(0, 80);
     if (thrown && thrown.message) text += " throw=" + String(thrown.message).slice(0, 80);
-    if (text.length > 300) text = text.slice(0, 300);
+    text = withBuild(text);
     this._lastUploadFail = text;
     this._uploadFailLogs = (this._uploadFailLogs || 0) + 1;
     if (this._uploadFailLogs <= 4) this._reportTv(text);
   };
 
   Player.prototype._engageCpu = function (result) {
-    var why = this._lastUploadFail || "texture upload failed";
+    var why = this._lastUploadFail || "texture upload failed stage=unspecified";
     if (why.indexOf("Canvas2D") < 0) why += "; Canvas2D tiles";
-    if (why.length > 300) why = why.slice(0, 300);
+    why = withBuild(why);
     this._cpuReason = why;
     this._diagNote = why;
     this._uploadPath = "cpu";
@@ -4587,8 +4630,8 @@
     this._domUploadOk = dom;
     if (dom === false && typed) this._uploadPath = "pixels";
     else if (dom === false && typed === false) {
-      this._lastUploadFail = "texture upload failed stage=probe gl=" + (this._probeDomGl || this._probeTypedGl || "none")
-        + " size=1x1 source=canvas path=probe";
+      this._lastUploadFail = withBuild("texture upload failed stage=probe gl=" + (this._probeDomGl || this._probeTypedGl || "none")
+        + " size=1x1 source=canvas path=probe");
       this._engageCpu({ gl: this._probeDomGl || this._probeTypedGl || "" });
     } else if (!this._uploadPath) this._uploadPath = "dom";
     var note = "upload probe typed=" + (typed ? "ok" : "fail")
@@ -4600,7 +4643,7 @@
     if (renderer) note += " renderer=" + String(renderer).slice(0, 80);
     if (this._probeTypedGl) note += " typedGl=" + String(this._probeTypedGl).slice(0, 60);
     if (this._probeDomGl) note += " domGl=" + String(this._probeDomGl).slice(0, 60);
-    if (note.length > 300) note = note.slice(0, 300);
+    note = withBuild(note);
     this._probeNote = note;
     this._send({ type: "log", message: note });
   };
@@ -6500,6 +6543,15 @@
     this._failOrRetry("timeout");
   };
 
+  function withBuild(text) {
+    var tag = " build=" + RECEIVER_BUILD;
+    text = text || "";
+    if (text.indexOf("build=") >= 0) tag = "";
+    var max = 300;
+    if ((text + tag).length > max) text = text.slice(0, Math.max(0, max - tag.length));
+    return text + tag;
+  }
+
   function warn(code, detail) {
     if (typeof console === "undefined" || !console.warn) return;
     var text = "spsphere cast: " + code;
@@ -7884,6 +7936,7 @@
     panLeadDeg: panLeadDeg,
     BASE_BYTES: BASE_BYTES,
     standbyAllowance: standbyAllowance,
+    RECEIVER_BUILD: RECEIVER_BUILD,
     receiverStartup: receiverStartup,
     IdleGuard: IdleGuard,
     decodeAim: decodeAim,

@@ -2687,6 +2687,44 @@ flushOnn();
 const fetchesAfter = onnSent.filter(function (msg) { return msg && msg.type === "fetch"; }).length;
 assert(fetchesAfter === fetchesBefore, "the fallback does not request the same tiles again, grew by " + (fetchesAfter - fetchesBefore));
 assert(onnSent.filter(function (msg) { return msg && msg.type === "log" && String(msg.message).indexOf("upload probe") >= 0; }).length >= 1, "startup probe is logged once");
+assert(onnDiag.build === Cast.RECEIVER_BUILD, "tile diagnostics name the receiver build");
+assert(onnDiag.note.indexOf("build=" + Cast.RECEIVER_BUILD) >= 0, "the failure note names the build, got " + onnDiag.note);
+assert(onnDiag.note !== "texture upload failed", "the failure note is not the legacy generic string");
+const buildBare = Cast.create({
+  width: 32,
+  height: 32,
+  clientWidth: 32,
+  clientHeight: 32,
+  style: {},
+  addEventListener: function () {},
+  getContext: function () { return null; },
+});
+buildBare._diagRequested = 40;
+buildBare._diagUploaded = 1;
+buildBare._diagErrors = 25;
+buildBare._diagNote = "texture upload failed";
+buildBare.session = { pending: null };
+buildBare.items = ["photo"];
+assert(buildBare._checkHealthWatchdog(900000) === false, "upload failures do not soft-reset even after one upload was counted");
+buildBare._lastUploadFail = "";
+buildBare._cpuTiles = false;
+buildBare._noteUploaded(null);
+assert(buildBare._diagNote !== "texture upload failed", "a missing texture does not reuse the legacy note");
+assert(buildBare._diagNote.indexOf("stage=") >= 0 && buildBare._diagNote.indexOf("build=" + Cast.RECEIVER_BUILD) >= 0, "the unspecified failure still names the stage and build, got " + buildBare._diagNote);
+const buildSent = [];
+const previousSend = sandbox.__castSend;
+sandbox.__castSend = null;
+const buildEarly = Cast.create(onnCanvas);
+assert(buildEarly._outbox && buildEarly._outbox.some(function (msg) { return msg && String(msg.message || "").indexOf("upload probe") >= 0; }), "the probe is kept until a sender exists");
+sandbox.__castSend = function (msg) { buildSent.push(msg); };
+buildEarly.announceBuild();
+assert(buildSent.some(function (msg) { return msg && msg.message === "receiver build " + Cast.RECEIVER_BUILD; }), "announceBuild tells the phone which receiver is running");
+assert(buildSent.some(function (msg) { return msg && String(msg.message || "").indexOf("upload probe") >= 0; }), "announceBuild delivers the probe that was sent before the channel existed");
+sandbox.__castSend = previousSend;
+const receiverPage = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
+assert(receiverPage.indexOf("player.js?v=" + Cast.RECEIVER_BUILD) >= 0, "index.html cache-busts player.js with the build id");
+assert(receiverPage.indexOf("no-cache") >= 0, "the receiver page asks not to be cached");
+assert(receiverPage.indexOf("announceBuild") >= 0, "the page repeats the build id when a sender connects");
 
 const pixelDraws = [];
 sandbox.document = {

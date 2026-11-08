@@ -3,6 +3,9 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
   <title></title>
   <style>
     html, body { margin: 0; height: 100%; background: #0b0d10; overflow: hidden; }
@@ -46,7 +49,7 @@
   <div id="mark" hidden><img class="logo" src="logo.png" alt="" /></div>
   <div id="busy"></div>
   <video id="wakeVideo" muted loop playsinline autoplay width="2" height="2" style="position:fixed;left:-99px;top:-99px;width:2px;height:2px;opacity:0.01;pointer-events:none"></video>
-  <script src="player.js"></script>
+  <script src="player.js?v=20261108.1"></script>
   <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
   <script>
     var NAMESPACE = "urn:x-cast:com.cameron.viewer360";
@@ -306,6 +309,7 @@
         keepReceiverAwake();
         sendLimits();
         sendCaps();
+        if (player && player.announceBuild) player.announceBuild();
         sendLog("receiver ready (hello ack)");
         if (player && player.items && player.items.length) {
           window.__castSend({
@@ -365,6 +369,7 @@
     window.__castSend = function (msg) {
       try { context.sendCustomMessage(NAMESPACE, undefined, msg); } catch (e) {}
     };
+    if (player && player.announceBuild) player.announceBuild();
     function onCastMessage(event) {
       try { handle(event && event.data); } catch (e) {}
     }
@@ -392,6 +397,7 @@
         if (sysEvents.SENDER_CONNECTED) {
           context.addEventListener(sysEvents.SENDER_CONNECTED, function (event) {
             keepReceiverAwake();
+            if (player && player.announceBuild) player.announceBuild();
             sendLog("sender connected: " + (event && event.senderId || "unknown"));
           });
         }
@@ -436,7 +442,7 @@
     } catch (e) {}
     context.start(options);
     keepReceiverAwake();
-    sendLog("receiver boot");
+    sendLog("receiver boot " + (SpsphereCast.RECEIVER_BUILD || ""));
     window.__idle = new SpsphereCast.IdleGuard(function () { return Date.now(); });
     var lastAppStateAt = Date.now();
     setInterval(function () {
