@@ -49,7 +49,7 @@
   <div id="mark" hidden><img class="logo" src="logo.png" alt="" /></div>
   <div id="busy"></div>
   <video id="wakeVideo" muted loop playsinline autoplay width="2" height="2" style="position:fixed;left:-99px;top:-99px;width:2px;height:2px;opacity:0.01;pointer-events:none"></video>
-  <script src="player.js?v=20261108.3"></script>
+  <script src="player.js?v=20261108.4"></script>
   <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
   <script>
     var NAMESPACE = "urn:x-cast:com.cameron.viewer360";
@@ -109,9 +109,15 @@
       }
       aimSocket = socket;
       socket.binaryType = "arraybuffer";
+      socket.onopen = function () {
+        if (socket !== aimSocket) return;
+        if (player && player.touchAim) player.touchAim(Date.now());
+        if (typeof sendLog === "function") sendLog("aim socket open");
+      };
       socket.onmessage = function (event) {
         if (socket !== aimSocket) return;
         if (player && player.noteSender) player.noteSender(Date.now());
+        if (player && player.touchAim) player.touchAim(Date.now());
         var skip = SpsphereCast.decodeSkip(event.data);
         if (skip) {
           player.skip(skip);
@@ -121,17 +127,29 @@
         if (!sample) return;
         if (player.applyAim(sample) && socket.readyState === 1) {
           socket.send(player.encodeEcho(sample.seq, sample.ts));
+          if (player.touchAim) player.touchAim(Date.now());
         }
       };
       socket.onclose = function () {
         if (socket !== aimSocket) return;
         aimSocket = null;
+        if (typeof sendLog === "function") sendLog("aim socket closed");
         if (aimUrl && player && player.items && player.items.length) {
           setTimeout(function () {
             if (!aimSocket) connectAim(aimUrl);
           }, 600);
         }
       };
+    }
+
+    function sendAimKeepalive(now) {
+      if (!aimSocket || aimSocket.readyState !== 1 || !player || !player.aimKeepaliveDue) return;
+      now = now || Date.now();
+      if (!player.aimKeepaliveDue(now)) return;
+      try {
+        aimSocket.send(player.aimKeepaliveBytes(now));
+        if (typeof sendLog === "function") sendLog("aim keepalive");
+      } catch (e) {}
     }
 
     var silentAudioCtx = null;
@@ -375,8 +393,8 @@
     }
     var startup = SpsphereCast.receiverStartup();
     var options = new cast.framework.CastReceiverOptions();
-    options.disableIdleTimeout = true;
-    options.maxInactivity = 86400;
+    options.disableIdleTimeout = startup.disableIdleTimeout !== false;
+    options.maxInactivity = startup.maxInactivity;
     options.customNamespaces = {};
     options.customNamespaces[NAMESPACE] = cast.framework.system.MessageType.JSON;
     options.skipMplLoad = startup.skipMplLoad;
@@ -471,6 +489,11 @@
       if (!guard.shown) guard.show();
       if (player.playing) guard.play();
       else guard.pause();
+      sendAimKeepalive(now);
+      if (player.items && player.items.length && (!player._castKeepaliveAt || now - player._castKeepaliveAt >= 10000)) {
+        player._castKeepaliveAt = now;
+        window.__castSend({ type: "heartbeat", state: guard.shown ? guard.state : "PLAYING" });
+      }
       if (!guard.tick()) return;
       window.__castSend({ type: "heartbeat", state: guard.state });
     }, 1000);

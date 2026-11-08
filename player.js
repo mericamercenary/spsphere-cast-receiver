@@ -19,7 +19,7 @@
 (function (root) {
   // Baked into player.js and the script URL. A Cast WebView that cached
   // "player.js" will not reuse that file for "player.js?v=<this>".
-  var RECEIVER_BUILD = "20261108.3";
+  var RECEIVER_BUILD = "20261108.4";
   var ROTATIONS = 2;
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
@@ -35,6 +35,10 @@
   var UPLOAD_BUDGET_MS = 4;
   var GPU_CAP = 384 * 1024 * 1024;
   var IDLE_HEARTBEAT_MS = 15000;
+  // NanoWSD's read loop blocks on the HTTP socket. This app closes that
+  // read after 30s of silence (the /aim drop is 30.0s after the last frame).
+  // Stay under that, and under NanoHTTPD's 5s stock SOCKET_READ_TIMEOUT.
+  var AIM_KEEPALIVE_MS = 10000;
   var MIN_DPS = 6;
   var MAX_DPS = 72;
   var OMEGA = 40;
@@ -2125,6 +2129,28 @@
     view.setUint32(4, seq >>> 0, true);
     view.setFloat64(8, Number(ts) || 0, true);
     return this._echo;
+  };
+
+  Player.prototype.touchAim = function (now) {
+    this._aimTrafficAt = now || Date.now();
+  };
+
+  Player.prototype.aimKeepaliveDue = function (now) {
+    now = now || Date.now();
+    var last = this._aimTrafficAt || 0;
+    if (!(last > 0)) return false;
+    return now - last >= AIM_KEEPALIVE_MS;
+  };
+
+  // An unsolicited echo (type 2, seq 0). The phone already accepts this
+  // frame on /aim, and any received byte resets the socket read timeout.
+  Player.prototype.aimKeepaliveBytes = function (now) {
+    now = now || Date.now();
+    var packet = this.encodeEcho(0, now);
+    var copy = new Uint8Array(packet.byteLength || 16);
+    copy.set(new Uint8Array(packet));
+    this.touchAim(now);
+    return copy;
   };
 
   Player.prototype._kick = function () {
@@ -7558,6 +7584,7 @@
       skipMplLoad: false,
       streamType: "LIVE",
       heartbeatMs: IDLE_HEARTBEAT_MS,
+    aimKeepaliveMs: AIM_KEEPALIVE_MS,
       contentId: "spsphere-show",
     };
   }
@@ -8163,6 +8190,7 @@
     materializeJpeg: materializeJpeg,
     SNAP_FADE_MS: SNAP_FADE_MS,
     SENDER_TIMEOUT_MS: SENDER_TIMEOUT_MS,
+    AIM_KEEPALIVE_MS: AIM_KEEPALIVE_MS,
     GPU_CAP: GPU_CAP,
     OMEGA: OMEGA,
     tileLoadOrder: tileLoadOrder,

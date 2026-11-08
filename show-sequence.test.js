@@ -2998,4 +2998,59 @@ assert(wideCpu.length === 4, "no-WebGL requests every longitude column, got " + 
 assert(wideCpu[0] === "c0", "the column under the lens is still first, got " + wideCpu.join(","));
 assert(wideGpu.indexOf("c3") < 0, "WebGL still skips a column outside the lookahead, got " + wideGpu.join(","));
 
+// /aim dies when NanoHTTPD's socket read sees 30s of silence. A keepalive
+// echo inside that window has to keep the socket open across 35s idle.
+function AimIdleServer(timeoutMs) {
+  this.timeoutMs = timeoutMs;
+  this.open = false;
+  this.lastRx = 0;
+  this.frames = [];
+}
+AimIdleServer.prototype.connect = function (now) {
+  this.open = true;
+  this.lastRx = now;
+};
+AimIdleServer.prototype.receive = function (now, bytes) {
+  if (!this.open || now - this.lastRx >= this.timeoutMs) {
+    this.open = false;
+    return false;
+  }
+  this.lastRx = now;
+  this.frames.push(bytes);
+  return true;
+};
+AimIdleServer.prototype.tick = function (now) {
+  if (this.open && now - this.lastRx >= this.timeoutMs) this.open = false;
+};
+const aimIdle = Cast.create({
+  width: 320,
+  height: 180,
+  clientWidth: 320,
+  clientHeight: 180,
+  style: {},
+  getContext: function () { return null; },
+});
+const aimServer = new AimIdleServer(30000);
+let aimNow = 5000;
+aimServer.connect(aimNow);
+aimIdle.touchAim(aimNow);
+for (let elapsed = 0; elapsed <= 35000; elapsed += 1000) {
+  aimNow = 5000 + elapsed;
+  aimServer.tick(aimNow);
+  if (aimIdle.aimKeepaliveDue(aimNow)) aimServer.receive(aimNow, aimIdle.aimKeepaliveBytes(aimNow));
+}
+assert(aimServer.open === true, "35s idle with keepalive does not drop a 30s /aim timeout");
+assert(aimServer.frames.length >= 3, "keepalive frames cover 35s, got " + aimServer.frames.length);
+assert(aimServer.frames[0][0] === 2, "keepalive is the echo frame the phone already accepts");
+const aimSilent = new AimIdleServer(30000);
+aimSilent.connect(5000);
+aimSilent.tick(5000 + 35000);
+assert(aimSilent.open === false, "35s of silence drops a 30s /aim socket");
+assert(Cast.AIM_KEEPALIVE_MS === 10000 && Cast.AIM_KEEPALIVE_MS < 30000, "keepalive stays under the 30s socket read");
+assert(Cast.receiverStartup().disableIdleTimeout === true, "CAF idle timeout stays off");
+assert(Cast.receiverStartup().maxInactivity >= 86400, "CAF inactivity stays at a day");
+const aimPage = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
+assert(aimPage.indexOf("sendAimKeepalive") >= 0, "the receiver page sends /aim keepalives");
+assert(aimPage.indexOf("disableIdleTimeout") >= 0 && aimPage.indexOf("maxInactivity") >= 0, "the page still sets the CAF idle options");
+
 console.log("show-sequence ok");
