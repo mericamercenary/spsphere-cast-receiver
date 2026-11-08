@@ -2644,18 +2644,22 @@ assert(onnDiag.note.indexOf("Canvas2D") >= 0, "the diag says the Canvas2D fallba
 assert(onnDiag.note.indexOf("Mali-G57") >= 0, "the diag names the renderer, got " + onnDiag.note);
 assert(onn._cpuTiles === true, "the receiver leaves the dead bitmap upload path");
 assert(onnBitmap.closed !== true, "the fallback keeps the decoded bitmap");
-const onnShown = cpuDraws.filter(function (call) {
-  return call.canvas && call.canvas._spsCpu && call.args && call.args[0] === onnBitmap;
+const onnBlitted = cpuDraws.filter(function (call) {
+  return call.args && call.args[0] === onnBitmap;
 });
-assert(onnShown.length >= 1, "Canvas2D drew the decoded tile, calls " + cpuDraws.length);
-const syAtRest = onnShown[onnShown.length - 1].args[2];
+assert(onnBlitted.length >= 1, "Canvas2D painted the decoded tile into the equirect, calls " + cpuDraws.length);
+const onnView = cpuDraws.filter(function (call) {
+  return call.canvas && call.canvas._spsCpu && call.args && call.args[0] !== onnBitmap;
+});
+assert(onnView.length >= 1, "the view is sampled from the equirect");
+const syAtRest = onnView[onnView.length - 1].args[2];
 assert(onn.applyAim({ seq: 3, yaw: 12, pitch: 30, roll: 0, fov: 75, anchor: true, ts: onnClock }), "aim is accepted on the fallback");
 for (let step = 0; step < 40; step++) onn.stepAim(16);
 assert(onn.pitch > 20, "aim pitch reaches the phone, got " + onn.pitch);
 const beforeAimDraw = cpuDraws.length;
 onn._drawCpuTiles();
 const aimedTile = cpuDraws.slice(beforeAimDraw).filter(function (call) {
-  return call.canvas && call.canvas._spsCpu && call.args && call.args[0] === onnBitmap;
+  return call.canvas && call.canvas._spsCpu && call.args && call.args[0] !== onnBitmap;
 });
 assert(aimedTile.length >= 1, "the aimed view redraws the tile");
 assert(Math.abs(aimedTile[0].args[2] - syAtRest) > 1, "pitch moves the equirect sample, " + aimedTile[0].args[2] + " vs " + syAtRest);
@@ -2673,8 +2677,10 @@ onn._tileDraw = [{
 const beforeFade = cpuDraws.length;
 onn._drawCpuTiles();
 const faded = cpuDraws.slice(beforeFade).filter(function (call) { return call.canvas && call.canvas._spsCpu; });
-assert(faded.some(function (call) { return call.args[0] === onnBitmap && Math.abs(call.alpha - 1) < 1e-6; }), "the previous photo stays up during the switch");
-assert(faded.some(function (call) { return call.args[0] === otherBitmap && Math.abs(call.alpha - 0.5) < 1e-6; }), "the next photo fades in on the Canvas2D path");
+assert(faded.some(function (call) { return call.canvas && call.canvas._spsCpu && Math.abs(call.alpha - 1) < 1e-6; }), "the previous photo stays up during the switch");
+assert(faded.some(function (call) { return call.canvas && call.canvas._spsCpu && Math.abs(call.alpha - 0.5) < 1e-6; }), "the next photo fades in on the Canvas2D path");
+assert(cpuDraws.some(function (call) { return call.args && call.args[0] === onnBitmap; }), "the previous photo is in the equirect");
+assert(cpuDraws.some(function (call) { return call.args && call.args[0] === otherBitmap; }), "the next photo is in the equirect");
 const fetchesBefore = onnSent.filter(function (msg) { return msg && msg.type === "fetch"; }).length;
 const resetsBefore = onn._softResets || 0;
 if (onn.session) onn.session.pending = null;
@@ -2851,7 +2857,7 @@ throwPlayer._tileH = 1000;
 throwDraws.length = 0;
 throwPlayer._drawCpuTiles();
 assert(throwDraws.some(function (call) {
-  return call.canvas && call.canvas._spsCpu && call.args && call.args[0] === throwImg;
+  return call.args && call.args[0] === throwImg;
 }), "Canvas2D drew the bitmap that never reached texImage2D");
 throwSent.length = 0;
 throwPlayer._announcedAt = 0;
@@ -2879,5 +2885,117 @@ nonePlayer._announcedAt = 0;
 nonePlayer.announceBuild();
 assert(noneSent.some(function (msg) { return msg && msg.message === "receiver build " + Cast.RECEIVER_BUILD; }), "announceBuild sends the build when the probe was skipped");
 assert(noneSent.some(function (msg) { return msg && String(msg.message || "").indexOf("upload probe") >= 0; }), "announceBuild sends the probe line when WebGL never started");
+
+const backSegs = Cast.tilePhotoSegments({ srcX: 6144, srcW: 4096, srcY: 1365, srcH: 1366 }, 8192);
+assert(backSegs.length === 2, "a 180° back strip splits across the seam, got " + backSegs.length);
+assert(backSegs.some(function (seg) { return seg.photoX === 0 && seg.photoW === 2048; }), "the wrapped half lands at longitude 0, " + JSON.stringify(backSegs));
+assert(backSegs.some(function (seg) { return seg.photoX === 6144 && seg.photoW === 2048; }), "the other half stays at the high longitudes, " + JSON.stringify(backSegs));
+const sphereTiles = [];
+const sphereImages = {};
+for (let row = 0; row < 3; row++) {
+  for (let col = 0; col < 2; col++) {
+    const id = "s-r" + row + "c" + col;
+    const tile = {
+      id: id,
+      col: col,
+      row: row,
+      srcX: col === 0 ? 2048 : 6144,
+      srcY: row * 1365,
+      srcW: 4096,
+      srcH: row === 2 ? 1366 : 1365,
+      texW: 400,
+      texH: 140,
+      padL: 0,
+      padT: 0,
+    };
+    const img = { width: 400, height: 140, id: id };
+    sphereImages[id] = img;
+    sphereTiles.push({ tex: { _cpu: true, _cpuImage: img, _mip: true, _spsUploaded: true }, tile: tile });
+  }
+}
+const sphereDraws = [];
+sandbox.document = {
+  createElement: cpuCanvasFactory(sphereDraws),
+  getElementById: function () { return null; },
+};
+const sphere = Cast.create({
+  width: 1280,
+  height: 720,
+  clientWidth: 1280,
+  clientHeight: 720,
+  style: {},
+  addEventListener: function () {},
+  getContext: function () { return null; },
+});
+sphere._cpuTiles = true;
+sphere._useTiles = true;
+sphere._tileDraw = sphereTiles;
+sphere._tileW = 8192;
+sphere._tileH = 4096;
+sphere.entries = [{ id: "sphere", width: 8192, height: 4096, tiles: sphereTiles.map(function (p) { return p.tile; }) }];
+sphere.session = { entry: sphere.entries[0] };
+sphere.yaw = 0;
+sphere.pitch = 0;
+sphere.fov = 90;
+for (let pass = 0; pass < 8; pass++) sphere._drawCpuTiles();
+const painted = {};
+sphereDraws.forEach(function (call) {
+  const img = call.args && call.args[0];
+  if (img && img.id) painted[img.id] = (painted[img.id] || 0) + 1;
+});
+["s-r0c0", "s-r1c0", "s-r2c0", "s-r0c1", "s-r1c1", "s-r2c1"].forEach(function (id) {
+  assert(painted[id] >= 1, "no-WebGL paints " + id + " onto the equirect, got " + JSON.stringify(painted));
+});
+assert(painted["s-r1c1"] >= 2, "the back horizon is drawn on both sides of the seam, got " + painted["s-r1c1"]);
+function viewSamples(yaw, pitch) {
+  sphereDraws.length = 0;
+  sphere.yaw = yaw;
+  sphere.pitch = pitch;
+  sphere._drawCpuTiles();
+  return sphereDraws.filter(function (call) { return call.canvas && call.canvas._spsCpu; });
+}
+const sphereFront = viewSamples(0, 0);
+const sphereBack = viewSamples(180, 0);
+const sphereUp = viewSamples(0, 70);
+const sphereDown = viewSamples(0, -70);
+assert(sphereFront.length >= 1 && sphereBack.length >= 1, "yaw 0 and yaw 180 both sample the equirect");
+assert(sphereBack.length >= 2, "yaw 180 wraps the view across the seam, draws " + sphereBack.length);
+const frontSx = sphereFront[0].args[1];
+const backSx = sphereBack.map(function (call) { return call.args[1]; });
+assert(backSx.some(function (sx) { return Math.abs(sx - frontSx) > 1; }) || sphereBack.length >= 2, "the back view is not the same window as the front");
+assert(sphereUp.length >= 1 && sphereDown.length >= 1, "pitch reaches both poles");
+assert(Math.abs(sphereUp[0].args[2] - sphereDown[0].args[2]) > 1, "pitch moves the latitude sample, " + sphereUp[0].args[2] + " vs " + sphereDown[0].args[2]);
+function pulled(full) {
+  const ids = [];
+  const ready = {};
+  const entry = {
+    id: "wide",
+    width: 8192,
+    height: 1000,
+    tiles: [0, 1, 2, 3].map(function (col) {
+      return { id: "c" + col, col: col, row: 0, srcX: col * 2048, srcY: 0, srcW: 2048, srcH: 1000, texW: 100, texH: 50 };
+    }),
+  };
+  const session = Cast.createSession({
+    fullSphere: function () { return full; },
+    view: function () { return { u: 0.125, v: 0.5, halfU: 0.08, halfV: 0.2, lookaheadDeg: 30, panSign: 1, manual: false }; },
+    now: function () { return 1; },
+  });
+  session.entry = entry;
+  session.loaded = [];
+  for (let n = 0; n < 8; n++) {
+    const tile = session._pickTile();
+    if (!tile) break;
+    ids.push(tile.id);
+    session.loaded.push({ tile: tile, tex: { _mip: true, _spsUploaded: true } });
+    ready[tile.id] = true;
+  }
+  return ids;
+}
+const wideCpu = pulled(true);
+const wideGpu = pulled(false);
+assert(wideCpu.length === 4, "no-WebGL requests every longitude column, got " + wideCpu.join(","));
+assert(wideCpu[0] === "c0", "the column under the lens is still first, got " + wideCpu.join(","));
+assert(wideGpu.indexOf("c3") < 0, "WebGL still skips a column outside the lookahead, got " + wideGpu.join(","));
 
 console.log("show-sequence ok");

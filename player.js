@@ -19,7 +19,7 @@
 (function (root) {
   // Baked into player.js and the script URL. A Cast WebView that cached
   // "player.js" will not reuse that file for "player.js?v=<this>".
-  var RECEIVER_BUILD = "20261108.2";
+  var RECEIVER_BUILD = "20261108.3";
   var ROTATIONS = 2;
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
@@ -2811,9 +2811,11 @@
         if ((self._lanFailures || 0) >= LAN_FAIL_LIMIT) self._lanDead = true;
       },
       ahead: function () {
-        if (self._lan && !self._lanDead && self._lanVerified) return LAN_AHEAD;
-        return AHEAD_REQUESTS;
+        var n = (self._lan && !self._lanDead && self._lanVerified) ? LAN_AHEAD : AHEAD_REQUESTS;
+        if (self._cpuTiles || self._uploadPath === "cpu") return Math.max(n, 3);
+        return n;
       },
+      fullSphere: function () { return !!(self._cpuTiles || self._uploadPath === "cpu"); },
       preloadLimit: function () { return self._preloadDepth || 0; },
       gpuRoom: function () { return Math.max(0, GPU_CAP - (self._gpuBytes || 0)); },
       materialize: function (payload, done) {
@@ -4746,6 +4748,68 @@
     return ctx;
   };
 
+  Player.prototype._cpuSpan = function () {
+    var span = this._photoSpan();
+    var entry = this._showingEntry();
+    if (entry && entry.width > span.w) span = { w: entry.width, h: (entry.height > span.h ? entry.height : span.h) };
+    return span;
+  };
+
+  Player.prototype._ensureCpuAtlas = function (key, spanW, spanH) {
+    if (!this._cpuAtlases) this._cpuAtlases = {};
+    var aw = spanW > 2048 ? 2048 : Math.max(2, spanW | 0);
+    var ah = Math.max(2, Math.round(aw * (spanH > 0 ? spanH : 1) / (spanW > 0 ? spanW : 1)));
+    if (ah > 1024) {
+      ah = 1024;
+      aw = Math.max(2, Math.round(ah * spanW / spanH));
+    }
+    var slot = this._cpuAtlases[key];
+    if (slot && slot.canvas && slot.spanW === spanW && slot.spanH === spanH && slot.canvas.width === aw && slot.canvas.height === ah) return slot;
+    var canvas = null;
+    var ctx = null;
+    if (typeof document !== "undefined" && document.createElement) {
+      canvas = document.createElement("canvas");
+      canvas.width = aw;
+      canvas.height = ah;
+      ctx = canvas.getContext("2d");
+    }
+    slot = { key: key, canvas: canvas, ctx: ctx, spanW: spanW, spanH: spanH, seen: {}, queue: [], width: aw, height: ah };
+    this._cpuAtlases[key] = slot;
+    return slot;
+  };
+
+  Player.prototype._enqueueCpuPieces = function (list, key, spanW, spanH) {
+    var atlas = this._ensureCpuAtlas(key, spanW, spanH);
+    if (!list) return atlas;
+    for (var i = 0; i < list.length; i++) {
+      var piece = list[i];
+      var tex = piece && piece.tex;
+      var img = (tex && tex._cpuImage) || (piece && piece.image) || null;
+      var tile = piece && (piece.spec || piece.tile || (tex && tex._window));
+      if (!img || !tile || !(tile.srcW > 0) || !(tile.srcH > 0)) continue;
+      if (!img._cpuStamp) {
+        this._cpuStamp = (this._cpuStamp || 0) + 1;
+        img._cpuStamp = this._cpuStamp;
+      }
+      var id = (tile.id || (tile.srcX + ":" + tile.srcY)) + ":" + img._cpuStamp;
+      if (atlas.seen[id]) continue;
+      atlas.seen[id] = true;
+      atlas.queue.push({ img: img, tile: tile });
+    }
+    return atlas;
+  };
+
+  Player.prototype._flushCpuAtlas = function (atlas, limit) {
+    if (!atlas || !atlas.ctx || !atlas.queue || !atlas.queue.length) return 0;
+    var n = 0;
+    var cap = limit > 0 ? limit : 1;
+    while (atlas.queue.length && n < cap) {
+      var job = atlas.queue.shift();
+      n += paintTileOnAtlas(atlas.ctx, atlas.width, atlas.height, job.img, job.tile, atlas.spanW, atlas.spanH) ? 1 : 0;
+    }
+    return n;
+  };
+
   Player.prototype._drawCpuTiles = function () {
     var ctx = this._cpuContext();
     if (!ctx) return 0;
@@ -4761,7 +4825,7 @@
     }
     ctx.fillStyle = "#0b0d10";
     ctx.fillRect(0, 0, w, h);
-    var span = this._photoSpan();
+    var span = this._cpuSpan();
     var pose = (this.poses && this.poses[this.index]) || ZERO_POSE;
     var fadePose = this._fadePose || ZERO_POSE;
     var oldList = this._fading ? (this._fadeFrom || []) : [];
@@ -4771,18 +4835,28 @@
     var alphas = compositeAlphas(this._fadeMs, haveOld, haveNew, this._fadeLimit || TILE_FADE_MS);
     var posePitch = ((pose.pitch || 0) * 180) / Math.PI;
     var oldPosePitch = ((fadePose.pitch || 0) * 180) / Math.PI;
+    var oldSpanW = this._fadeW || span.w;
+    var oldSpanH = this._fadeH || span.h;
+    var newAtlas = this._enqueueCpuPieces(newList, "live", span.w, span.h);
+    var oldAtlas = haveOld ? this._enqueueCpuPieces(oldList, "fade", oldSpanW, oldSpanH) : null;
+    var pending = (newAtlas && newAtlas.queue ? newAtlas.queue.length : 0) + (oldAtlas && oldAtlas.queue ? oldAtlas.queue.length : 0);
+    // One full-resolution strip per frame. Painting every 4064px JPEG on
+    // every vsync stalled the Cast heartbeat on the TV.
+    var cap = pending > 2 ? 1 : pending;
+    var left = cap;
+    if (newAtlas && left > 0) left -= this._flushCpuAtlas(newAtlas, left);
+    if (oldAtlas && left > 0) this._flushCpuAtlas(oldAtlas, left);
     var drawn = 0;
-    if (haveOld && alphas.oldAlpha > 0) {
-      drawn += paintEquirectTiles(ctx, oldList, this._fadeW || span.w, this._fadeH || span.h, this.yaw, (this.pitch || 0) + oldPosePitch, this.fov, w, h, alphas.oldAlpha);
+    if (haveOld && oldAtlas && oldAtlas.canvas && alphas.oldAlpha > 0) {
+      drawStrip(ctx, oldAtlas.canvas, this.yaw, (this.pitch || 0) + oldPosePitch, this.fov, w, h, alphas.oldAlpha);
+      drawn += 1;
     }
-    var base = !haveNew && this._activeBase ? this._activeBase() : null;
-    if (base && ((base.tex && base.tex._cpuImage) || base.canvas)) {
-      var baseImg = (base.tex && base.tex._cpuImage) || base.canvas;
-      var baseEntry = this._showingEntry();
-      drawn += paintEquirectTiles(ctx, [{ tex: { _cpuImage: baseImg }, tile: base.tile }], (baseEntry && baseEntry.width) || span.w, (baseEntry && baseEntry.height) || span.h, this.yaw, (this.pitch || 0) + posePitch, this.fov, w, h, haveNew ? alphas.newAlpha : 1);
-    }
-    if (haveNew && alphas.newAlpha > 0) {
-      drawn += paintEquirectTiles(ctx, newList, span.w, span.h, this.yaw, (this.pitch || 0) + posePitch, this.fov, w, h, alphas.newAlpha);
+    if (haveNew && newAtlas && newAtlas.canvas && (!haveOld || alphas.newAlpha > 0.001)) {
+      var show = haveOld ? alphas.newAlpha : 1;
+      if (show > 0) {
+        drawStrip(ctx, newAtlas.canvas, this.yaw, (this.pitch || 0) + posePitch, this.fov, w, h, show);
+        drawn += 1;
+      }
     }
     this._cpuDrawn = (this._cpuDrawn || 0) + drawn;
     return drawn;
@@ -5083,37 +5157,94 @@
     return { x: srcX, y: srcY, w: srcW, h: srcH };
   }
 
-  function blitTile(ctx, img, tile, viewX, viewY, viewW, viewH, screenX, screenY, screenW, screenH) {
-    var x0 = tile.srcX > viewX ? tile.srcX : viewX;
+  function tilePhotoSegments(tile, spanW) {
+    var segs = [];
+    var span = spanW > 0 ? spanW : 1;
+    var remain = tile && tile.srcW > 0 ? tile.srcW : 0;
+    var local = 0;
+    var photo = tile ? tile.srcX : 0;
+    var guard = 0;
+    while (remain > 0.5 && guard < 4) {
+      guard += 1;
+      var photoMod = photo % span;
+      if (photoMod < 0) photoMod += span;
+      var room = span - photoMod;
+      var take = remain < room ? remain : room;
+      if (!(take > 0)) break;
+      segs.push({ photoX: photoMod, photoW: take, localX: local });
+      local += take;
+      remain -= take;
+      photo += take;
+    }
+    return segs;
+  }
+
+  function blitTile(ctx, img, tile, viewX, viewY, viewW, viewH, screenX, screenY, screenW, screenH, spanW) {
+    var segs = tilePhotoSegments(tile, spanW || (tile.srcX + tile.srcW));
     var y0 = tile.srcY > viewY ? tile.srcY : viewY;
-    var x1 = tile.srcX + tile.srcW;
     var y1 = tile.srcY + tile.srcH;
-    var viewR = viewX + viewW;
     var viewB = viewY + viewH;
-    if (x1 > viewR) x1 = viewR;
     if (y1 > viewB) y1 = viewB;
-    if (!(x1 > x0) || !(y1 > y0)) return false;
+    if (!(y1 > y0)) return false;
     var imgW = img.width || tile.texW || tile.srcW;
     var imgH = img.height || tile.texH || tile.srcH;
     var texW = tile.texW || imgW;
     var texH = tile.texH || imgH;
     var scaleX = imgW / texW;
     var scaleY = imgH / texH;
-    var sx = ((tile.padL || 0) + (x0 - tile.srcX)) * scaleX;
-    var sy = ((tile.padT || 0) + (y0 - tile.srcY)) * scaleY;
-    var sw = (x1 - x0) * scaleX;
-    var sh = (y1 - y0) * scaleY;
-    if (!(sw > 0) || !(sh > 0)) return false;
-    var dx = screenX + ((x0 - viewX) / viewW) * screenW;
-    var dy = screenY + ((y0 - viewY) / viewH) * screenH;
-    var dw = ((x1 - x0) / viewW) * screenW;
-    var dh = ((y1 - y0) / viewH) * screenH;
-    try {
-      ctx.drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh);
-    } catch (error) {
-      return false;
+    var drawn = false;
+    for (var s = 0; s < segs.length; s++) {
+      var seg = segs[s];
+      var x0 = seg.photoX > viewX ? seg.photoX : viewX;
+      var x1 = seg.photoX + seg.photoW;
+      var viewR = viewX + viewW;
+      if (x1 > viewR) x1 = viewR;
+      if (!(x1 > x0)) continue;
+      var local = seg.localX + (x0 - seg.photoX);
+      var sx = ((tile.padL || 0) + local) * scaleX;
+      var sy = ((tile.padT || 0) + (y0 - tile.srcY)) * scaleY;
+      var sw = (x1 - x0) * scaleX;
+      var sh = (y1 - y0) * scaleY;
+      if (!(sw > 0) || !(sh > 0)) continue;
+      var dx = screenX + ((x0 - viewX) / viewW) * screenW;
+      var dy = screenY + ((y0 - viewY) / viewH) * screenH;
+      var dw = ((x1 - x0) / viewW) * screenW;
+      var dh = ((y1 - y0) / viewH) * screenH;
+      try {
+        ctx.drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh);
+        drawn = true;
+      } catch (error) {}
     }
-    return true;
+    return drawn;
+  }
+
+  function paintTileOnAtlas(ctx, atlasW, atlasH, img, tile, spanW, spanH) {
+    if (!ctx || !img || !tile || !(spanW > 0) || !(spanH > 0)) return 0;
+    var segs = tilePhotoSegments(tile, spanW);
+    var imgW = img.width || tile.texW || tile.srcW || 1;
+    var imgH = img.height || tile.texH || tile.srcH || 1;
+    var texW = tile.texW || imgW;
+    var texH = tile.texH || imgH;
+    var scaleX = imgW / texW;
+    var scaleY = imgH / texH;
+    var drawn = 0;
+    for (var s = 0; s < segs.length; s++) {
+      var seg = segs[s];
+      var sx = ((tile.padL || 0) + seg.localX) * scaleX;
+      var sy = (tile.padT || 0) * scaleY;
+      var sw = seg.photoW * scaleX;
+      var sh = tile.srcH * scaleY;
+      if (!(sw > 0) || !(sh > 0)) continue;
+      var dx = (seg.photoX / spanW) * atlasW;
+      var dy = (tile.srcY / spanH) * atlasH;
+      var dw = (seg.photoW / spanW) * atlasW;
+      var dh = (tile.srcH / spanH) * atlasH;
+      try {
+        ctx.drawImage(img, sx, sy, Math.max(sw, 1), Math.max(sh, 1), dx, dy, Math.max(dw, 1), Math.max(dh, 1));
+        drawn += 1;
+      } catch (error) {}
+    }
+    return drawn;
   }
 
   function paintEquirectTiles(ctx, pieces, spanW, spanH, yaw, pitch, fov, viewW, viewH, alpha) {
@@ -5131,7 +5262,7 @@
         var img = (tex && tex._cpuImage) || piece.image || null;
         var tile = piece.spec || piece.tile || (tex && tex._window);
         if (!img || !tile || !(tile.srcW > 0) || !(tile.srcH > 0)) continue;
-        if (blitTile(ctx, img, tile, photoX, win.y, photoW, win.h, screenX, 0, screenW, viewH)) drawn += 1;
+        if (blitTile(ctx, img, tile, photoX, win.y, photoW, win.h, screenX, 0, screenW, viewH, spanW)) drawn += 1;
       }
     }
     var srcX = win.x;
@@ -5951,12 +6082,25 @@
     // Pole caps wait until the screen and the next horizon's bands are at
     // least on the wire. A free slot must not download r0 while r2c1 is in flight.
     var deferPoles = this._bandsOutstanding(view);
+    var fullSphere = !!(this.hooks.fullSphere && this.hooks.fullSphere());
     var best = null;
     var bestRank = 1e15;
-    for (var i = 0; i < masters.length; i++) {
-      var tile = masters[i];
+    var pool = masters;
+    if (fullSphere) {
+      // No GPU budget to protect. Every strip is wanted, still in front-first
+      // rank, so a pan around the sphere is not a black hemisphere.
+      pool = [];
+      for (var p = 0; p < entry.tiles.length; p++) {
+        var all = entry.tiles[p];
+        if (!all || all._base || all._skip) continue;
+        if (!fetchUnlocked(all, entry.tiles, anchor, this._masterInfo(view).loaded)) continue;
+        pool.push(all);
+      }
+    }
+    for (var i = 0; i < pool.length; i++) {
+      var tile = pool[i];
       if (!tile || tile._skip || tile._gpuPending || this.assemblers[tile.id] || this._tileReady(tile.id)) continue;
-      if (deferPoles && Math.abs((tile.row | 0) - anchor) > 1) continue;
+      if (!fullSphere && deferPoles && Math.abs((tile.row | 0) - anchor) > 1) continue;
       // The column under the lens finishes its visible bands before the
       // other hemisphere is requested. Pole caps wait until that lookahead.
       var rank = masterRank(tile, entry.tiles, entry.width, entry.height, view);
@@ -8022,6 +8166,7 @@
     GPU_CAP: GPU_CAP,
     OMEGA: OMEGA,
     tileLoadOrder: tileLoadOrder,
+    tilePhotoSegments: tilePhotoSegments,
     panLookaheadDeg: panLookaheadDeg,
     panLeadDeg: panLeadDeg,
     BASE_BYTES: BASE_BYTES,
