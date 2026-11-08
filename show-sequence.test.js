@@ -2657,12 +2657,15 @@ assert(onn.applyAim({ seq: 3, yaw: 12, pitch: 30, roll: 0, fov: 75, anchor: true
 for (let step = 0; step < 40; step++) onn.stepAim(16);
 assert(onn.pitch > 20, "aim pitch reaches the phone, got " + onn.pitch);
 const beforeAimDraw = cpuDraws.length;
+onn._cpuDrewAt = 0;
 onn._drawCpuTiles();
 const aimedTile = cpuDraws.slice(beforeAimDraw).filter(function (call) {
   return call.canvas && call.canvas._spsCpu && call.args && call.args[0] !== onnBitmap;
 });
 assert(aimedTile.length >= 1, "the aimed view redraws the tile");
-assert(Math.abs(aimedTile[0].args[2] - syAtRest) > 1, "pitch moves the equirect sample, " + aimedTile[0].args[2] + " vs " + syAtRest);
+const restUv = Cast.perspectiveUv(0, 0, 0, onn.fov, 1280 / 720, 0, 0, 0, 0);
+const aimUv = Cast.perspectiveUv(onn.yaw, onn.pitch, 0, onn.fov, 1280 / 720, 0, 0, 0, 0);
+assert(Math.abs(aimUv.v - restUv.v) > 0.02, "pitch moves the equirect sample, " + aimUv.v + " vs " + restUv.v);
 const otherBitmap = { width: 566, height: 283 };
 onn._fadeFrom = (onn._tileDraw || []).slice();
 onn._fadeW = 2000;
@@ -2951,6 +2954,7 @@ function viewSamples(yaw, pitch) {
   sphereDraws.length = 0;
   sphere.yaw = yaw;
   sphere.pitch = pitch;
+  sphere._cpuDrewAt = 0;
   sphere._drawCpuTiles();
   return sphereDraws.filter(function (call) { return call.canvas && call.canvas._spsCpu; });
 }
@@ -2997,6 +3001,69 @@ const wideGpu = pulled(false);
 assert(wideCpu.length === 4, "no-WebGL requests every longitude column, got " + wideCpu.join(","));
 assert(wideCpu[0] === "c0", "the column under the lens is still first, got " + wideCpu.join(","));
 assert(wideGpu.indexOf("c3") < 0, "WebGL still skips a column outside the lookahead, got " + wideGpu.join(","));
+
+function nearly(a, b, eps, label) {
+  assert(Math.abs(a - b) <= eps, label + " got " + a + " expected " + b);
+}
+const aspect = 16 / 9;
+const centerUv = Cast.perspectiveUv(0, 0, 0, 75, aspect, 0, 0, 0, 0);
+nearly(centerUv.u, 0.5, 1e-3, "yaw 0 pitch 0 lands on the front of the equirect");
+nearly(centerUv.v, 0.5, 1e-3, "yaw 0 pitch 0 lands on the horizon");
+nearly(centerUv.x, 0, 1e-3, "the center ray has no x");
+nearly(centerUv.z, -1, 1e-3, "the center ray looks down -z");
+const yaw90 = Cast.perspectiveUv(90, 0, 0, 75, aspect, 0, 0, 0, 0);
+nearly(yaw90.u, 0.75, 1e-3, "yaw 90 is a quarter turn");
+const yaw180 = Cast.perspectiveUv(180, 0, 0, 75, aspect, 0, 0, 0, 0);
+nearly(Math.min(yaw180.u, 1 - yaw180.u), 0, 1e-3, "yaw 180 sits on the equirect seam");
+const pitch30 = Cast.perspectiveUv(0, 30, 0, 75, aspect, 0, 0, 0, 0);
+nearly(pitch30.v, 0.5 - 30 / 180, 1e-3, "pitch 30 is 30 degrees of latitude");
+nearly(Cast.perspectiveUv(0, 0, 0, 75, aspect, 0, 0.7, 0, 0).u, 0.5, 1e-3, "a vertical screen line through the center keeps longitude");
+nearly(Cast.perspectiveUv(0, 0, 0, 75, aspect, 0, -0.7, 0, 0).u, 0.5, 1e-3, "the lower vertical line keeps longitude");
+nearly(Cast.perspectiveUv(0, 0, 0, 75, aspect, -0.85, 0, 0, 0).v, 0.5, 1e-3, "a horizontal screen line through the center keeps latitude");
+nearly(Cast.perspectiveUv(0, 0, 0, 75, aspect, 0.85, 0, 0, 0).v, 0.5, 1e-3, "the right side of that line keeps latitude");
+const lineMid = Cast.perspectiveUv(0, 0, 0, 90, aspect, 0, 0.5, 0, 0);
+const lineEdge = Cast.perspectiveUv(0, 0, 0, 90, aspect, 0.95, 0.5, 0, 0);
+assert(Math.abs(lineEdge.v - 0.5) < Math.abs(lineMid.v - 0.5) - 0.01, "a horizontal line above center bends back toward the horizon at the edge, cylindrical would keep v, mid " + lineMid.v + " edge " + lineEdge.v);
+function triple(a, b, c) {
+  return a.x * (b.y * c.z - b.z * c.y) - a.y * (b.x * c.z - b.z * c.x) + a.z * (b.x * c.y - b.y * c.x);
+}
+[[0, 0, 70], [40, 20, 90], [180, -15, 60], [270, 35, 100]].forEach(function (view) {
+  const samples = [];
+  for (let i = 0; i < 5; i++) samples.push(Cast.perspectiveUv(view[0], view[1], 0, view[2], aspect, -0.8 + i * 0.4, 0.25, 0, 0));
+  const vol = Math.abs(triple(samples[0], samples[2], samples[4]));
+  assert(vol < 1e-3, "a screen line stays straight at yaw " + view[0] + " pitch " + view[1] + " fov " + view[2] + ", volume " + vol);
+});
+function dirOf(uv) { return { x: uv.x, y: uv.y, z: uv.z }; }
+function subDir(a, b) { return { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }; }
+function dotDir(a, b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+function normDir(a) {
+  const len = Math.sqrt(dotDir(a, a)) || 1;
+  return { x: a.x / len, y: a.y / len, z: a.z / len };
+}
+const axisCenter = dirOf(Cast.perspectiveUv(15, -10, 5, 80, aspect, 0, 0, 0, 0));
+const axisX = normDir(subDir(dirOf(Cast.perspectiveUv(15, -10, 5, 80, aspect, 0.04, 0, 0, 0)), axisCenter));
+const axisY = normDir(subDir(dirOf(Cast.perspectiveUv(15, -10, 5, 80, aspect, 0, 0.04, 0, 0)), axisCenter));
+const axisDeg = Math.acos(Math.max(-1, Math.min(1, dotDir(axisX, axisY)))) * 180 / Math.PI;
+assert(Math.abs(axisDeg - 90) < 2, "screen axes meet at a right angle, got " + axisDeg);
+const fovEdge = Cast.perspectiveDir(0, 0, 0, 80, aspect, 0, 1);
+const fovFwd = Cast.perspectiveDir(0, 0, 0, 80, aspect, 0, 0);
+const fovDeg = Math.acos(Math.max(-1, Math.min(1, fovEdge[0] * fovFwd[0] + fovEdge[1] * fovFwd[1] + fovEdge[2] * fovFwd[2]))) * 180 / Math.PI;
+nearly(fovDeg, 40, 0.25, "vertical fov reaches the screen edge");
+const fullEq = Cast.cpuEquirectSize(8192, 4096);
+assert(fullEq.w === 8192 && fullEq.h === 4096, "an 8192 equirect is kept, got " + fullEq.w + "x" + fullEq.h);
+const tallEq = Cast.cpuEquirectSize(8192, 4320);
+assert(tallEq.w <= 8192 && tallEq.h <= 4096 && tallEq.w >= 7000, "a taller photo stays inside the equirect cap, got " + tallEq.w + "x" + tallEq.h);
+const stripEq = Cast.cpuEquirectSize(4064, 864);
+assert(stripEq.w === 4064 && stripEq.h === 864, "a 4064 strip is not crushed to 2048, got " + stripEq.w + "x" + stripEq.h);
+const viewStart = Cast.cpuRenderSize(3840, 2160, 0, 0);
+assert(viewStart.w === 1280 && viewStart.h === 720, "Canvas2D starts at 1280x720, got " + viewStart.w + "x" + viewStart.h);
+const viewFast = Cast.cpuRenderSize(3840, 2160, 10, 1280);
+assert(viewFast.w > 1280 && viewFast.w <= 1920 && viewFast.h <= 1080, "a fast frame grows and stays within 1080p, got " + viewFast.w + "x" + viewFast.h);
+const viewSlow = Cast.cpuRenderSize(3840, 2160, 60, 1600);
+assert(viewSlow.w >= 960 && viewSlow.w < 1600, "a slow frame shrinks but stays readable, got " + viewSlow.w + "x" + viewSlow.h);
+const viewCap = Cast.cpuRenderSize(3840, 2160, 8, 1800);
+assert(viewCap.w <= 1920 && viewCap.h <= 1080, "the render cap is 1920x1080, got " + viewCap.w + "x" + viewCap.h);
+assert(sphereFront.length >= 16 * 9, "the view mesh is at least 16 by 9, draws " + sphereFront.length);
 
 // /aim dies when NanoHTTPD's socket read sees 30s of silence. A keepalive
 // echo inside that window has to keep the socket open across 35s idle.

@@ -19,7 +19,7 @@
 (function (root) {
   // Baked into player.js and the script URL. A Cast WebView that cached
   // "player.js" will not reuse that file for "player.js?v=<this>".
-  var RECEIVER_BUILD = "20261108.4";
+  var RECEIVER_BUILD = "20261108.5";
   var ROTATIONS = 2;
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
@@ -39,6 +39,10 @@
   // read after 30s of silence (the /aim drop is 30.0s after the last frame).
   // Stay under that, and under NanoHTTPD's 5s stock SOCKET_READ_TIMEOUT.
   var AIM_KEEPALIVE_MS = 10000;
+  var CPU_EQUIRECT_MAX_W = 8192;
+  var CPU_EQUIRECT_MAX_H = 4096;
+  var CPU_VIEW_MAX_W = 1920;
+  var CPU_VIEW_MAX_H = 1080;
   var MIN_DPS = 6;
   var MAX_DPS = 72;
   var OMEGA = 40;
@@ -4783,12 +4787,9 @@
 
   Player.prototype._ensureCpuAtlas = function (key, spanW, spanH) {
     if (!this._cpuAtlases) this._cpuAtlases = {};
-    var aw = spanW > 2048 ? 2048 : Math.max(2, spanW | 0);
-    var ah = Math.max(2, Math.round(aw * (spanH > 0 ? spanH : 1) / (spanW > 0 ? spanW : 1)));
-    if (ah > 1024) {
-      ah = 1024;
-      aw = Math.max(2, Math.round(ah * spanW / spanH));
-    }
+    var fit = cpuEquirectSize(spanW, spanH);
+    var aw = fit.w;
+    var ah = fit.h;
     var slot = this._cpuAtlases[key];
     if (slot && slot.canvas && slot.spanW === spanW && slot.spanH === spanH && slot.canvas.width === aw && slot.canvas.height === ah) return slot;
     var canvas = null;
@@ -4845,12 +4846,6 @@
     var h = (host && host.height) || (canvas && canvas.height) || 720;
     if (w < 2) w = 1280;
     if (h < 2) h = 720;
-    if (canvas && canvas !== host) {
-      if (canvas.width !== w) canvas.width = w;
-      if (canvas.height !== h) canvas.height = h;
-    }
-    ctx.fillStyle = "#0b0d10";
-    ctx.fillRect(0, 0, w, h);
     var span = this._cpuSpan();
     var pose = (this.poses && this.poses[this.index]) || ZERO_POSE;
     var fadePose = this._fadePose || ZERO_POSE;
@@ -4866,24 +4861,76 @@
     var newAtlas = this._enqueueCpuPieces(newList, "live", span.w, span.h);
     var oldAtlas = haveOld ? this._enqueueCpuPieces(oldList, "fade", oldSpanW, oldSpanH) : null;
     var pending = (newAtlas && newAtlas.queue ? newAtlas.queue.length : 0) + (oldAtlas && oldAtlas.queue ? oldAtlas.queue.length : 0);
-    // One full-resolution strip per frame. Painting every 4064px JPEG on
-    // every vsync stalled the Cast heartbeat on the TV.
+    // One source strip per frame. The view itself is a mesh over a small
+    // backing store, so Cast messages are not waiting on 4064px JPEGs.
     var cap = pending > 2 ? 1 : pending;
     var left = cap;
     if (newAtlas && left > 0) left -= this._flushCpuAtlas(newAtlas, left);
     if (oldAtlas && left > 0) this._flushCpuAtlas(oldAtlas, left);
+    var fit = cpuRenderSize(w, h, this._cpuFrameMs || 0, this._cpuViewW || 0);
+    var rw = fit.w;
+    var rh = fit.h;
+    this._cpuViewW = rw;
+    this._cpuViewH = rh;
+    if (canvas) {
+      if (canvas.width !== rw) canvas.width = rw;
+      if (canvas.height !== rh) canvas.height = rh;
+    }
+    var cols = this._cpuMeshCols || 16;
+    var rows = this._cpuMeshRows || 9;
+    var eqW = newAtlas && newAtlas.width || 0;
+    var eqH = newAtlas && newAtlas.height || 0;
+    var sizeLine = "canvas2d render " + rw + "x" + rh + " equirect " + eqW + "x" + eqH + " mesh " + cols + "x" + rows;
+    if (sizeLine !== this._cpuSizeLog && eqW > 0) {
+      this._cpuSizeLog = sizeLine;
+      this._reportTv(withBuild(sizeLine));
+    }
+    var nowDraw = Date.now();
+    var moved = Math.abs((this.yaw || 0) - (this._cpuYaw || 0))
+      + Math.abs((this.pitch || 0) - (this._cpuPitch || 0))
+      + Math.abs((this.roll || 0) - (this._cpuRoll || 0))
+      + Math.abs((this.fov || 0) - (this._cpuFov || 0));
+    var age = nowDraw - (this._cpuDrewAt || 0);
+    var minAge = this.manual ? 50 : 32;
+    var queueLeft = (newAtlas && newAtlas.queue ? newAtlas.queue.length : 0) + (oldAtlas && oldAtlas.queue ? oldAtlas.queue.length : 0);
+    var paintedNow = queueLeft < pending;
+    if (!this._fading && !paintedNow && queueLeft === 0 && this._cpuDrewAt && age < minAge && moved < (this.manual ? 0.45 : 0.08)) {
+      return this._cpuDrawn || 0;
+    }
+    ctx.fillStyle = "#0b0d10";
+    ctx.fillRect(0, 0, rw, rh);
     var drawn = 0;
+    var t0 = Date.now();
     if (haveOld && oldAtlas && oldAtlas.canvas && alphas.oldAlpha > 0) {
-      drawStrip(ctx, oldAtlas.canvas, this.yaw, (this.pitch || 0) + oldPosePitch, this.fov, w, h, alphas.oldAlpha);
-      drawn += 1;
+      drawn += paintPerspective(ctx, oldAtlas.canvas, this.yaw, (this.pitch || 0) + oldPosePitch, this.roll || 0, this.fov, fadePose.pitch || 0, fadePose.roll || 0, rw, rh, alphas.oldAlpha, cols, rows);
     }
     if (haveNew && newAtlas && newAtlas.canvas && (!haveOld || alphas.newAlpha > 0.001)) {
       var show = haveOld ? alphas.newAlpha : 1;
       if (show > 0) {
-        drawStrip(ctx, newAtlas.canvas, this.yaw, (this.pitch || 0) + posePitch, this.fov, w, h, show);
-        drawn += 1;
+        drawn += paintPerspective(ctx, newAtlas.canvas, this.yaw, (this.pitch || 0) + posePitch, this.roll || 0, this.fov, pose.pitch || 0, pose.roll || 0, rw, rh, show, cols, rows);
       }
     }
+    var frame = Date.now() - t0;
+    this._cpuFrameMs = this._cpuFrameMs ? this._cpuFrameMs * 0.6 + frame * 0.4 : frame;
+    // Stay on a 16x9 mesh unless several frames in a row prove headroom.
+    // Resolution, not a 32x18 mesh, is what drops first when a frame runs long.
+    if (frame > 40) {
+      this._cpuFast = 0;
+      if (cols > 16) cols -= 4;
+    } else if (frame > 0 && frame < 12) {
+      this._cpuFast = (this._cpuFast || 0) + 1;
+      if (this._cpuFast >= 6 && cols < 24) {
+        cols += 4;
+        this._cpuFast = 0;
+      }
+    } else this._cpuFast = 0;
+    this._cpuMeshCols = cols;
+    this._cpuMeshRows = Math.max(9, Math.round(cols * 9 / 16));
+    this._cpuDrewAt = nowDraw;
+    this._cpuYaw = this.yaw || 0;
+    this._cpuPitch = this.pitch || 0;
+    this._cpuRoll = this.roll || 0;
+    this._cpuFov = this.fov || 0;
     this._cpuDrawn = (this._cpuDrawn || 0) + drawn;
     return drawn;
   };
@@ -5303,6 +5350,234 @@
       paint(0, srcW - right, (right / srcW) * viewW, ((srcW - right) / srcW) * viewW);
     } else {
       paint(srcX, srcW, 0, viewW);
+    }
+    if (ctx.restore) ctx.restore();
+    return drawn;
+  }
+
+  function cpuEquirectSize(spanW, spanH) {
+    var sw = spanW > 1 ? spanW : 2;
+    var sh = spanH > 1 ? spanH : 2;
+    var aw = sw > CPU_EQUIRECT_MAX_W ? CPU_EQUIRECT_MAX_W : sw;
+    var ah = aw * sh / sw;
+    if (ah > CPU_EQUIRECT_MAX_H) {
+      ah = CPU_EQUIRECT_MAX_H;
+      aw = ah * sw / sh;
+    }
+    var pixels = CPU_EQUIRECT_MAX_W * CPU_EQUIRECT_MAX_H;
+    if (aw * ah > pixels) {
+      var scale = Math.sqrt(pixels / (aw * ah));
+      aw *= scale;
+      ah *= scale;
+    }
+    return { w: Math.max(2, Math.round(aw)), h: Math.max(2, Math.round(ah)) };
+  }
+
+  function cpuRenderSize(clientW, clientH, frameMs, prevW) {
+    var cw = clientW > 2 ? clientW : 1280;
+    var ch = clientH > 2 ? clientH : 720;
+    var aspect = cw / ch;
+    var maxW = cw > CPU_VIEW_MAX_W ? CPU_VIEW_MAX_W : cw;
+    var maxH = ch > CPU_VIEW_MAX_H ? CPU_VIEW_MAX_H : ch;
+    if (maxW / maxH > aspect) maxW = maxH * aspect;
+    else maxH = maxW / aspect;
+    var target = prevW > 0 ? prevW : Math.min(1280, maxW);
+    if (frameMs > 48 && target > 960) target *= 0.75;
+    else if (frameMs > 0 && frameMs < 16 && target < maxW) target = Math.min(maxW, target * 1.25);
+    if (target > maxW) target = maxW;
+    if (target < 960 && maxW >= 960) target = 960;
+    var tw = Math.max(2, Math.round(target));
+    var th = Math.max(2, Math.round(tw / aspect));
+    if (th > CPU_VIEW_MAX_H) {
+      th = CPU_VIEW_MAX_H;
+      tw = Math.max(2, Math.round(th * aspect));
+    }
+    return { w: tw, h: th };
+  }
+
+  function poseToCameraDir(x, y, z, pitch, roll) {
+    var nX = x;
+    var nY = -z;
+    var nZ = y;
+    var cp = Math.cos(pitch || 0);
+    var sp = Math.sin(pitch || 0);
+    var cr = Math.cos(roll || 0);
+    var sr = Math.sin(roll || 0);
+    var pX = nX;
+    var pY = cp * nY + sp * nZ;
+    var pZ = -sp * nY + cp * nZ;
+    var cX = cr * pX - sr * pZ;
+    var cY = pY;
+    var cZ = sr * pX + cr * pZ;
+    return [cX, cZ, -cY];
+  }
+
+  function equirectFromDir(x, y, z) {
+    var lon = Math.abs(x) + Math.abs(z) < 1e-8 ? 0 : Math.atan2(x, -z);
+    var lat = Math.asin(Math.max(-1, Math.min(1, y)));
+    var u = 0.5 + lon / (Math.PI * 2);
+    u = u - Math.floor(u);
+    var v = 0.5 - lat / Math.PI;
+    if (v < 0) v = 0;
+    if (v > 1) v = 1;
+    return { u: u, v: v, x: x, y: y, z: z };
+  }
+
+  function perspectiveDir(yawDeg, pitchDeg, rollDeg, fovDeg, aspect, ndcX, ndcY) {
+    var f = 1 / Math.tan((fovDeg * Math.PI / 180) / 2);
+    var x = ndcX * aspect / f;
+    var y = ndcY / f;
+    var z = -1;
+    var len = Math.sqrt(x * x + y * y + z * z) || 1;
+    x /= len;
+    y /= len;
+    z /= len;
+    fillAimView(scratchYaw, scratchPitch, scratchRoll, scratchView, yawDeg || 0, pitchDeg || 0, rollDeg || 0);
+    var V = scratchView;
+    return [
+      V[0] * x + V[1] * y + V[2] * z,
+      V[4] * x + V[5] * y + V[6] * z,
+      V[8] * x + V[9] * y + V[10] * z,
+    ];
+  }
+
+  function perspectiveUv(yawDeg, pitchDeg, rollDeg, fovDeg, aspect, ndcX, ndcY, posePitch, poseRoll) {
+    var world = perspectiveDir(yawDeg, pitchDeg, rollDeg, fovDeg, aspect, ndcX, ndcY);
+    var dir = poseToCameraDir(world[0], world[1], world[2], posePitch || 0, poseRoll || 0);
+    var len = Math.sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]) || 1;
+    return equirectFromDir(dir[0] / len, dir[1] / len, dir[2] / len);
+  }
+
+  function unwrapU(u, ref) {
+    var d = u - ref;
+    if (d > 0.5) return u - 1;
+    if (d < -0.5) return u + 1;
+    return u;
+  }
+
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  function splitTriSeam(u0, v0, u1, v1, u2, v2, x0, y0, x1, y1, x2, y2) {
+    var pts = [
+      { u: u0, v: v0, x: x0, y: y0 },
+      { u: unwrapU(u1, u0), v: v1, x: x1, y: y1 },
+      { u: unwrapU(u2, u0), v: v2, x: x2, y: y2 },
+    ];
+    var minU = Math.min(pts[0].u, pts[1].u, pts[2].u);
+    var maxU = Math.max(pts[0].u, pts[1].u, pts[2].u);
+    if (minU >= -1e-4 && maxU <= 1 + 1e-4) return [pts];
+    var cut = maxU > 1 ? 1 : 0;
+    var above = [];
+    var below = [];
+    for (var i = 0; i < 3; i++) {
+      var a = pts[i];
+      var b = pts[(i + 1) % 3];
+      var aAbove = a.u >= cut;
+      if (aAbove) above.push(a);
+      else below.push(a);
+      if (aAbove !== (b.u >= cut) && b.u !== a.u) {
+        var t = (cut - a.u) / (b.u - a.u);
+        var hit = { u: cut, v: lerp(a.v, b.v, t), x: lerp(a.x, b.x, t), y: lerp(a.y, b.y, t) };
+        above.push(hit);
+        below.push(hit);
+      }
+    }
+    function fan(poly, shift) {
+      if (poly.length < 3) return [];
+      var out = [];
+      var base = [poly[0], poly[1], poly[2]];
+      out.push(base);
+      if (poly.length > 3) out.push([poly[0], poly[2], poly[3]]);
+      if (!shift) return out;
+      return out.map(function (tri) {
+        return tri.map(function (p) {
+          return { u: p.u + shift, v: p.v, x: p.x, y: p.y };
+        });
+      });
+    }
+    var highShift = cut === 1 ? -1 : 0;
+    var lowShift = cut === 0 ? 1 : 0;
+    return fan(above, highShift).concat(fan(below, lowShift));
+  }
+
+  function drawTexturedTri(ctx, img, su0, sv0, su1, sv1, su2, sv2, dx0, dy0, dx1, dy1, dx2, dy2) {
+    var parts = splitTriSeam(su0, sv0, su1, sv1, su2, sv2, dx0, dy0, dx1, dy1, dx2, dy2);
+    for (var i = 0; i < parts.length; i++) {
+      var p = parts[i];
+      blitTri(ctx, img, p[0], p[1], p[2]);
+    }
+  }
+
+  function blitTri(ctx, img, p0, p1, p2) {
+    var sx0 = p0.u * img.width;
+    var sy0 = p0.v * img.height;
+    var sx1 = p1.u * img.width;
+    var sy1 = p1.v * img.height;
+    var sx2 = p2.u * img.width;
+    var sy2 = p2.v * img.height;
+    if (ctx.setTransform && ctx.beginPath && ctx.clip) {
+      var det = sx0 * (sy1 - sy2) + sx1 * (sy2 - sy0) + sx2 * (sy0 - sy1);
+      if (Math.abs(det) < 1e-4) return;
+      var a = (p0.x * (sy1 - sy2) + p1.x * (sy2 - sy0) + p2.x * (sy0 - sy1)) / det;
+      var c = (p0.x * (sx2 - sx1) + p1.x * (sx0 - sx2) + p2.x * (sx1 - sx0)) / det;
+      var e = p0.x - a * sx0 - c * sy0;
+      var b = (p0.y * (sy1 - sy2) + p1.y * (sy2 - sy0) + p2.y * (sy0 - sy1)) / det;
+      var d = (p0.y * (sx2 - sx1) + p1.y * (sx0 - sx2) + p2.y * (sx1 - sx0)) / det;
+      var f = p0.y - b * sx0 - d * sy0;
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(p0.x, p0.y);
+      ctx.lineTo(p1.x, p1.y);
+      ctx.lineTo(p2.x, p2.y);
+      ctx.closePath();
+      ctx.clip();
+      ctx.setTransform(a, b, c, d, e, f);
+      ctx.drawImage(img, 0, 0);
+      ctx.restore();
+      return;
+    }
+    var minU = Math.min(p0.u, p1.u, p2.u);
+    var maxU = Math.max(p0.u, p1.u, p2.u);
+    var minV = Math.min(p0.v, p1.v, p2.v);
+    var maxV = Math.max(p0.v, p1.v, p2.v);
+    var minX = Math.min(p0.x, p1.x, p2.x);
+    var maxX = Math.max(p0.x, p1.x, p2.x);
+    var minY = Math.min(p0.y, p1.y, p2.y);
+    var maxY = Math.max(p0.y, p1.y, p2.y);
+    ctx.drawImage(img, minU * img.width, minV * img.height, Math.max(1, (maxU - minU) * img.width), Math.max(1, (maxV - minV) * img.height), minX, minY, Math.max(1, maxX - minX), Math.max(1, maxY - minY));
+  }
+
+  function paintPerspective(ctx, img, yaw, pitch, roll, fov, posePitch, poseRoll, viewW, viewH, alpha, cols, rows) {
+    if (!ctx || !img || !(img.width > 0) || !(viewW > 1) || !(viewH > 1) || !(alpha > 0)) return 0;
+    cols = cols > 4 ? cols : 16;
+    rows = rows > 4 ? rows : 9;
+    var aspect = viewW / viewH;
+    var grid = [];
+    for (var y = 0; y <= rows; y++) {
+      var row = [];
+      var py = (y / rows) * viewH;
+      var ndcY = 1 - (py / viewH) * 2;
+      for (var x = 0; x <= cols; x++) {
+        var px = (x / cols) * viewW;
+        var ndcX = (px / viewW) * 2 - 1;
+        var uv = perspectiveUv(yaw, pitch, roll, fov, aspect, ndcX, ndcY, posePitch, poseRoll);
+        row.push({ x: px, y: py, u: uv.u, v: uv.v });
+      }
+      grid.push(row);
+    }
+    if (ctx.save) ctx.save();
+    ctx.globalAlpha = alpha;
+    var drawn = 0;
+    for (var gy = 0; gy < rows; gy++) {
+      for (var gx = 0; gx < cols; gx++) {
+        var a = grid[gy][gx];
+        var b = grid[gy][gx + 1];
+        var c = grid[gy + 1][gx];
+        var d = grid[gy + 1][gx + 1];
+        drawTexturedTri(ctx, img, a.u, a.v, b.u, b.v, c.u, c.v, a.x, a.y, b.x, b.y, c.x, c.y);
+        drawTexturedTri(ctx, img, b.u, b.v, d.u, d.v, c.u, c.v, b.x, b.y, d.x, d.y, c.x, c.y);
+        drawn += 2;
+      }
     }
     if (ctx.restore) ctx.restore();
     return drawn;
@@ -8195,6 +8470,10 @@
     OMEGA: OMEGA,
     tileLoadOrder: tileLoadOrder,
     tilePhotoSegments: tilePhotoSegments,
+    perspectiveUv: perspectiveUv,
+    perspectiveDir: perspectiveDir,
+    cpuEquirectSize: cpuEquirectSize,
+    cpuRenderSize: cpuRenderSize,
     panLookaheadDeg: panLookaheadDeg,
     panLeadDeg: panLeadDeg,
     BASE_BYTES: BASE_BYTES,
