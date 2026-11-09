@@ -2647,11 +2647,12 @@ assert(onnBitmap.closed !== true, "the fallback keeps the decoded bitmap");
 const onnBlitted = cpuDraws.filter(function (call) {
   return call.args && call.args[0] === onnBitmap;
 });
-assert(onnBlitted.length >= 1, "Canvas2D painted the decoded tile into the equirect, calls " + cpuDraws.length);
+assert(onnBlitted.length >= 1, "Canvas2D samples the decoded tile, calls " + cpuDraws.length);
 const onnView = cpuDraws.filter(function (call) {
-  return call.canvas && call.canvas._spsCpu && call.args && call.args[0] !== onnBitmap;
+  return call.canvas && call.canvas._spsCpu && call.args && call.args[0] === onnBitmap;
 });
-assert(onnView.length >= 1, "the view is sampled from the equirect");
+assert(onnView.length >= 1, "the view samples the decoded tile");
+assert(onnView.every(function (call) { return call.args.length >= 9 && call.args[3] < onnBitmap.width; }), "each cell copies a window of the tile, not the whole JPEG");
 const syAtRest = onnView[onnView.length - 1].args[2];
 assert(onn.applyAim({ seq: 3, yaw: 12, pitch: 30, roll: 0, fov: 75, anchor: true, ts: onnClock }), "aim is accepted on the fallback");
 for (let step = 0; step < 40; step++) onn.stepAim(16);
@@ -2660,7 +2661,7 @@ const beforeAimDraw = cpuDraws.length;
 onn._cpuDrewAt = 0;
 onn._drawCpuTiles();
 const aimedTile = cpuDraws.slice(beforeAimDraw).filter(function (call) {
-  return call.canvas && call.canvas._spsCpu && call.args && call.args[0] !== onnBitmap;
+  return call.canvas && call.canvas._spsCpu && call.args && call.args[0] === onnBitmap;
 });
 assert(aimedTile.length >= 1, "the aimed view redraws the tile");
 const restUv = Cast.perspectiveUv(0, 0, 0, onn.fov, 1280 / 720, 0, 0, 0, 0);
@@ -2946,10 +2947,9 @@ sphereDraws.forEach(function (call) {
   const img = call.args && call.args[0];
   if (img && img.id) painted[img.id] = (painted[img.id] || 0) + 1;
 });
-["s-r0c0", "s-r1c0", "s-r2c0", "s-r0c1", "s-r1c1", "s-r2c1"].forEach(function (id) {
-  assert(painted[id] >= 1, "no-WebGL paints " + id + " onto the equirect, got " + JSON.stringify(painted));
+["s-r0c0", "s-r1c0", "s-r2c0"].forEach(function (id) {
+  assert(painted[id] >= 1, "the front view samples " + id + ", got " + JSON.stringify(painted));
 });
-assert(painted["s-r1c1"] >= 2, "the back horizon is drawn on both sides of the seam, got " + painted["s-r1c1"]);
 function viewSamples(yaw, pitch) {
   sphereDraws.length = 0;
   sphere.yaw = yaw;
@@ -2962,7 +2962,13 @@ const sphereFront = viewSamples(0, 0);
 const sphereBack = viewSamples(180, 0);
 const sphereUp = viewSamples(0, 70);
 const sphereDown = viewSamples(0, -70);
-assert(sphereFront.length >= 1 && sphereBack.length >= 1, "yaw 0 and yaw 180 both sample the equirect");
+assert(sphereFront.length >= 1 && sphereBack.length >= 1, "yaw 0 and yaw 180 both sample a strip");
+const backIds = {};
+sphereBack.forEach(function (call) {
+  const img = call.args && call.args[0];
+  if (img && img.id) backIds[img.id] = (backIds[img.id] || 0) + 1;
+});
+assert(backIds["s-r1c1"] >= 2, "yaw 180 draws the wrapping back strip on both sides of the seam, got " + backIds["s-r1c1"]);
 assert(sphereBack.length >= 2, "yaw 180 wraps the view across the seam, draws " + sphereBack.length);
 const frontSx = sphereFront[0].args[1];
 const backSx = sphereBack.map(function (call) { return call.args[1]; });
@@ -3134,6 +3140,107 @@ assert(!tvDraws.some(function (call) { return call.args[0] === tvAtlas && call.a
 const viewBlits = tvDraws.filter(function (call) { return call.kind === "view"; });
 assert(viewBlits.length >= 16 * 9, "the view is the mesh, draws " + viewBlits.length);
 assert(viewBlits.every(function (call) { return call.args[0] && call.args[0].width === 256; }), "affine samples come from the 256px crop, not the 8000px atlas");
+assert(Cast.cpuDeliveredFps([250, 250, 200]) === 4, "four paints a second is a 250ms gap, not a 64ms draw");
+assert(Cast.cpuDeliveredFps([64]) === 16, "a 64ms gap is 16fps only when the next paint actually starts then");
+const qualityHeld = Cast.cpuQualityStep(64, 250, 1280, 16, 1920);
+assert(qualityHeld.w === 1280, "a slow paint keeps the 1280 view while the mesh steps down, got " + qualityHeld.w);
+assert(qualityHeld.cols === 12, "a 64ms paint reduces the mesh, got " + qualityHeld.cols);
+const decodeBound = Cast.cpuQualityStep(12, 250, 1280, 16, 1920);
+assert(decodeBound.w === 1280 && decodeBound.cols === 16, "JPEG time in the gap does not shrink the picture, got " + decodeBound.w + " mesh " + decodeBound.cols);
+let climbed = { w: 960, cols: 8 };
+for (let hop = 0; hop < 6; hop++) climbed = Cast.cpuQualityStep(16, 32, climbed.w, climbed.cols, 1920);
+assert(climbed.w > 960 && climbed.w <= 1920, "settled fast frames climb back from 960, got " + climbed.w);
+const flowDraws = [];
+sandbox.document = {
+  createElement: cpuCanvasFactory(flowDraws),
+  getElementById: function () { return null; },
+};
+const flowStrips = [];
+for (let row = 0; row < 5; row++) {
+  for (let col = 0; col < 2; col++) {
+    const img = { width: col === 1 && row === 2 ? 4064 : 4064, height: row === 0 || row === 4 ? 832 : 864, id: "f-r" + row + "c" + col };
+    flowStrips.push({
+      tex: { _cpu: true, _cpuImage: img, _mip: true, _spsUploaded: true },
+      tile: {
+        id: img.id,
+        col: col,
+        row: row,
+        srcX: col === 0 ? 1968 : 6032,
+        srcY: row * 800,
+        srcW: 4064,
+        srcH: row === 4 ? 800 : 800,
+        texW: img.width,
+        texH: img.height,
+      },
+    });
+  }
+}
+const flow = Cast.create({
+  width: 1920, height: 1080, clientWidth: 1920, clientHeight: 1080, style: {},
+  addEventListener: function () {},
+  getContext: function () { return null; },
+});
+flow._cpuTiles = true;
+flow._tileW = 8000;
+flow._tileH = 4000;
+flow.entries = [{ id: "flow", width: 8000, height: 4000, tiles: flowStrips.map(function (p) { return p.tile; }) }];
+flow.session = { entry: flow.entries[0] };
+flow.manual = true;
+flow.fov = 75;
+flow.yaw = 0;
+flow.pitch = 0;
+flow._tileDraw = [];
+for (let arrive = 0; arrive < flowStrips.length; arrive++) {
+  flow._tileDraw.push(flowStrips[arrive]);
+  flow._cpuDrewAt = 0;
+  flow._drawCpuTiles();
+  assert(flow._cpuDetail === arrive + 1, "unique strips follow arrivals, got " + flow._cpuDetail + " after " + (arrive + 1));
+}
+const uniqueAfter = flow._cpuDetail;
+const pxAfter = flow._cpuDetailPx;
+for (let extra = 0; extra < 8; extra++) {
+  flow.yaw = extra * 4;
+  flow._cpuDrewAt = 0;
+  flow._cpuDirty = true;
+  flow._drawCpuTiles();
+}
+assert(flow._cpuDetail === uniqueAfter && flow._cpuDetailPx === pxAfter, "aim repaints do not count the strips again, unique " + flow._cpuDetail + " px " + flow._cpuDetailPx);
+flow._fadeFrom = flow._tileDraw.slice();
+flow._fadeW = 8000;
+flow._fadeH = 4000;
+flow._fading = true;
+flow._fadeMs = Cast.TILE_FADE_MS / 2;
+flow._fadeLimit = Cast.TILE_FADE_MS;
+flow._cpuDrewAt = 0;
+const beforeFlowFade = flowDraws.length;
+flow._drawCpuTiles();
+const flowFaded = flowDraws.slice(beforeFlowFade).filter(function (call) { return call.canvas && call.canvas._spsCpu; });
+assert(flowFaded.some(function (call) { return Math.abs(call.alpha - 1) < 1e-6; }), "the outgoing photo stays opaque during the fade");
+assert(flowFaded.some(function (call) { return Math.abs(call.alpha - 0.5) < 1e-6; }), "the incoming photo is mid-fade");
+assert(flow._cpuDetail === uniqueAfter, "the fade does not double the unique strip count");
+flow._fading = false;
+flow._cpuDrewAt = Date.now();
+flow._cpuDirty = false;
+flow.yaw = flow._cpuYaw;
+const settledBefore = flowDraws.length;
+for (let still = 0; still < 6; still++) flow._drawCpuTiles();
+assert(flowDraws.length === settledBefore, "a settled view does not repaint on every pump");
+const aimBefore = flowDraws.length;
+let aimDraws = 0;
+for (let step = 0; step < 12; step++) {
+  flow.yaw += 3;
+  flow._cpuDrewAt = 0;
+  flow._cpuDirty = true;
+  const mark = flowDraws.length;
+  flow._drawCpuTiles();
+  const added = flowDraws.filter(function (call, index) { return index >= mark && call.canvas && call.canvas._spsCpu; }).length;
+  aimDraws += added;
+  assert(added > 0 && added < 400, "one aim step stays inside a cell budget, draws " + added);
+}
+assert(aimDraws > 0, "continuous aim keeps producing frames");
+assert(flowDraws.slice(aimBefore).every(function (call) {
+  return !call.args || call.args.length >= 9 || !call.canvas || !call.canvas._spsCpu;
+}), "aim frames sample a source window");
 
 // /aim dies when NanoHTTPD's socket read sees 30s of silence. A keepalive
 // echo inside that window has to keep the socket open across 35s idle.

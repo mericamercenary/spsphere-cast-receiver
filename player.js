@@ -19,7 +19,7 @@
 (function (root) {
   // Baked into player.js and the script URL. A Cast WebView that cached
   // "player.js" will not reuse that file for "player.js?v=<this>".
-  var RECEIVER_BUILD = "20261109.1";
+  var RECEIVER_BUILD = "20261109.2";
   var ROTATIONS = 2;
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
@@ -4227,6 +4227,14 @@
 
   Player.prototype.draw = function () {
     if (this._holdFrame && !this._snapOn) return;
+    if (this._cpuTiles) {
+      var stamp = Date.now();
+      if (this._cpuDrawStamp === stamp) {
+        this._cpuDirty = true;
+        return;
+      }
+      this._cpuDrawStamp = stamp;
+    }
     resize(this.canvas);
     if (this._cpuTiles) this._drawCpuTiles();
     else if (this._mode === "webgl" && this._gl) this._drawGl();
@@ -4906,31 +4914,27 @@
     var oldPosePitch = ((fadePose.pitch || 0) * 180) / Math.PI;
     var oldSpanW = this._fadeW || span.w;
     var oldSpanH = this._fadeH || span.h;
-    var newAtlas = this._enqueueCpuPieces(newList, "live", span.w, span.h);
-    this._paintCpuUnderlay(newAtlas);
-    var oldAtlas = haveOld ? this._enqueueCpuPieces(oldList, "fade", oldSpanW, oldSpanH) : null;
-    var pending = (newAtlas && newAtlas.queue ? newAtlas.queue.length : 0) + (oldAtlas && oldAtlas.queue ? oldAtlas.queue.length : 0);
-    // One source strip per frame. The view itself is a mesh over a small
-    // backing store, so Cast messages are not waiting on 4064px JPEGs.
-    var cap = pending > 2 ? 1 : pending;
-    var left = cap;
-    if (newAtlas && left > 0) left -= this._flushCpuAtlas(newAtlas, left);
-    if (oldAtlas && left > 0) this._flushCpuAtlas(oldAtlas, left);
-    var fit = cpuRenderSize(w, h, this._cpuFrameMs || 0, this._cpuViewW || 0);
+    this._noteCpuResidents(newList);
+    if (haveOld) this._noteCpuResidents(oldList);
+    var cols = this._cpuMeshCols || 16;
+    var rows = this._cpuMeshRows || 9;
+    var maxView = cpuRenderSize(w, h, 0, 0);
+    var qual = cpuQualityStep(this._cpuDrawMs || 0, this._cpuGapMs || 0, this._cpuViewW || 0, cols, maxView.w);
+    cols = qual.cols;
+    rows = qual.rows;
+    var fit = cpuRenderSize(w, h, 0, qual.w);
     var rw = fit.w;
     var rh = fit.h;
     this._cpuViewW = rw;
     this._cpuViewH = rh;
+    this._cpuMeshCols = cols;
+    this._cpuMeshRows = rows;
     if (canvas) {
       if (canvas.width !== rw) canvas.width = rw;
       if (canvas.height !== rh) canvas.height = rh;
     }
-    var cols = this._cpuMeshCols || 16;
-    var rows = this._cpuMeshRows || 9;
-    var eqW = newAtlas && newAtlas.width || 0;
-    var eqH = newAtlas && newAtlas.height || 0;
-    var sizeLine = "canvas2d render " + rw + "x" + rh + " equirect " + eqW + "x" + eqH + " mesh " + cols + "x" + rows;
-    if (sizeLine !== this._cpuSizeLog && eqW > 0) {
+    var sizeLine = "canvas2d render " + rw + "x" + rh + " mesh " + cols + "x" + rows + " unique " + (this._cpuDetail || 0);
+    if (sizeLine !== this._cpuSizeLog && (haveNew || haveOld)) {
       this._cpuSizeLog = sizeLine;
       this._reportTv(withBuild(sizeLine));
     }
@@ -4940,59 +4944,57 @@
       + Math.abs((this.roll || 0) - (this._cpuRoll || 0))
       + Math.abs((this.fov || 0) - (this._cpuFov || 0));
     var age = nowDraw - (this._cpuDrewAt || 0);
-    var minAge = this.manual ? 50 : 32;
-    var queueLeft = (newAtlas && newAtlas.queue ? newAtlas.queue.length : 0) + (oldAtlas && oldAtlas.queue ? oldAtlas.queue.length : 0);
-    var paintedNow = queueLeft < pending;
-    if (!this._fading && !paintedNow && queueLeft === 0 && this._cpuDrewAt && age < minAge && moved < (this.manual ? 0.45 : 0.08)) {
+    var minAge = this.manual ? 32 : 28;
+    if (!this._cpuDirty && !this._fading && this._cpuDrewAt && age < minAge && moved < (this.manual ? 0.35 : 0.08)) {
       return this._cpuDrawn || 0;
     }
+    var gap = this._cpuPaintAt ? nowDraw - this._cpuPaintAt : 0;
+    this._cpuPaintAt = nowDraw;
     ctx.fillStyle = "#0b0d10";
     ctx.fillRect(0, 0, rw, rh);
     var drawn = 0;
     var t0 = Date.now();
-    if (haveOld && oldAtlas && oldAtlas.canvas && alphas.oldAlpha > 0) {
-      drawn += paintPerspective(ctx, oldAtlas.canvas, this.yaw, (this.pitch || 0) + oldPosePitch, this.roll || 0, this.fov, fadePose.pitch || 0, fadePose.roll || 0, rw, rh, alphas.oldAlpha, cols, rows);
+    var under = this._cpuUnderlayPiece();
+    if (haveOld && alphas.oldAlpha > 0) {
+      drawn += paintStripView(ctx, oldList, under, oldSpanW, oldSpanH, this.yaw, (this.pitch || 0) + oldPosePitch, this.roll || 0, this.fov, fadePose.pitch || 0, fadePose.roll || 0, rw, rh, alphas.oldAlpha, cols, rows);
     }
-    if (haveNew && newAtlas && newAtlas.canvas && (!haveOld || alphas.newAlpha > 0.001)) {
+    if (haveNew && (!haveOld || alphas.newAlpha > 0.001)) {
       var show = haveOld ? alphas.newAlpha : 1;
       if (show > 0) {
-        drawn += paintPerspective(ctx, newAtlas.canvas, this.yaw, (this.pitch || 0) + posePitch, this.roll || 0, this.fov, pose.pitch || 0, pose.roll || 0, rw, rh, show, cols, rows);
+        drawn += paintStripView(ctx, newList, under, span.w, span.h, this.yaw, (this.pitch || 0) + posePitch, this.roll || 0, this.fov, pose.pitch || 0, pose.roll || 0, rw, rh, show, cols, rows);
       }
     }
-    var frame = Date.now() - t0;
-    this._cpuFrameMs = this._cpuFrameMs ? this._cpuFrameMs * 0.6 + frame * 0.4 : frame;
+    var drawMs = Date.now() - t0;
+    this._cpuDrawMs = this._cpuDrawMs ? this._cpuDrawMs * 0.6 + drawMs * 0.4 : drawMs;
+    if (gap > 0) this._cpuGapMs = this._cpuGapMs ? this._cpuGapMs * 0.6 + gap * 0.4 : gap;
     this._cpuFrames = (this._cpuFrames || 0) + 1;
-    this._cpuFrameSum = (this._cpuFrameSum || 0) + frame;
+    this._cpuFrameSum = (this._cpuFrameSum || 0) + drawMs;
+    this._cpuGapSum = (this._cpuGapSum || 0) + (gap > 0 ? gap : 0);
+    this._cpuGapN = (this._cpuGapN || 0) + (gap > 0 ? 1 : 0);
+    var queue = ((this._decodeQueue && this._decodeQueue.length) || 0) + ((this._uploadQueue && this._uploadQueue.length) || 0);
     if (!this._cpuFpsLogAt) this._cpuFpsLogAt = nowDraw;
     if (nowDraw - this._cpuFpsLogAt >= 2000 && this._cpuFrames > 0) {
-      var avg = Math.round(this._cpuFrameSum / this._cpuFrames);
-      var fps = Math.round(this._cpuFrames * 1000 / Math.max(1, nowDraw - this._cpuFpsLogAt));
+      var avgDraw = Math.round(this._cpuFrameSum / this._cpuFrames);
+      var avgGap = this._cpuGapN ? Math.round(this._cpuGapSum / this._cpuGapN) : 0;
+      var delivered = avgGap > 0 ? Math.round(1000 / avgGap) : 0;
+      var outside = avgGap > avgDraw ? avgGap - avgDraw : 0;
       this._reportTv(withBuild(
-        "canvas2d frame " + avg + "ms fps " + fps
+        "canvas2d cadence draw " + avgDraw + "ms gap " + avgGap + "ms delivered " + delivered
+        + " outside " + outside
         + " view " + rw + "x" + rh
-        + " equirect " + eqW + "x" + eqH
-        + " strips " + (this._cpuDetail || 0)
-        + " overview " + (this._cpuOverview || 0)
         + " mesh " + cols + "x" + rows
+        + " unique " + (this._cpuDetail || 0)
+        + " overview " + (this._cpuOverview || 0)
+        + " queue " + queue
+        + " fade " + (this._fading ? 1 : 0)
       ));
       this._cpuFpsLogAt = nowDraw;
       this._cpuFrames = 0;
       this._cpuFrameSum = 0;
+      this._cpuGapSum = 0;
+      this._cpuGapN = 0;
     }
-    // Stay on a 16x9 mesh unless several frames in a row prove headroom.
-    // Resolution, not a 32x18 mesh, is what drops first when a frame runs long.
-    if (frame > 40) {
-      this._cpuFast = 0;
-      if (cols > 16) cols -= 4;
-    } else if (frame > 0 && frame < 12) {
-      this._cpuFast = (this._cpuFast || 0) + 1;
-      if (this._cpuFast >= 6 && cols < 24) {
-        cols += 4;
-        this._cpuFast = 0;
-      }
-    } else this._cpuFast = 0;
-    this._cpuMeshCols = cols;
-    this._cpuMeshRows = Math.max(9, Math.round(cols * 9 / 16));
+    this._cpuDirty = false;
     this._cpuDrewAt = nowDraw;
     this._cpuYaw = this.yaw || 0;
     this._cpuPitch = this.pitch || 0;
@@ -5000,6 +5002,48 @@
     this._cpuFov = this.fov || 0;
     this._cpuDrawn = (this._cpuDrawn || 0) + drawn;
     return drawn;
+  };
+
+  Player.prototype._cpuUnderlayPiece = function () {
+    var base = this._activeBase && this._activeBase();
+    var img = base && base.tex && base.tex._cpuImage;
+    if (!img || !base.tile) return null;
+    return { tex: base.tex, tile: base.tile };
+  };
+
+  Player.prototype._noteCpuResidents = function (list) {
+    if (!list) return;
+    if (!this._cpuSeen) this._cpuSeen = {};
+    var changed = false;
+    for (var i = 0; i < list.length; i++) {
+      var piece = list[i];
+      var tex = piece && piece.tex;
+      var img = (tex && tex._cpuImage) || (piece && piece.image) || null;
+      var tile = piece && (piece.spec || piece.tile || (tex && tex._window));
+      if (!img || !tile) continue;
+      var id = String(tile.id || ((tile.srcX || 0) + ":" + (tile.srcY || 0)));
+      if (this._cpuSeen[id]) continue;
+      this._cpuSeen[id] = 1;
+      changed = true;
+      var imgW = img.width || 0;
+      var imgH = img.height || 0;
+      var srcW = tile.srcW || 0;
+      var overview = !!(tile._overview || tile._base) || /overview/i.test(id) || (imgW > 0 && imgW <= 256 && srcW > imgW * 4);
+      if (overview) this._cpuOverview = (this._cpuOverview || 0) + 1;
+      else {
+        this._cpuDetail = (this._cpuDetail || 0) + 1;
+        this._cpuDetailPx = (this._cpuDetailPx || 0) + imgW * imgH;
+      }
+      this._cpuDirty = true;
+    }
+    if (!changed) return;
+    var line = "canvas2d composed unique " + (this._cpuDetail || 0)
+      + " overview " + (this._cpuOverview || 0)
+      + " detailPx " + (this._cpuDetailPx || 0);
+    if (line !== this._cpuComposeLog) {
+      this._cpuComposeLog = line;
+      this._reportTv(withBuild(line));
+    }
   };
 
   function copyOverview(overview) {
@@ -5469,6 +5513,203 @@
       tw = Math.max(2, Math.round(th * aspect));
     }
     return { w: tw, h: th };
+  }
+
+  // drawMs is the paint itself. gapMs is the wall time from one paint to the
+  // next, including decode, Cast traffic, and the wait for the next frame.
+  // A 64ms paint delivered every 250ms is 4 fps. The gap decides the rate.
+  // Only a long paint shrinks the mesh, then the view. A long gap caused by
+  // a JPEG decode does not throw away resolution.
+  function cpuQualityStep(drawMs, gapMs, prevW, prevCols, maxW) {
+    var cols = prevCols > 4 ? prevCols : 16;
+    var cap = maxW > 320 ? maxW : 1920;
+    var w = prevW > 320 ? prevW : Math.min(1280, cap);
+    if (drawMs > 55 && cols > 8) cols -= 4;
+    else if (drawMs > 80 && cols <= 8 && w > 960) w = Math.max(960, Math.round(w * 0.8));
+    else if (drawMs > 0 && drawMs < 28 && gapMs > 0 && gapMs < 50) {
+      if (w < cap) w = Math.min(cap, Math.round(w * 1.15));
+      else if (cols < 16) cols += 4;
+    }
+    if (w > cap) w = cap;
+    var rows = Math.max(5, Math.round(cols * 9 / 16));
+    return { w: Math.round(w), cols: cols, rows: rows };
+  }
+
+  function cpuDeliveredFps(gaps) {
+    if (!gaps || !gaps.length) return 0;
+    var sum = 0;
+    var n = 0;
+    for (var i = 0; i < gaps.length; i++) {
+      if (!(gaps[i] > 0)) continue;
+      sum += gaps[i];
+      n += 1;
+    }
+    if (!(n > 0) || !(sum > 0)) return 0;
+    return Math.round(1000 / (sum / n));
+  }
+
+  function pieceImage(piece) {
+    var tex = piece && piece.tex;
+    return (tex && tex._cpuImage) || (piece && piece.image) || null;
+  }
+
+  function pieceTile(piece) {
+    var tex = piece && piece.tex;
+    return piece && (piece.spec || piece.tile || (tex && tex._window));
+  }
+
+  function pieceIsOverview(img, tile) {
+    if (!tile) return false;
+    var id = String(tile.id || "");
+    var imgW = (img && img.width) || 0;
+    var srcW = tile.srcW || 0;
+    return !!(tile._overview || tile._base) || /overview/i.test(id) || (imgW > 0 && imgW <= 256 && srcW > imgW * 4);
+  }
+
+  function indexStrip(img, tile, spanW, spanH) {
+    var imgW = (img && img.width) || tile.texW || tile.srcW || 1;
+    var imgH = (img && img.height) || tile.texH || tile.srcH || 1;
+    var texW = tile.texW || imgW;
+    var texH = tile.texH || imgH;
+    var photoW = tile.srcW || texW || imgW;
+    var photoH = tile.srcH || texH || imgH;
+    var downscale = imgW > 0 && photoW > imgW * 2;
+    return {
+      img: img,
+      tile: tile,
+      segs: tilePhotoSegments(tile, spanW),
+      scaleX: downscale ? imgW / photoW : imgW / (texW || imgW),
+      scaleY: downscale ? imgH / photoH : imgH / (texH || imgH),
+      y0: tile.srcY || 0,
+      y1: (tile.srcY || 0) + (tile.srcH || photoH || spanH || 1),
+      overview: pieceIsOverview(img, tile),
+    };
+  }
+
+  function blitOverlap(ctx, item, px0, px1, py0, py1, x, y, dw, dh) {
+    var oy0 = py0 > item.y0 ? py0 : item.y0;
+    var oy1 = py1 < item.y1 ? py1 : item.y1;
+    if (!(oy1 > oy0)) return 0;
+    var drawn = 0;
+    for (var s = 0; s < item.segs.length; s++) {
+      var seg = item.segs[s];
+      var ox0 = px0 > seg.photoX ? px0 : seg.photoX;
+      var ox1 = px1 < seg.photoX + seg.photoW ? px1 : seg.photoX + seg.photoW;
+      if (!(ox1 > ox0)) continue;
+      var local = seg.localX + (ox0 - seg.photoX);
+      var sx = ((item.tile.padL || 0) + local) * item.scaleX;
+      var sy = ((item.tile.padT || 0) + (oy0 - item.y0)) * item.scaleY;
+      var sw = (ox1 - ox0) * item.scaleX;
+      var sh = (oy1 - oy0) * item.scaleY;
+      if (!(sw > 0.5) || !(sh > 0.5)) continue;
+      var dx = x + ((ox0 - px0) / (px1 - px0)) * dw;
+      var dy = y + ((oy0 - py0) / (py1 - py0)) * dh;
+      var bw = ((ox1 - ox0) / (px1 - px0)) * dw;
+      var bh = ((oy1 - oy0) / (py1 - py0)) * dh;
+      try {
+        ctx.drawImage(item.img, sx, sy, sw, sh, dx, dy, Math.max(bw, 0.5), Math.max(bh, 0.5));
+        drawn += 1;
+      } catch (error) {}
+    }
+    return drawn;
+  }
+
+  function paintIndexed(ctx, indexed, spanW, spanH, u0, v0, u1, v1, x, y, dw, dh) {
+    if (!(u1 > u0) || !(v1 > v0) || !(dw > 0) || !(dh > 0)) return 0;
+    var px0 = u0 * spanW;
+    var px1 = u1 * spanW;
+    var py0 = v0 * spanH;
+    var py1 = v1 * spanH;
+    var drawn = 0;
+    var hit = false;
+    for (var i = 0; i < indexed.length; i++) {
+      if (indexed[i].overview) continue;
+      var n = blitOverlap(ctx, indexed[i], px0, px1, py0, py1, x, y, dw, dh);
+      if (n > 0) hit = true;
+      drawn += n;
+    }
+    if (hit) return drawn;
+    for (var j = 0; j < indexed.length; j++) {
+      if (!indexed[j].overview) continue;
+      drawn += blitOverlap(ctx, indexed[j], px0, px1, py0, py1, x, y, dw, dh);
+    }
+    return drawn;
+  }
+
+  function paintStripView(ctx, pieces, underlay, spanW, spanH, yaw, pitch, roll, fov, posePitch, poseRoll, viewW, viewH, alpha, cols, rows) {
+    if (!ctx || !(alpha > 0) || !(spanW > 1) || !(spanH > 1) || !(viewW > 1) || !(viewH > 1)) return 0;
+    cols = cols > 4 ? cols : 16;
+    rows = rows > 4 ? rows : 9;
+    var indexed = [];
+    var list = pieces || [];
+    for (var i = 0; i < list.length; i++) {
+      var img = pieceImage(list[i]);
+      var tile = pieceTile(list[i]);
+      if (!img || !tile || !(tile.srcW > 0)) continue;
+      indexed.push(indexStrip(img, tile, spanW, spanH));
+    }
+    if (underlay) {
+      var uimg = pieceImage(underlay);
+      var utile = pieceTile(underlay);
+      if (uimg && utile) indexed.push(indexStrip(uimg, utile, spanW, spanH));
+    }
+    if (!indexed.length) return 0;
+    var aspect = viewW / viewH;
+    var grid = [];
+    for (var gy = 0; gy <= rows; gy++) {
+      var row = [];
+      var py = (gy / rows) * viewH;
+      var ndcY = 1 - (py / viewH) * 2;
+      for (var gx = 0; gx <= cols; gx++) {
+        var px = (gx / cols) * viewW;
+        var ndcX = (px / viewW) * 2 - 1;
+        var uv = perspectiveUv(yaw, pitch, roll, fov, aspect, ndcX, ndcY, posePitch, poseRoll);
+        row.push({ x: px, y: py, u: uv.u, v: uv.v });
+      }
+      grid.push(row);
+    }
+    if (ctx.save) ctx.save();
+    ctx.globalAlpha = alpha;
+    if (ctx.imageSmoothingEnabled != null) ctx.imageSmoothingEnabled = true;
+    var drawn = 0;
+    for (var y = 0; y < rows; y++) {
+      for (var x = 0; x < cols; x++) {
+        var a = grid[y][x];
+        var b = grid[y][x + 1];
+        var c = grid[y + 1][x];
+        var d = grid[y + 1][x + 1];
+        var ub = unwrapU(b.u, a.u);
+        var uc = unwrapU(c.u, a.u);
+        var ud = unwrapU(d.u, a.u);
+        var minU = Math.min(a.u, ub, uc, ud);
+        var maxU = Math.max(a.u, ub, uc, ud);
+        var minV = Math.min(a.v, b.v, c.v, d.v);
+        var maxV = Math.max(a.v, b.v, c.v, d.v);
+        var x0 = Math.min(a.x, b.x, c.x, d.x);
+        var x1 = Math.max(a.x, b.x, c.x, d.x);
+        var y0 = Math.min(a.y, b.y, c.y, d.y);
+        var y1 = Math.max(a.y, b.y, c.y, d.y);
+        if (minU < 0 || maxU > 1) {
+          var cut = minU < 0 ? 0 : 1;
+          var spanU = maxU - minU;
+          var leftU = cut - minU;
+          var frac = spanU > 0 ? leftU / spanU : 0.5;
+          if (frac < 0) frac = 0;
+          if (frac > 1) frac = 1;
+          var mid = x0 + (x1 - x0) * frac;
+          var uLo0 = minU < 0 ? minU + 1 : minU;
+          var uLo1 = minU < 0 ? 1 : cut;
+          var uHi0 = minU < 0 ? 0 : cut;
+          var uHi1 = maxU > 1 ? maxU - 1 : maxU;
+          if (uLo1 > uLo0) drawn += paintIndexed(ctx, indexed, spanW, spanH, uLo0, minV, uLo1, maxV, x0, y0, Math.max(mid - x0, 0.5), Math.max(y1 - y0, 0.5));
+          if (uHi1 > uHi0) drawn += paintIndexed(ctx, indexed, spanW, spanH, uHi0, minV, uHi1, maxV, mid, y0, Math.max(x1 - mid, 0.5), Math.max(y1 - y0, 0.5));
+        } else {
+          drawn += paintIndexed(ctx, indexed, spanW, spanH, minU, minV, maxU, maxV, x0, y0, Math.max(x1 - x0, 0.5), Math.max(y1 - y0, 0.5));
+        }
+      }
+    }
+    if (ctx.restore) ctx.restore();
+    return drawn;
   }
 
   function poseToCameraDir(x, y, z, pitch, roll) {
@@ -8658,7 +8899,10 @@
     cpuEquirectSize: cpuEquirectSize,
     cpuRenderSize: cpuRenderSize,
     cpuSampleBudget: cpuSampleBudget,
+    cpuQualityStep: cpuQualityStep,
+    cpuDeliveredFps: cpuDeliveredFps,
     paintPerspective: paintPerspective,
+    paintStripView: paintStripView,
     paintTileOnAtlas: paintTileOnAtlas,
     panLookaheadDeg: panLookaheadDeg,
     panLeadDeg: panLeadDeg,
