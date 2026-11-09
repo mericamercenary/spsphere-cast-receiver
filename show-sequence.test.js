@@ -3059,11 +3059,81 @@ const viewStart = Cast.cpuRenderSize(3840, 2160, 0, 0);
 assert(viewStart.w === 1280 && viewStart.h === 720, "Canvas2D starts at 1280x720, got " + viewStart.w + "x" + viewStart.h);
 const viewFast = Cast.cpuRenderSize(3840, 2160, 10, 1280);
 assert(viewFast.w > 1280 && viewFast.w <= 1920 && viewFast.h <= 1080, "a fast frame grows and stays within 1080p, got " + viewFast.w + "x" + viewFast.h);
-const viewSlow = Cast.cpuRenderSize(3840, 2160, 60, 1600);
+const viewSlow = Cast.cpuRenderSize(3840, 2160, 120, 1600);
 assert(viewSlow.w >= 960 && viewSlow.w < 1600, "a slow frame shrinks but stays readable, got " + viewSlow.w + "x" + viewSlow.h);
 const viewCap = Cast.cpuRenderSize(3840, 2160, 8, 1800);
 assert(viewCap.w <= 1920 && viewCap.h <= 1080, "the render cap is 1920x1080, got " + viewCap.w + "x" + viewCap.h);
 assert(sphereFront.length >= 16 * 9, "the view mesh is at least 16 by 9, draws " + sphereFront.length);
+const budget = Cast.cpuSampleBudget(8000, 4000, 1280, 720, 75, 16, 9);
+assert(budget.cells === 16 * 9, "the frame is one crop per cell, got " + budget.cells);
+assert(budget.pixels > 500000, "the frame reads the visible equirect, pixels " + budget.pixels);
+assert(budget.pixels < 8000000, "a frame stays under 8 megapixels, pixels " + budget.pixels);
+assert(budget.fullImage > 1000000000, "the old full-image mesh was over a billion pixels");
+assert(budget.pixels * 100 < budget.fullImage, "the cell crop is at least 100x cheaper than blitting the equirect per triangle");
+assert(budget.maxCell < 8000 * 4000 / 8, "no cell copies a large fraction of the equirect, max " + budget.maxCell);
+let recovered = Cast.cpuRenderSize(3840, 2160, 120, 1280).w;
+assert(recovered < 1280 && recovered >= 960, "a slow frame steps the view down, got " + recovered);
+for (let step = 0; step < 8; step++) recovered = Cast.cpuRenderSize(3840, 2160, 12, recovered).w;
+assert(recovered >= 1600 && recovered <= 1920, "fast frames climb back toward 1080p, got " + recovered);
+const composeDraws = [];
+const composeCtx = { drawImage: function () { composeDraws.push(Array.prototype.slice.call(arguments)); } };
+const overviewImg = { width: 64, height: 32, id: "overview" };
+const stripImg = { width: 4064, height: 864, id: "strip" };
+Cast.paintTileOnAtlas(composeCtx, 8000, 4000, overviewImg, {
+  id: "p-overview", _overview: true, _base: true,
+  srcX: 0, srcY: 0, srcW: 8000, srcH: 4000, texW: 64, texH: 32,
+}, 8000, 4000);
+Cast.paintTileOnAtlas(composeCtx, 8000, 4000, stripImg, {
+  id: "p-r2-c0", srcX: 2048, srcY: 1600, srcW: 4064, srcH: 864, texW: 4064, texH: 864,
+}, 8000, 4000);
+const overviewBlit = composeDraws.find(function (args) { return args[0] === overviewImg; });
+const stripBlit = composeDraws.find(function (args) { return args[0] === stripImg; });
+assert(overviewBlit && overviewBlit[3] <= 64, "the overview contributes its own 64px bitmap, sw " + (overviewBlit && overviewBlit[3]));
+assert(overviewBlit && overviewBlit[7] > 7000, "the overview is only the base layer stretched across the photo");
+assert(stripBlit && stripBlit[3] >= 4000, "the detail strip is copied at 4064px, sw " + (stripBlit && stripBlit[3]));
+assert(stripBlit && stripBlit[7] >= 3900 && stripBlit[7] <= 4200, "the detail strip lands 1:1 on the equirect, dw " + (stripBlit && stripBlit[7]));
+const counterHost = {
+  width: 320, height: 180, clientWidth: 320, clientHeight: 180, style: {},
+  addEventListener: function () {},
+  getContext: function () { return null; },
+};
+const counter = Cast.create(counterHost);
+counter._noteCpuComposite(overviewImg, { id: "p-overview", _overview: true, srcW: 8000 });
+counter._noteCpuComposite(stripImg, { id: "p-r2-c0", srcW: 4064, srcH: 864 });
+assert(counter._cpuOverview === 1 && counter._cpuDetail === 1, "composition counts overview and detail separately");
+assert(counter._cpuDetailPx === 4064 * 864, "detail pixels are the strip, not the overview, got " + counter._cpuDetailPx);
+const tvDraws = [];
+sandbox.document = {
+  createElement: function () {
+    const canvas = { width: 256, height: 256 };
+    canvas.getContext = function () {
+      return {
+        imageSmoothingEnabled: true,
+        drawImage: function () { tvDraws.push({ kind: "crop", args: Array.prototype.slice.call(arguments) }); },
+      };
+    };
+    return canvas;
+  },
+  getElementById: function () { return null; },
+};
+const tvAtlas = { width: 8000, height: 4000 };
+const tvView = {
+  save: function () {}, restore: function () {},
+  beginPath: function () {}, moveTo: function () {}, lineTo: function () {}, closePath: function () {},
+  clip: function () {}, setTransform: function () {},
+  imageSmoothingEnabled: true, globalAlpha: 1,
+  drawImage: function () { tvDraws.push({ kind: "view", args: Array.prototype.slice.call(arguments) }); },
+};
+Cast.paintPerspective(tvView, tvAtlas, 0, 0, 0, 75, 0, 0, 1280, 720, 1, 16, 9);
+const crops = tvDraws.filter(function (call) { return call.kind === "crop" && call.args[0] === tvAtlas; });
+assert(crops.length >= 16 * 9, "each mesh cell crops the equirect, crops " + crops.length);
+crops.forEach(function (call) {
+  assert(call.args.length >= 9 && call.args[3] < 2000 && call.args[3] > 20, "cell source width stays a window into the strip, sw " + call.args[3]);
+});
+assert(!tvDraws.some(function (call) { return call.args[0] === tvAtlas && call.args.length < 5; }), "the full 8000px equirect is never drawn as one image");
+const viewBlits = tvDraws.filter(function (call) { return call.kind === "view"; });
+assert(viewBlits.length >= 16 * 9, "the view is the mesh, draws " + viewBlits.length);
+assert(viewBlits.every(function (call) { return call.args[0] && call.args[0].width === 256; }), "affine samples come from the 256px crop, not the 8000px atlas");
 
 // /aim dies when NanoHTTPD's socket read sees 30s of silence. A keepalive
 // echo inside that window has to keep the socket open across 35s idle.

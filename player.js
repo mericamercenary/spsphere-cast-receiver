@@ -19,7 +19,7 @@
 (function (root) {
   // Baked into player.js and the script URL. A Cast WebView that cached
   // "player.js" will not reuse that file for "player.js?v=<this>".
-  var RECEIVER_BUILD = "20261108.5";
+  var RECEIVER_BUILD = "20261109.1";
   var ROTATIONS = 2;
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
@@ -2706,6 +2706,12 @@
         tex._evicted = false;
       }
     }
+    if (img && !tex._cpuImage && !(this._gl && !this._glLost && !(this._gl.isContextLost && this._gl.isContextLost()))) {
+      // No WebGL context, so the decoded overview has to stay on the CPU
+      // atlas. Strips paint over it; the bitmap is not a substitute for them.
+      img._cpuRetain = true;
+      tex._cpuImage = img;
+    }
     if (!tex) tex = {};
     tex._base = true;
     tex._photo = true;
@@ -4826,15 +4832,57 @@
     return atlas;
   };
 
+  Player.prototype._paintCpuUnderlay = function (atlas) {
+    if (!atlas || !atlas.ctx) return;
+    var base = this._activeBase();
+    var img = base && base.tex && base.tex._cpuImage;
+    if (!img || !base.tile) return;
+    if (!img._cpuStamp) {
+      this._cpuStamp = (this._cpuStamp || 0) + 1;
+      img._cpuStamp = this._cpuStamp;
+    }
+    var id = (base.tile.id || "base") + ":" + img._cpuStamp;
+    if (atlas.underlay === id) return;
+    if (paintTileOnAtlas(atlas.ctx, atlas.width, atlas.height, img, base.tile, atlas.spanW, atlas.spanH) > 0) {
+      atlas.underlay = id;
+      this._noteCpuComposite(img, base.tile);
+    }
+  };
+
   Player.prototype._flushCpuAtlas = function (atlas, limit) {
     if (!atlas || !atlas.ctx || !atlas.queue || !atlas.queue.length) return 0;
     var n = 0;
     var cap = limit > 0 ? limit : 1;
     while (atlas.queue.length && n < cap) {
       var job = atlas.queue.shift();
-      n += paintTileOnAtlas(atlas.ctx, atlas.width, atlas.height, job.img, job.tile, atlas.spanW, atlas.spanH) ? 1 : 0;
+      var parts = paintTileOnAtlas(atlas.ctx, atlas.width, atlas.height, job.img, job.tile, atlas.spanW, atlas.spanH);
+      if (parts > 0) {
+        n += 1;
+        this._noteCpuComposite(job.img, job.tile);
+      }
     }
     return n;
+  };
+
+  Player.prototype._noteCpuComposite = function (img, tile) {
+    var imgW = (img && img.width) || 0;
+    var imgH = (img && img.height) || 0;
+    var srcW = (tile && tile.srcW) || 0;
+    var id = String((tile && tile.id) || "");
+    var overview = !!(tile && (tile._overview || tile._base)) || /overview/i.test(id) || (imgW > 0 && imgW <= 256 && srcW > imgW * 4);
+    if (overview) {
+      this._cpuOverview = (this._cpuOverview || 0) + 1;
+    } else {
+      this._cpuDetail = (this._cpuDetail || 0) + 1;
+      this._cpuDetailPx = (this._cpuDetailPx || 0) + imgW * imgH;
+    }
+    var line = "canvas2d composed detail " + (this._cpuDetail || 0)
+      + " overview " + (this._cpuOverview || 0)
+      + " detailPx " + (this._cpuDetailPx || 0);
+    if (line !== this._cpuComposeLog) {
+      this._cpuComposeLog = line;
+      this._reportTv(withBuild(line));
+    }
   };
 
   Player.prototype._drawCpuTiles = function () {
@@ -4859,6 +4907,7 @@
     var oldSpanW = this._fadeW || span.w;
     var oldSpanH = this._fadeH || span.h;
     var newAtlas = this._enqueueCpuPieces(newList, "live", span.w, span.h);
+    this._paintCpuUnderlay(newAtlas);
     var oldAtlas = haveOld ? this._enqueueCpuPieces(oldList, "fade", oldSpanW, oldSpanH) : null;
     var pending = (newAtlas && newAtlas.queue ? newAtlas.queue.length : 0) + (oldAtlas && oldAtlas.queue ? oldAtlas.queue.length : 0);
     // One source strip per frame. The view itself is a mesh over a small
@@ -4912,6 +4961,24 @@
     }
     var frame = Date.now() - t0;
     this._cpuFrameMs = this._cpuFrameMs ? this._cpuFrameMs * 0.6 + frame * 0.4 : frame;
+    this._cpuFrames = (this._cpuFrames || 0) + 1;
+    this._cpuFrameSum = (this._cpuFrameSum || 0) + frame;
+    if (!this._cpuFpsLogAt) this._cpuFpsLogAt = nowDraw;
+    if (nowDraw - this._cpuFpsLogAt >= 2000 && this._cpuFrames > 0) {
+      var avg = Math.round(this._cpuFrameSum / this._cpuFrames);
+      var fps = Math.round(this._cpuFrames * 1000 / Math.max(1, nowDraw - this._cpuFpsLogAt));
+      this._reportTv(withBuild(
+        "canvas2d frame " + avg + "ms fps " + fps
+        + " view " + rw + "x" + rh
+        + " equirect " + eqW + "x" + eqH
+        + " strips " + (this._cpuDetail || 0)
+        + " overview " + (this._cpuOverview || 0)
+        + " mesh " + cols + "x" + rows
+      ));
+      this._cpuFpsLogAt = nowDraw;
+      this._cpuFrames = 0;
+      this._cpuFrameSum = 0;
+    }
     // Stay on a 16x9 mesh unless several frames in a row prove headroom.
     // Resolution, not a 32x18 mesh, is what drops first when a frame runs long.
     if (frame > 40) {
@@ -5298,8 +5365,14 @@
     var imgH = img.height || tile.texH || tile.srcH || 1;
     var texW = tile.texW || imgW;
     var texH = tile.texH || imgH;
-    var scaleX = imgW / texW;
-    var scaleY = imgH / texH;
+    var photoW = tile.srcW || texW || imgW;
+    var photoH = tile.srcH || texH || imgH;
+    // A 64px overview stands in for the whole photo. A 4064px strip is already
+    // in photo pixels and has to be copied at that width, not stretched from
+    // the overview.
+    var downscale = imgW > 0 && photoW > imgW * 2;
+    var scaleX = downscale ? imgW / photoW : imgW / (texW || imgW);
+    var scaleY = downscale ? imgH / photoH : imgH / (texH || imgH);
     var drawn = 0;
     for (var s = 0; s < segs.length; s++) {
       var seg = segs[s];
@@ -5382,8 +5455,11 @@
     if (maxW / maxH > aspect) maxW = maxH * aspect;
     else maxH = maxW / aspect;
     var target = prevW > 0 ? prevW : Math.min(1280, maxW);
-    if (frameMs > 48 && target > 960) target *= 0.75;
-    else if (frameMs > 0 && frameMs < 16 && target < maxW) target = Math.min(maxW, target * 1.25);
+    // A slow frame steps down, and a run of cheap frames climbs back toward
+    // 1080p. The onn path dropped to 960x540 on the first expensive mesh and
+    // never returned, which is the soft picture on a 4K panel.
+    if (frameMs > 90 && target > 960) target = Math.max(960, target * 0.8);
+    else if (frameMs > 0 && frameMs < 40 && target < maxW) target = Math.min(maxW, target * 1.15);
     if (target > maxW) target = maxW;
     if (target < 960 && maxW >= 960) target = 960;
     var tw = Math.max(2, Math.round(target));
@@ -5500,51 +5576,142 @@
     return fan(above, highShift).concat(fan(below, lowShift));
   }
 
-  function drawTexturedTri(ctx, img, su0, sv0, su1, sv1, su2, sv2, dx0, dy0, dx1, dy1, dx2, dy2) {
-    var parts = splitTriSeam(su0, sv0, su1, sv1, su2, sv2, dx0, dy0, dx1, dy1, dx2, dy2);
-    for (var i = 0; i < parts.length; i++) {
-      var p = parts[i];
-      blitTri(ctx, img, p[0], p[1], p[2]);
+  var CPU_SCRATCH = 256;
+  var cpuScratch = null;
+  var cpuScratchCtx = null;
+
+  function scratchContext() {
+    if (typeof document === "undefined" || !document.createElement) return null;
+    if (!cpuScratch) {
+      cpuScratch = document.createElement("canvas");
+      cpuScratch.width = CPU_SCRATCH;
+      cpuScratch.height = CPU_SCRATCH;
+      cpuScratch._spsScratch = true;
+      cpuScratchCtx = cpuScratch.getContext("2d");
+      if (cpuScratchCtx) cpuScratchCtx.imageSmoothingEnabled = true;
     }
+    return cpuScratchCtx;
   }
 
-  function blitTri(ctx, img, p0, p1, p2) {
-    var sx0 = p0.u * img.width;
-    var sy0 = p0.v * img.height;
-    var sx1 = p1.u * img.width;
-    var sy1 = p1.v * img.height;
-    var sx2 = p2.u * img.width;
-    var sy2 = p2.v * img.height;
-    if (ctx.setTransform && ctx.beginPath && ctx.clip) {
-      var det = sx0 * (sy1 - sy2) + sx1 * (sy2 - sy0) + sx2 * (sy0 - sy1);
-      if (Math.abs(det) < 1e-4) return;
-      var a = (p0.x * (sy1 - sy2) + p1.x * (sy2 - sy0) + p2.x * (sy0 - sy1)) / det;
-      var c = (p0.x * (sx2 - sx1) + p1.x * (sx0 - sx2) + p2.x * (sx1 - sx0)) / det;
-      var e = p0.x - a * sx0 - c * sy0;
-      var b = (p0.y * (sy1 - sy2) + p1.y * (sy2 - sy0) + p2.y * (sy0 - sy1)) / det;
-      var d = (p0.y * (sx2 - sx1) + p1.y * (sx0 - sx2) + p2.y * (sx1 - sx0)) / det;
-      var f = p0.y - b * sx0 - d * sy0;
-      ctx.save();
-      ctx.beginPath();
-      ctx.moveTo(p0.x, p0.y);
-      ctx.lineTo(p1.x, p1.y);
-      ctx.lineTo(p2.x, p2.y);
-      ctx.closePath();
-      ctx.clip();
-      ctx.setTransform(a, b, c, d, e, f);
-      ctx.drawImage(img, 0, 0);
-      ctx.restore();
-      return;
+  function sourceBounds(points, img) {
+    var minU = points[0].u;
+    var maxU = points[0].u;
+    var minV = points[0].v;
+    var maxV = points[0].v;
+    for (var i = 1; i < points.length; i++) {
+      if (points[i].u < minU) minU = points[i].u;
+      if (points[i].u > maxU) maxU = points[i].u;
+      if (points[i].v < minV) minV = points[i].v;
+      if (points[i].v > maxV) maxV = points[i].v;
     }
-    var minU = Math.min(p0.u, p1.u, p2.u);
-    var maxU = Math.max(p0.u, p1.u, p2.u);
-    var minV = Math.min(p0.v, p1.v, p2.v);
-    var maxV = Math.max(p0.v, p1.v, p2.v);
-    var minX = Math.min(p0.x, p1.x, p2.x);
-    var maxX = Math.max(p0.x, p1.x, p2.x);
-    var minY = Math.min(p0.y, p1.y, p2.y);
-    var maxY = Math.max(p0.y, p1.y, p2.y);
-    ctx.drawImage(img, minU * img.width, minV * img.height, Math.max(1, (maxU - minU) * img.width), Math.max(1, (maxV - minV) * img.height), minX, minY, Math.max(1, maxX - minX), Math.max(1, maxY - minY));
+    var sx = minU * img.width;
+    var sy = minV * img.height;
+    var sw = (maxU - minU) * img.width;
+    var sh = (maxV - minV) * img.height;
+    if (sx < 0) { sw += sx; sx = 0; }
+    if (sy < 0) { sh += sy; sy = 0; }
+    if (sx + sw > img.width) sw = img.width - sx;
+    if (sy + sh > img.height) sh = img.height - sy;
+    return { minU: minU, minV: minV, maxU: maxU, maxV: maxV, sx: sx, sy: sy, sw: sw, sh: sh };
+  }
+
+  // Source pixels a frame actually reads. The old mesh multiplied the whole
+  // equirect by every triangle (8000*4000*288). A cell reads only its UV box.
+  function cpuSampleBudget(eqW, eqH, viewW, viewH, fov, cols, rows) {
+    cols = cols > 4 ? cols : 16;
+    rows = rows > 4 ? rows : 9;
+    var aspect = viewW / Math.max(viewH, 1);
+    var pixels = 0;
+    var maxCell = 0;
+    var cells = 0;
+    for (var y = 0; y < rows; y++) {
+      for (var x = 0; x < cols; x++) {
+        var samples = [];
+        for (var iy = 0; iy <= 1; iy++) {
+          for (var ix = 0; ix <= 1; ix++) {
+            var ndcX = ((x + ix) / cols) * 2 - 1;
+            var ndcY = 1 - ((y + iy) / rows) * 2;
+            samples.push(perspectiveUv(0, 0, 0, fov || 75, aspect, ndcX, ndcY, 0, 0));
+          }
+        }
+        var ref = samples[0].u;
+        var minU = ref;
+        var maxU = ref;
+        var minV = samples[0].v;
+        var maxV = samples[0].v;
+        for (var s = 0; s < samples.length; s++) {
+          var u = unwrapU(samples[s].u, ref);
+          if (u < minU) minU = u;
+          if (u > maxU) maxU = u;
+          if (samples[s].v < minV) minV = samples[s].v;
+          if (samples[s].v > maxV) maxV = samples[s].v;
+        }
+        var area = Math.max(0, maxU - minU) * eqW * Math.max(0, maxV - minV) * eqH;
+        pixels += area;
+        if (area > maxCell) maxCell = area;
+        cells += 1;
+      }
+    }
+    return {
+      pixels: Math.round(pixels),
+      maxCell: Math.round(maxCell),
+      cells: cells,
+      fullImage: eqW * eqH * cells * 2,
+    };
+  }
+
+  function blitAffine(ctx, image, s0, s1, s2, p0, p1, p2) {
+    var det = s0.x * (s1.y - s2.y) + s1.x * (s2.y - s0.y) + s2.x * (s0.y - s1.y);
+    if (Math.abs(det) < 1e-3) return false;
+    var a = (p0.x * (s1.y - s2.y) + p1.x * (s2.y - s0.y) + p2.x * (s0.y - s1.y)) / det;
+    var c = (p0.x * (s2.x - s1.x) + p1.x * (s0.x - s2.x) + p2.x * (s1.x - s0.x)) / det;
+    var e = p0.x - a * s0.x - c * s0.y;
+    var b = (p0.y * (s1.y - s2.y) + p1.y * (s2.y - s0.y) + p2.y * (s0.y - s1.y)) / det;
+    var d = (p0.y * (s2.x - s1.x) + p1.y * (s0.x - s2.x) + p2.y * (s1.x - s0.x)) / det;
+    var f = p0.y - b * s0.x - d * s0.y;
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(p0.x, p0.y);
+    ctx.lineTo(p1.x, p1.y);
+    ctx.lineTo(p2.x, p2.y);
+    ctx.closePath();
+    ctx.clip();
+    ctx.setTransform(a, b, c, d, e, f);
+    ctx.drawImage(image, 0, 0);
+    ctx.restore();
+    return true;
+  }
+
+  function paintCell(ctx, img, points) {
+    var bounds = sourceBounds(points, img);
+    if (!(bounds.sw > 0.5) || !(bounds.sh > 0.5)) return 0;
+    paintPerspective.samplePixels = (paintPerspective.samplePixels || 0) + bounds.sw * bounds.sh;
+    if (ctx.setTransform && ctx.beginPath && ctx.clip) {
+      var scratch = scratchContext();
+      if (scratch && cpuScratch) {
+        scratch.drawImage(img, bounds.sx, bounds.sy, bounds.sw, bounds.sh, 0, 0, CPU_SCRATCH, CPU_SCRATCH);
+        var su = CPU_SCRATCH / Math.max(bounds.maxU - bounds.minU, 1e-6);
+        var sv = CPU_SCRATCH / Math.max(bounds.maxV - bounds.minV, 1e-6);
+        function at(p) {
+          return { x: (p.u - bounds.minU) * su, y: (p.v - bounds.minV) * sv };
+        }
+        blitAffine(ctx, cpuScratch, at(points[0]), at(points[1]), at(points[2]), points[0], points[1], points[2]);
+        if (points.length > 3) blitAffine(ctx, cpuScratch, at(points[1]), at(points[3]), at(points[2]), points[1], points[3], points[2]);
+        return points.length > 3 ? 2 : 1;
+      }
+    }
+    var minX = points[0].x;
+    var maxX = points[0].x;
+    var minY = points[0].y;
+    var maxY = points[0].y;
+    for (var i = 1; i < points.length; i++) {
+      if (points[i].x < minX) minX = points[i].x;
+      if (points[i].x > maxX) maxX = points[i].x;
+      if (points[i].y < minY) minY = points[i].y;
+      if (points[i].y > maxY) maxY = points[i].y;
+    }
+    ctx.drawImage(img, bounds.sx, bounds.sy, Math.max(1, bounds.sw), Math.max(1, bounds.sh), minX, minY, Math.max(1, maxX - minX), Math.max(1, maxY - minY));
+    return 1;
   }
 
   function paintPerspective(ctx, img, yaw, pitch, roll, fov, posePitch, poseRoll, viewW, viewH, alpha, cols, rows) {
@@ -5567,16 +5734,32 @@
     }
     if (ctx.save) ctx.save();
     ctx.globalAlpha = alpha;
+    if (ctx.imageSmoothingEnabled != null) ctx.imageSmoothingEnabled = true;
+    paintPerspective.samplePixels = 0;
     var drawn = 0;
     for (var gy = 0; gy < rows; gy++) {
       for (var gx = 0; gx < cols; gx++) {
         var a = grid[gy][gx];
         var b = grid[gy][gx + 1];
         var c = grid[gy + 1][gx];
-        var d = grid[gy + 1][gx + 1];
-        drawTexturedTri(ctx, img, a.u, a.v, b.u, b.v, c.u, c.v, a.x, a.y, b.x, b.y, c.x, c.y);
-        drawTexturedTri(ctx, img, b.u, b.v, d.u, d.v, c.u, c.v, b.x, b.y, d.x, d.y, c.x, c.y);
-        drawn += 2;
+        var dpt = grid[gy + 1][gx + 1];
+        var ub = unwrapU(b.u, a.u);
+        var uc = unwrapU(c.u, a.u);
+        var ud = unwrapU(dpt.u, a.u);
+        var span = Math.max(a.u, ub, uc, ud) - Math.min(a.u, ub, uc, ud);
+        if (span > 0.5) {
+          var partsA = splitTriSeam(a.u, a.v, b.u, b.v, c.u, c.v, a.x, a.y, b.x, b.y, c.x, c.y);
+          var partsB = splitTriSeam(b.u, b.v, dpt.u, dpt.v, c.u, c.v, b.x, b.y, dpt.x, dpt.y, c.x, c.y);
+          for (var i = 0; i < partsA.length; i++) drawn += paintCell(ctx, img, partsA[i]);
+          for (var j = 0; j < partsB.length; j++) drawn += paintCell(ctx, img, partsB[j]);
+        } else {
+          drawn += paintCell(ctx, img, [
+            { u: a.u, v: a.v, x: a.x, y: a.y },
+            { u: ub, v: b.v, x: b.x, y: b.y },
+            { u: uc, v: c.v, x: c.x, y: c.y },
+            { u: ud, v: dpt.v, x: dpt.x, y: dpt.y },
+          ]);
+        }
       }
     }
     if (ctx.restore) ctx.restore();
@@ -8474,6 +8657,9 @@
     perspectiveDir: perspectiveDir,
     cpuEquirectSize: cpuEquirectSize,
     cpuRenderSize: cpuRenderSize,
+    cpuSampleBudget: cpuSampleBudget,
+    paintPerspective: paintPerspective,
+    paintTileOnAtlas: paintTileOnAtlas,
     panLookaheadDeg: panLookaheadDeg,
     panLeadDeg: panLeadDeg,
     BASE_BYTES: BASE_BYTES,
