@@ -19,7 +19,7 @@
 (function (root) {
   // Baked into player.js and the script URL. A Cast WebView that cached
   // "player.js" will not reuse that file for "player.js?v=<this>".
-  var RECEIVER_BUILD = "20261109.2";
+  var RECEIVER_BUILD = "20261109.3";
   var ROTATIONS = 2;
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
@@ -4919,7 +4919,7 @@
     var cols = this._cpuMeshCols || 16;
     var rows = this._cpuMeshRows || 9;
     var maxView = cpuRenderSize(w, h, 0, 0);
-    var qual = cpuQualityStep(this._cpuDrawMs || 0, this._cpuGapMs || 0, this._cpuViewW || 0, cols, maxView.w);
+    var qual = cpuQualityStep(this._cpuDrawMs || 0, this._cpuGapMs || 0, this._cpuViewW || 0, cols, maxView.w, this._cpuSlow || 0);
     cols = qual.cols;
     rows = qual.rows;
     var fit = cpuRenderSize(w, h, 0, qual.w);
@@ -4966,6 +4966,7 @@
     }
     var drawMs = Date.now() - t0;
     this._cpuDrawMs = this._cpuDrawMs ? this._cpuDrawMs * 0.6 + drawMs * 0.4 : drawMs;
+    this._cpuSlow = drawMs > 55 ? (this._cpuSlow || 0) + 1 : 0;
     if (gap > 0) this._cpuGapMs = this._cpuGapMs ? this._cpuGapMs * 0.6 + gap * 0.4 : gap;
     this._cpuFrames = (this._cpuFrames || 0) + 1;
     this._cpuFrameSum = (this._cpuFrameSum || 0) + drawMs;
@@ -5520,12 +5521,16 @@
   // A 64ms paint delivered every 250ms is 4 fps. The gap decides the rate.
   // Only a long paint shrinks the mesh, then the view. A long gap caused by
   // a JPEG decode does not throw away resolution.
-  function cpuQualityStep(drawMs, gapMs, prevW, prevCols, maxW) {
+  function cpuQualityStep(drawMs, gapMs, prevW, prevCols, maxW, slowStreak) {
+    slowStreak = slowStreak || 0;
     var cols = prevCols > 4 ? prevCols : 16;
     var cap = maxW > 320 ? maxW : 1920;
     var w = prevW > 320 ? prevW : Math.min(1280, cap);
-    if (drawMs > 55 && cols > 8) cols -= 4;
-    else if (drawMs > 80 && cols <= 8 && w > 960) w = Math.max(960, Math.round(w * 0.8));
+    // One slow paint, such as the doubled fade frame, must not retile the
+    // mesh. The onn jumped 16x9 to 8x5 and back in one second, which moves
+    // every seam.
+    if (drawMs > 55 && cols > 8 && slowStreak >= 3) cols -= 4;
+    else if (drawMs > 80 && cols <= 8 && w > 960 && slowStreak >= 3) w = Math.max(960, Math.round(w * 0.8));
     else if (drawMs > 0 && drawMs < 28 && gapMs > 0 && gapMs < 50) {
       if (w < cap) w = Math.min(cap, Math.round(w * 1.15));
       else if (cols < 16) cols += 4;
@@ -5602,12 +5607,28 @@
       var sw = (ox1 - ox0) * item.scaleX;
       var sh = (oy1 - oy0) * item.scaleY;
       if (!(sw > 0.5) || !(sh > 0.5)) continue;
+      // One source pixel of bleed. The canvas filter otherwise mixes the
+      // edge of this rect with empty and draws a dark line on the cell.
+      var imgW = item.img.width || sw;
+      var imgH = item.img.height || sh;
+      if (sx >= 1) { sx -= 1; sw += 1; }
+      if (sy >= 1) { sy -= 1; sh += 1; }
+      if (sx + sw < imgW - 1) sw += 1;
+      if (sy + sh < imgH - 1) sh += 1;
       var dx = x + ((ox0 - px0) / (px1 - px0)) * dw;
       var dy = y + ((oy0 - py0) / (py1 - py0)) * dh;
       var bw = ((ox1 - ox0) / (px1 - px0)) * dw;
       var bh = ((oy1 - oy0) / (py1 - py0)) * dh;
+      if (dx > x) { dx -= 1; bw += 1; }
+      if (dy > y) { dy -= 1; bh += 1; }
+      if (dx + bw < x + dw) bw += 1;
+      if (dy + bh < y + dh) bh += 1;
+      if (dx < x) { bw -= x - dx; dx = x; }
+      if (dy < y) { bh -= y - dy; dy = y; }
+      if (dx + bw > x + dw) bw = x + dw - dx;
+      if (dy + bh > y + dh) bh = y + dh - dy;
       try {
-        ctx.drawImage(item.img, sx, sy, sw, sh, dx, dy, Math.max(bw, 0.5), Math.max(bh, 0.5));
+        ctx.drawImage(item.img, sx, sy, sw, sh, dx, dy, Math.max(bw, 1), Math.max(bh, 1));
         drawn += 1;
       } catch (error) {}
     }
@@ -5634,6 +5655,21 @@
       drawn += blitOverlap(ctx, indexed[j], px0, px1, py0, py1, x, y, dw, dh);
     }
     return drawn;
+  }
+
+  // Floor the shared edge and overlap the next cell by one pixel. Independent
+  // drawImage rects otherwise round apart, and the filter at each source edge
+  // blends with empty, which is the vertical line on every mesh column.
+  function cellBox(x0, y0, x1, y1, viewW, viewH, edgeR, edgeB) {
+    var left = Math.floor(x0);
+    var top = Math.floor(y0);
+    var right = edgeR ? viewW : Math.ceil(x1) + 1;
+    var bottom = edgeB ? viewH : Math.ceil(y1) + 1;
+    if (left < 0) left = 0;
+    if (top < 0) top = 0;
+    if (right > viewW) right = viewW;
+    if (bottom > viewH) bottom = viewH;
+    return { x: left, y: top, w: Math.max(1, right - left), h: Math.max(1, bottom - top) };
   }
 
   function paintStripView(ctx, pieces, underlay, spanW, spanH, yaw, pitch, roll, fov, posePitch, poseRoll, viewW, viewH, alpha, cols, rows) {
@@ -5685,10 +5721,11 @@
         var maxU = Math.max(a.u, ub, uc, ud);
         var minV = Math.min(a.v, b.v, c.v, d.v);
         var maxV = Math.max(a.v, b.v, c.v, d.v);
-        var x0 = Math.min(a.x, b.x, c.x, d.x);
-        var x1 = Math.max(a.x, b.x, c.x, d.x);
-        var y0 = Math.min(a.y, b.y, c.y, d.y);
-        var y1 = Math.max(a.y, b.y, c.y, d.y);
+        var x0 = a.x;
+        var x1 = b.x;
+        var y0 = a.y;
+        var y1 = c.y;
+        var box = cellBox(x0, y0, x1, y1, viewW, viewH, x === cols - 1, y === rows - 1);
         if (minU < 0 || maxU > 1) {
           var cut = minU < 0 ? 0 : 1;
           var spanU = maxU - minU;
@@ -5696,15 +5733,17 @@
           var frac = spanU > 0 ? leftU / spanU : 0.5;
           if (frac < 0) frac = 0;
           if (frac > 1) frac = 1;
-          var mid = x0 + (x1 - x0) * frac;
+          var mid = Math.round(box.x + box.w * frac);
+          if (mid < box.x + 1) mid = box.x + 1;
+          if (mid > box.x + box.w - 1) mid = box.x + box.w - 1;
           var uLo0 = minU < 0 ? minU + 1 : minU;
           var uLo1 = minU < 0 ? 1 : cut;
           var uHi0 = minU < 0 ? 0 : cut;
           var uHi1 = maxU > 1 ? maxU - 1 : maxU;
-          if (uLo1 > uLo0) drawn += paintIndexed(ctx, indexed, spanW, spanH, uLo0, minV, uLo1, maxV, x0, y0, Math.max(mid - x0, 0.5), Math.max(y1 - y0, 0.5));
-          if (uHi1 > uHi0) drawn += paintIndexed(ctx, indexed, spanW, spanH, uHi0, minV, uHi1, maxV, mid, y0, Math.max(x1 - mid, 0.5), Math.max(y1 - y0, 0.5));
+          if (uLo1 > uLo0) drawn += paintIndexed(ctx, indexed, spanW, spanH, uLo0, minV, uLo1, maxV, box.x, box.y, mid - box.x + 1, box.h);
+          if (uHi1 > uHi0) drawn += paintIndexed(ctx, indexed, spanW, spanH, uHi0, minV, uHi1, maxV, mid, box.y, box.x + box.w - mid, box.h);
         } else {
-          drawn += paintIndexed(ctx, indexed, spanW, spanH, minU, minV, maxU, maxV, x0, y0, Math.max(x1 - x0, 0.5), Math.max(y1 - y0, 0.5));
+          drawn += paintIndexed(ctx, indexed, spanW, spanH, minU, minV, maxU, maxV, box.x, box.y, box.w, box.h);
         }
       }
     }

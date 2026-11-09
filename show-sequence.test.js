@@ -3142,9 +3142,11 @@ assert(viewBlits.length >= 16 * 9, "the view is the mesh, draws " + viewBlits.le
 assert(viewBlits.every(function (call) { return call.args[0] && call.args[0].width === 256; }), "affine samples come from the 256px crop, not the 8000px atlas");
 assert(Cast.cpuDeliveredFps([250, 250, 200]) === 4, "four paints a second is a 250ms gap, not a 64ms draw");
 assert(Cast.cpuDeliveredFps([64]) === 16, "a 64ms gap is 16fps only when the next paint actually starts then");
-const qualityHeld = Cast.cpuQualityStep(64, 250, 1280, 16, 1920);
-assert(qualityHeld.w === 1280, "a slow paint keeps the 1280 view while the mesh steps down, got " + qualityHeld.w);
-assert(qualityHeld.cols === 12, "a 64ms paint reduces the mesh, got " + qualityHeld.cols);
+const qualityHeld = Cast.cpuQualityStep(64, 250, 1280, 16, 1920, 1);
+assert(qualityHeld.w === 1280 && qualityHeld.cols === 16, "one slow paint does not retile the mesh, got " + qualityHeld.cols);
+const qualityHeldLater = Cast.cpuQualityStep(64, 250, 1280, 16, 1920, 3);
+assert(qualityHeldLater.w === 1280, "a run of slow paints keeps the 1280 view, got " + qualityHeldLater.w);
+assert(qualityHeldLater.cols === 12, "three slow paints reduce the mesh, got " + qualityHeldLater.cols);
 const decodeBound = Cast.cpuQualityStep(12, 250, 1280, 16, 1920);
 assert(decodeBound.w === 1280 && decodeBound.cols === 16, "JPEG time in the gap does not shrink the picture, got " + decodeBound.w + " mesh " + decodeBound.cols);
 let climbed = { w: 960, cols: 8 };
@@ -3238,6 +3240,130 @@ for (let step = 0; step < 12; step++) {
   assert(added > 0 && added < 400, "one aim step stays inside a cell budget, draws " + added);
 }
 assert(aimDraws > 0, "continuous aim keeps producing frames");
+function checkerImage(w, h, phase, markX, markRgb) {
+  return {
+    width: w,
+    height: h,
+    at: function (x, y) {
+      if (x === markX) return markRgb;
+      const on = ((Math.floor(x / 8) + Math.floor(y / 8) + phase) & 1) === 0;
+      return on ? [240, 230, 40] : [30, 90, 220];
+    },
+  };
+}
+function rasterCalls(calls, w, h) {
+  const buf = new Uint8Array(w * h * 4);
+  for (let i = 0; i < buf.length; i += 4) {
+    buf[i] = 11;
+    buf[i + 1] = 13;
+    buf[i + 2] = 16;
+    buf[i + 3] = 255;
+  }
+  calls.forEach(function (args) {
+    const img = args[0];
+    if (!img || !img.at || args.length < 9) return;
+    const sx = args[1];
+    const sy = args[2];
+    const sw = args[3];
+    const sh = args[4];
+    const dx = args[5];
+    const dy = args[6];
+    const dw = args[7];
+    const dh = args[8];
+    const x0 = Math.max(0, Math.floor(dx));
+    const y0 = Math.max(0, Math.floor(dy));
+    const x1 = Math.min(w, Math.ceil(dx + dw));
+    const y1 = Math.min(h, Math.ceil(dy + dh));
+    for (let y = y0; y < y1; y++) {
+      const v = dh > 0 ? (y + 0.5 - dy) / dh : 0;
+      let iy = Math.floor(sy + v * sh);
+      if (iy < 0) iy = 0;
+      if (iy > img.height - 1) iy = img.height - 1;
+      for (let x = x0; x < x1; x++) {
+        const u = dw > 0 ? (x + 0.5 - dx) / dw : 0;
+        let ix = Math.floor(sx + u * sw);
+        if (ix < 0) ix = 0;
+        if (ix > img.width - 1) ix = img.width - 1;
+        const c = img.at(ix, iy);
+        const o = (y * w + x) * 4;
+        buf[o] = c[0];
+        buf[o + 1] = c[1];
+        buf[o + 2] = c[2];
+      }
+    }
+  });
+  return buf;
+}
+function backgroundPixels(buf, w, h) {
+  let n = 0;
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const o = (y * w + x) * 4;
+      if (buf[o] === 11 && buf[o + 1] === 13 && buf[o + 2] === 16) n += 1;
+    }
+  }
+  return n;
+}
+function paintPanorama(yaw, pitch, fov, cols, rows) {
+  const calls = [];
+  const ctx = {
+    save: function () {},
+    restore: function () {},
+    imageSmoothingEnabled: true,
+    globalAlpha: 1,
+    drawImage: function () { calls.push(Array.prototype.slice.call(arguments)); },
+  };
+  const spanW = 800;
+  const spanH = 400;
+  const top = checkerImage(440, 220, 0, 320, [255, 0, 0]);
+  const bottom = checkerImage(440, 220, 1, 320, [255, 0, 0]);
+  const right = checkerImage(440, 220, 0, 20, [0, 255, 80]);
+  const wrap = checkerImage(200, 220, 1, 10, [255, 0, 255]);
+  const pieces = [
+    { image: top, tile: { id: "top", srcX: 0, srcY: 0, srcW: 440, srcH: 220, texW: 440, texH: 220 } },
+    { image: bottom, tile: { id: "bottom", srcX: 0, srcY: 180, srcW: 440, srcH: 220, texW: 440, texH: 220 } },
+    { image: right, tile: { id: "right", srcX: 360, srcY: 0, srcW: 440, srcH: 400, texW: 440, texH: 220 } },
+    { image: wrap, tile: { id: "wrap", srcX: 700, srcY: 80, srcW: 200, srcH: 220, texW: 200, texH: 220 } },
+  ];
+  Cast.paintStripView(ctx, pieces, null, spanW, spanH, yaw, pitch, 0, fov, 0, 0, 320, 180, 1, cols, rows);
+  return { calls: calls, buf: rasterCalls(calls, 320, 180), top: top, right: right, wrap: wrap };
+}
+[[16, 9], [12, 7], [8, 5]].forEach(function (mesh) {
+  const frame = paintPanorama(10, 0, 70, mesh[0], mesh[1]);
+  const holes = backgroundPixels(frame.buf, 320, 180);
+  assert(holes === 0, "mesh " + mesh.join("x") + " leaves no background seam, holes " + holes);
+});
+const panoFront = paintPanorama(0, 0, 60, 16, 9);
+const redRows = [];
+for (let y = 8; y < 172; y++) {
+  const xs = [];
+  for (let x = 0; x < 320; x++) {
+    const o = (y * 320 + x) * 4;
+    if (panoFront.buf[o] > 240 && panoFront.buf[o + 1] < 20 && panoFront.buf[o + 2] < 20) xs.push(x);
+  }
+  if (xs.length) redRows.push(xs.reduce(function (a, b) { return a + b; }, 0) / xs.length);
+}
+assert(redRows.length > 100, "the labeled meridian is visible down the frame, rows " + redRows.length);
+let drift = 0;
+const meridianMid = redRows[Math.floor(redRows.length / 2)];
+redRows.forEach(function (x) { drift = Math.max(drift, Math.abs(x - meridianMid)); });
+assert(drift < 3, "a vertical source line stays vertical on screen, drift " + drift);
+const panoPitch = paintPanorama(15, 25, 70, 16, 9);
+assert(backgroundPixels(panoPitch.buf, 320, 180) === 0, "pitch does not open a seam");
+const panoSeam = paintPanorama(180, 0, 80, 16, 9);
+assert(backgroundPixels(panoSeam.buf, 320, 180) === 0, "yaw 180 does not open a seam");
+let sawWrap = false;
+panoSeam.calls.forEach(function (args) { if (args[0] === panoSeam.wrap) sawWrap = true; });
+assert(sawWrap, "yaw 180 samples the strip that crosses longitude 0");
+const panoPole = paintPanorama(0, 70, 80, 16, 9);
+assert(backgroundPixels(panoPole.buf, 320, 180) === 0, "a pitched-up view stays covered");
+let sawTop = false;
+let sawRight = false;
+panoFront.calls.forEach(function (args) {
+  if (args[0] === panoFront.top) sawTop = true;
+  if (args[0] === panoFront.right) sawRight = true;
+});
+assert(sawTop && sawRight, "one view samples both sides of the strip boundary");
 assert(flowDraws.slice(aimBefore).every(function (call) {
   return !call.args || call.args.length >= 9 || !call.canvas || !call.canvas._spsCpu;
 }), "aim frames sample a source window");
