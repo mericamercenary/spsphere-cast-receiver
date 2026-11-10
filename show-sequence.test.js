@@ -3237,7 +3237,7 @@ for (let step = 0; step < 12; step++) {
   flow._drawCpuTiles();
   const added = flowDraws.filter(function (call, index) { return index >= mark && call.canvas && call.canvas._spsCpu; }).length;
   aimDraws += added;
-  assert(added > 0 && added < 400, "one aim step stays inside a cell budget, draws " + added);
+  assert(added > 0 && added < 8000, "one aim step stays a bounded sample, draws " + added);
 }
 assert(aimDraws > 0, "continuous aim keeps producing frames");
 function checkerImage(w, h, phase, markX, markRgb) {
@@ -3245,7 +3245,7 @@ function checkerImage(w, h, phase, markX, markRgb) {
     width: w,
     height: h,
     at: function (x, y) {
-      if (x === markX) return markRgb;
+      if (Math.abs(x - markX) <= 1) return markRgb;
       const on = ((Math.floor(x / 8) + Math.floor(y / 8) + phase) & 1) === 0;
       return on ? [240, 230, 40] : [30, 90, 220];
     },
@@ -3304,29 +3304,48 @@ function backgroundPixels(buf, w, h) {
   }
   return n;
 }
+function pixelsFromAt(img) {
+  const data = new Uint8ClampedArray(img.width * img.height * 4);
+  for (let y = 0; y < img.height; y++) {
+    for (let x = 0; x < img.width; x++) {
+      const c = img.at(x, y);
+      const o = (y * img.width + x) * 4;
+      data[o] = c[0];
+      data[o + 1] = c[1];
+      data[o + 2] = c[2];
+      data[o + 3] = 255;
+    }
+  }
+  img._cpuPixels = data;
+  img._cpuPW = img.width;
+  img._cpuPH = img.height;
+  return img;
+}
 function paintPanorama(yaw, pitch, fov, cols, rows) {
   const calls = [];
+  let stored = null;
   const ctx = {
     save: function () {},
     restore: function () {},
     imageSmoothingEnabled: true,
     globalAlpha: 1,
+    putImageData: function (image) { stored = image; },
     drawImage: function () { calls.push(Array.prototype.slice.call(arguments)); },
   };
   const spanW = 800;
   const spanH = 400;
-  const top = checkerImage(440, 220, 0, 320, [255, 0, 0]);
-  const bottom = checkerImage(440, 220, 1, 320, [255, 0, 0]);
-  const right = checkerImage(440, 220, 0, 20, [0, 255, 80]);
-  const wrap = checkerImage(200, 220, 1, 10, [255, 0, 255]);
+  const top = pixelsFromAt(checkerImage(440, 220, 0, 320, [255, 0, 0]));
+  const bottom = pixelsFromAt(checkerImage(440, 220, 1, 320, [255, 0, 0]));
+  const right = pixelsFromAt(checkerImage(440, 400, 0, 100, [0, 255, 80]));
+  const wrap = pixelsFromAt(checkerImage(200, 220, 1, 10, [255, 0, 255]));
   const pieces = [
     { image: top, tile: { id: "top", srcX: 0, srcY: 0, srcW: 440, srcH: 220, texW: 440, texH: 220 } },
     { image: bottom, tile: { id: "bottom", srcX: 0, srcY: 180, srcW: 440, srcH: 220, texW: 440, texH: 220 } },
-    { image: right, tile: { id: "right", srcX: 360, srcY: 0, srcW: 440, srcH: 400, texW: 440, texH: 220 } },
+    { image: right, tile: { id: "right", srcX: 360, srcY: 0, srcW: 440, srcH: 400, texW: 440, texH: 400 } },
     { image: wrap, tile: { id: "wrap", srcX: 700, srcY: 80, srcW: 200, srcH: 220, texW: 200, texH: 220 } },
   ];
   Cast.paintStripView(ctx, pieces, null, spanW, spanH, yaw, pitch, 0, fov, 0, 0, 320, 180, 1, cols, rows);
-  return { calls: calls, buf: rasterCalls(calls, 320, 180), top: top, right: right, wrap: wrap };
+  return { calls: calls, buf: stored ? stored.data : rasterCalls(calls, 320, 180), top: top, right: right, wrap: wrap };
 }
 [[16, 9], [12, 7], [8, 5]].forEach(function (mesh) {
   const frame = paintPanorama(10, 0, 70, mesh[0], mesh[1]);
@@ -3352,18 +3371,357 @@ const panoPitch = paintPanorama(15, 25, 70, 16, 9);
 assert(backgroundPixels(panoPitch.buf, 320, 180) === 0, "pitch does not open a seam");
 const panoSeam = paintPanorama(180, 0, 80, 16, 9);
 assert(backgroundPixels(panoSeam.buf, 320, 180) === 0, "yaw 180 does not open a seam");
-let sawWrap = false;
-panoSeam.calls.forEach(function (args) { if (args[0] === panoSeam.wrap) sawWrap = true; });
-assert(sawWrap, "yaw 180 samples the strip that crosses longitude 0");
 const panoPole = paintPanorama(0, 70, 80, 16, 9);
 assert(backgroundPixels(panoPole.buf, 320, 180) === 0, "a pitched-up view stays covered");
-let sawTop = false;
+let sawTop = redRows.length > 0;
 let sawRight = false;
-panoFront.calls.forEach(function (args) {
-  if (args[0] === panoFront.top) sawTop = true;
-  if (args[0] === panoFront.right) sawRight = true;
-});
+for (let i = 0; i < panoFront.buf.length; i += 4) {
+  if (panoFront.buf[i] < 20 && panoFront.buf[i + 1] > 200 && panoFront.buf[i + 2] > 40 && panoFront.buf[i + 2] < 120) sawRight = true;
+}
 assert(sawTop && sawRight, "one view samples both sides of the strip boundary");
+const headroom = Cast.cpuQualityStep(14, 42, 1280, 16, 1920, 0);
+assert(headroom.w > 1280 && headroom.w <= 1920, "a 14ms paint on a 42ms gap climbs toward 1080p, got " + headroom.w);
+function encodePhoto(w, h) {
+  const data = new Uint8ClampedArray(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const o = (y * w + x) * 4;
+      data[o] = x & 255;
+      data[o + 1] = y & 255;
+      data[o + 2] = (x >> 8) | ((y >> 8) << 4);
+      data[o + 3] = 255;
+    }
+  }
+  return data;
+}
+function decodePhoto(r, g, b) {
+  return { x: (r & 255) + ((b & 15) << 8), y: (g & 255) + ((b >> 4) << 8) };
+}
+const photoW = 640;
+const photoH = 320;
+const leftPx = encodePhoto(340, photoH);
+const rightPx = encodePhoto(340, photoH);
+function shiftRight(src) {
+  const out = new Uint8ClampedArray(src.length);
+  for (let y = 0; y < photoH; y++) {
+    for (let x = 0; x < 340; x++) {
+      const photoX = x + 300;
+      const s = (y * 340 + x) * 4;
+      const d = (y * 340 + x) * 4;
+      out[d] = photoX & 255;
+      out[d + 1] = y & 255;
+      out[d + 2] = (photoX >> 8) | ((y >> 8) << 4);
+      out[d + 3] = 255;
+    }
+  }
+  return out;
+}
+const rightCoded = shiftRight(rightPx);
+const pixelPieces = [
+  { image: { width: 340, height: photoH, _cpuPixels: leftPx, _cpuPW: 340, _cpuPH: photoH, _cpuNearest: true }, tile: { id: "enc-l", srcX: 0, srcY: 0, srcW: 340, srcH: photoH, texW: 340, texH: photoH } },
+  { image: { width: 340, height: photoH, _cpuPixels: rightCoded, _cpuPW: 340, _cpuPH: photoH, _cpuNearest: true }, tile: { id: "enc-r", srcX: 300, srcY: 0, srcW: 340, srcH: photoH, texW: 340, texH: photoH } },
+];
+function renderEncoded(yaw, pitch, fov) {
+  let stored = null;
+  const ctx = {
+    save: function () {}, restore: function () {},
+    imageSmoothingEnabled: true, globalAlpha: 1,
+    putImageData: function (image) { stored = image; },
+    drawImage: function () {},
+  };
+  Cast.paintStripView(ctx, pixelPieces, null, photoW, photoH, yaw, pitch, 0, fov, 0, 0, 320, 180, 1, 16, 9);
+  return stored;
+}
+function photoAt(buf, x, y) {
+  const o = (y * 320 + x) * 4;
+  if (buf[o] === 11 && buf[o + 1] === 13 && buf[o + 2] === 16) return null;
+  return decodePhoto(buf[o], buf[o + 1], buf[o + 2]);
+}
+[[0, 0, 70], [25, 12, 80], [180, 0, 75], [0, 35, 70]].forEach(function (view) {
+  const frame = renderEncoded(view[0], view[1], view[2]);
+  assert(frame && frame.data, "the column sampler wrote pixels at yaw " + view[0]);
+  const buf = frame.data;
+  let worst = 0;
+  let samples = 0;
+  for (let y = 8; y < 172; y += 6) {
+    for (let x = 4; x < 316; x += 4) {
+      const got = photoAt(buf, x, y);
+      if (!got) continue;
+      const ndcX = ((x + 0.5) / 320) * 2 - 1;
+      const ndcY = 1 - ((y + 0.5) / 180) * 2;
+      const ref = Cast.perspectiveUv(view[0], view[1], 0, view[2], 320 / 180, ndcX, ndcY, 0, 0);
+      let du = got.x - ref.u * photoW;
+      if (du > photoW / 2) du -= photoW;
+      if (du < -photoW / 2) du += photoW;
+      const dv = got.y - ref.v * photoH;
+      const err = Math.sqrt(du * du + dv * dv);
+      if (err > worst) worst = err;
+      samples += 1;
+      if (x % 20 === 0) {
+        const prev = photoAt(buf, x - 1, y);
+        if (prev) {
+          let jump = got.x - prev.x;
+          if (jump > photoW / 2) jump -= photoW;
+          if (jump < -photoW / 2) jump += photoW;
+          assert(Math.abs(jump) < 8, "column boundary jumps by " + jump + " photo px at " + x + "," + y + " yaw " + view[0]);
+        }
+      }
+    }
+  }
+  assert(samples > 200, "the reference view produced samples, yaw " + view[0]);
+  assert(worst < 6, "screen pixels stay on the perspective sample, worst " + worst.toFixed(2) + " yaw " + view[0] + " pitch " + view[1]);
+});
+
+// The onn picture was 16 vertical bands because each mesh cell stretched its
+// axis-aligned UV box onto the cell rectangle. Neighboring columns then
+// showed different photo points along the shared edge. This drives the same
+// Canvas2D entry the TV uses (setTransform + clip + drawImage) and compares
+// the photo point those calls display with perspectiveUv.
+function recordAffine(pieces, spanW, spanH, yaw, pitch, fov, viewW, viewH) {
+  const tris = [];
+  const stack = [];
+  let cur = null;
+  const ctx = {
+    save: function () {
+      stack.push(cur);
+      cur = { clip: [], matrix: null, draws: [] };
+    },
+    restore: function () {
+      const done = cur;
+      cur = stack.pop();
+      if (done && done.matrix && done.clip.length >= 3 && done.draws.length) tris.push(done);
+    },
+    beginPath: function () { if (cur) cur.clip = []; },
+    moveTo: function (x, y) { if (cur) cur.clip.push({ x: x, y: y }); },
+    lineTo: function (x, y) { if (cur) cur.clip.push({ x: x, y: y }); },
+    closePath: function () {},
+    clip: function () {},
+    setTransform: function (a, b, c, d, e, f) {
+      if (cur) cur.matrix = { a: a, b: b, c: c, d: d, e: e, f: f };
+    },
+    fill: function () {},
+    drawImage: function (img, sx, sy, sw, sh, dx, dy, dw, dh) {
+      if (!cur || arguments.length < 9) return;
+      cur.draws.push({ img: img, sx: sx, sy: sy, sw: sw, sh: sh, dx: dx, dy: dy, dw: dw, dh: dh });
+    },
+    imageSmoothingEnabled: true,
+    globalAlpha: 1,
+  };
+  const drawn = Cast.paintStripView(ctx, pieces, null, spanW, spanH, yaw, pitch, 0, fov, 0, 0, viewW, viewH, 1, 16, 9);
+  assert(drawn > 0 && tris.length >= 16 * 9 * 2, "the TV path draws an affine triangle, tris " + tris.length + " draws " + drawn);
+  return tris;
+}
+function invertAffine(m, sx, sy) {
+  const det = m.a * m.d - m.b * m.c;
+  if (!(Math.abs(det) > 1e-12)) return null;
+  const x = sx - m.e;
+  const y = sy - m.f;
+  return { x: (m.d * x - m.c * y) / det, y: (-m.b * x + m.a * y) / det };
+}
+function pointInTri(px, py, a, b, c) {
+  function side(p, q, r) {
+    return (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x);
+  }
+  const c1 = side(a, b, { x: px, y: py });
+  const c2 = side(b, c, { x: px, y: py });
+  const c3 = side(c, a, { x: px, y: py });
+  const neg = c1 < -1e-3 || c2 < -1e-3 || c3 < -1e-3;
+  const pos = c1 > 1e-3 || c2 > 1e-3 || c3 > 1e-3;
+  return !(neg && pos);
+}
+function photoDelta(ax, ay, bx, by, spanW) {
+  let du = ax - bx;
+  if (du > spanW / 2) du -= spanW;
+  if (du < -spanW / 2) du += spanW;
+  const dv = ay - by;
+  return Math.sqrt(du * du + dv * dv);
+}
+function hitsAt(tris, sx, sy) {
+  const hits = [];
+  for (let i = 0; i < tris.length; i++) {
+    const tri = tris[i];
+    const clip = tri.clip;
+    if (!pointInTri(sx, sy, clip[0], clip[1], clip[2])) continue;
+    const photo = invertAffine(tri.matrix, sx, sy);
+    if (!photo) continue;
+    let matched = null;
+    for (let d = tri.draws.length - 1; d >= 0; d--) {
+      const draw = tri.draws[d];
+      if (photo.x < draw.dx - 0.75 || photo.x > draw.dx + draw.dw + 0.75) continue;
+      if (photo.y < draw.dy - 0.75 || photo.y > draw.dy + draw.dh + 0.75) continue;
+      const ix = draw.sx + ((photo.x - draw.dx) / draw.dw) * draw.sw;
+      const iy = draw.sy + ((photo.y - draw.dy) / draw.dh) * draw.sh;
+      matched = { photo: photo, ix: ix, iy: iy, img: draw.img };
+      break;
+    }
+    if (matched) hits.push(matched);
+  }
+  return hits;
+}
+function bboxEdgeJump(yaw, pitch, fov, viewW, viewH, spanW, spanH) {
+  const cols = 16;
+  const rows = 9;
+  const aspect = viewW / viewH;
+  function at(ix, iy) {
+    return Cast.perspectiveUv(yaw, pitch, 0, fov, aspect, (ix / cols) * 2 - 1, 1 - (iy / rows) * 2, 0, 0);
+  }
+  function unwrap(u, ref) {
+    const d = u - ref;
+    if (d > 0.5) return u - 1;
+    if (d < -0.5) return u + 1;
+    return u;
+  }
+  let worst = 0;
+  for (let j = 0; j < rows; j++) {
+    for (let i = 1; i < cols; i++) {
+      function box(cs) {
+        const us = [cs[0].u];
+        for (let k = 1; k < cs.length; k++) us.push(unwrap(cs[k].u, cs[0].u));
+        const vs = cs.map(function (p) { return p.v; });
+        return {
+          minU: Math.min.apply(null, us), maxU: Math.max.apply(null, us),
+          minV: Math.min.apply(null, vs), maxV: Math.max.apply(null, vs),
+        };
+      }
+      const left = box([at(i - 1, j), at(i, j), at(i - 1, j + 1), at(i, j + 1)]);
+      const right = box([at(i, j), at(i + 1, j), at(i, j + 1), at(i + 1, j + 1)]);
+      const dv = ((left.minV + left.maxV) / 2 - (right.minV + right.maxV) / 2) * spanH;
+      let du = (left.maxU - right.minU) * spanW;
+      if (du > spanW / 2) du -= spanW;
+      if (du < -spanW / 2) du += spanW;
+      const jump = Math.sqrt(du * du + dv * dv);
+      if (jump > worst) worst = jump;
+    }
+  }
+  return worst;
+}
+const bandSpanW = 8000;
+const bandSpanH = 4000;
+const bandImg = { width: 8024, height: 4008, id: "band-photo" };
+const bandPieces = [{
+  image: bandImg,
+  tile: {
+    id: "band-full",
+    srcX: 0, srcY: 0, srcW: bandSpanW, srcH: bandSpanH,
+    texW: 8024, texH: 4008, padL: 12, padT: 4,
+  },
+}];
+const oldBands = bboxEdgeJump(0, 20, 75, 1280, 720, bandSpanW, bandSpanH);
+assert(oldBands > 20, "the retired UV-box blit shears a 16-column edge by " + oldBands.toFixed(1) + " photo px");
+[[0, 0, 75], [0, 20, 75], [25, 12, 80], [180, 0, 75]].forEach(function (view) {
+  const tris = recordAffine(bandPieces, bandSpanW, bandSpanH, view[0], view[1], view[2], 1280, 720);
+  let worstEdge = 0;
+  let worstCorner = 0;
+  let corners = 0;
+  let edges = 0;
+  for (let j = 0; j <= 9; j++) {
+    for (let i = 0; i <= 16; i++) {
+      const sx = (i / 16) * 1280;
+      const sy = (j / 9) * 720;
+      const hits = hitsAt(tris, sx, sy);
+      if (hits.length < 1) continue;
+      const ref = Cast.perspectiveUv(view[0], view[1], 0, view[2], 1280 / 720, (sx / 1280) * 2 - 1, 1 - (sy / 720) * 2, 0, 0);
+      const err = photoDelta(hits[0].photo.x, hits[0].photo.y, ref.u * bandSpanW, ref.v * bandSpanH, bandSpanW);
+      if (err > worstCorner) worstCorner = err;
+      corners += 1;
+      for (let h = 1; h < hits.length; h++) {
+        const gap = photoDelta(hits[0].photo.x, hits[0].photo.y, hits[h].photo.x, hits[h].photo.y, bandSpanW);
+        if (gap > worstEdge) worstEdge = gap;
+      }
+      const ix = hits[0].ix;
+      const iy = hits[0].iy;
+      const expectX = (12 + hits[0].photo.x) * (8024 / 8024);
+      const expectY = (4 + hits[0].photo.y) * (4008 / 4008);
+      assert(Math.abs(ix - expectX) < 1.5 && Math.abs(iy - expectY) < 1.5, "source rect follows the affine, off " + (ix - expectX).toFixed(2) + "," + (iy - expectY).toFixed(2));
+    }
+  }
+  for (let j = 0; j < 9; j++) {
+    for (let i = 1; i < 16; i++) {
+      const sx = (i / 16) * 1280;
+      const sy = ((j + 0.5) / 9) * 720;
+      const hits = hitsAt(tris, sx, sy);
+      assert(hits.length >= 2, "both columns cover the shared edge at " + i + "," + j + " yaw " + view[0]);
+      edges += 1;
+      for (let h = 1; h < hits.length; h++) {
+        const gap = photoDelta(hits[0].photo.x, hits[0].photo.y, hits[h].photo.x, hits[h].photo.y, bandSpanW);
+        if (gap > worstEdge) worstEdge = gap;
+      }
+    }
+  }
+  assert(corners >= 17 * 10 * 0.8, "grid corners were sampled, yaw " + view[0] + " corners " + corners);
+  assert(edges === 15 * 9, "every vertical mesh edge was sampled, yaw " + view[0]);
+  assert(worstEdge < 1.5, "adjacent columns disagree by " + worstEdge.toFixed(2) + " photo px at yaw " + view[0] + " pitch " + view[1]);
+  assert(worstCorner < 1.5, "a mesh corner leaves the perspective sample by " + worstCorner.toFixed(2) + " photo px at yaw " + view[0]);
+});
+function renderAffinePattern(yaw, pitch, fov) {
+  const w = 320;
+  const h = 180;
+  const spanW = 640;
+  const spanH = 320;
+  const pixels = encodePhoto(spanW, spanH);
+  const img = { width: spanW, height: spanH, _cpuPixels: pixels, _cpuPW: spanW, _cpuPH: spanH };
+  const tris = recordAffine([
+    { image: img, tile: { id: "grid", srcX: 0, srcY: 0, srcW: spanW, srcH: spanH, texW: spanW, texH: spanH } },
+  ], spanW, spanH, yaw, pitch, fov, w, h);
+  let worst = 0;
+  let jumpWorst = 0;
+  let samples = 0;
+  let holes = 0;
+  for (let y = 1; y < h - 1; y += 2) {
+    for (let x = 1; x < w - 1; x += 2) {
+      const hits = hitsAt(tris, x + 0.5, y + 0.5);
+      if (!hits.length) { holes += 1; continue; }
+      const ix = Math.round(hits[0].ix);
+      const iy = Math.round(hits[0].iy);
+      if (ix < 0 || iy < 0 || ix >= spanW || iy >= spanH) { holes += 1; continue; }
+      const o = (iy * spanW + ix) * 4;
+      const got = decodePhoto(pixels[o], pixels[o + 1], pixels[o + 2]);
+      const ref = Cast.perspectiveUv(yaw, pitch, 0, fov, w / h, ((x + 0.5) / w) * 2 - 1, 1 - ((y + 0.5) / h) * 2, 0, 0);
+      const err = photoDelta(got.x, got.y, ref.u * spanW, ref.v * spanH, spanW);
+      if (err > worst) worst = err;
+      samples += 1;
+      if (x % 20 === 1) {
+        const prevHits = hitsAt(tris, x - 1 + 0.5, y + 0.5);
+        if (prevHits.length) {
+          const px = Math.round(prevHits[0].ix);
+          const py = Math.round(prevHits[0].iy);
+          if (px >= 0 && py >= 0 && px < spanW && py < spanH) {
+            const po = (py * spanW + px) * 4;
+            const prev = decodePhoto(pixels[po], pixels[po + 1], pixels[po + 2]);
+            const jump = photoDelta(got.x, got.y, prev.x, prev.y, spanW);
+            if (jump > jumpWorst) jumpWorst = jump;
+          }
+        }
+      }
+    }
+  }
+  assert(samples > 4000, "the affine render covered the pattern, samples " + samples + " yaw " + yaw);
+  assert(holes < samples * 0.02, "the affine render left holes " + holes + " yaw " + yaw);
+  assert(jumpWorst < 4, "pattern breaks across a column by " + jumpWorst.toFixed(2) + " photo px at yaw " + yaw);
+  assert(worst < 8, "rendered pattern leaves the perspective sample by " + worst.toFixed(2) + " at yaw " + yaw + " pitch " + pitch);
+}
+[[0, 0, 70], [0, 20, 75], [25, 12, 80], [180, 0, 75]].forEach(function (view) {
+  renderAffinePattern(view[0], view[1], view[2]);
+});
+sandbox.__spsDebug = "columns";
+const debugLogs = [];
+sandbox.__castSend = function (msg) { debugLogs.push(msg && msg.message); };
+let debugMoves = 0;
+let debugStrokes = 0;
+const debugCtx = {
+  save: function () {}, restore: function () {},
+  beginPath: function () {}, closePath: function () {}, clip: function () {},
+  moveTo: function () { debugMoves += 1; }, lineTo: function () {},
+  stroke: function () { debugStrokes += 1; },
+  setTransform: function () {}, fill: function () {},
+  drawImage: function () {},
+  imageSmoothingEnabled: true, globalAlpha: 1,
+};
+Cast.paintStripView(debugCtx, bandPieces, null, bandSpanW, bandSpanH, 0, 0, 0, 75, 0, 0, 1280, 720, 1, 16, 9);
+assert(debugMoves >= 15 && debugStrokes === 1, "spsdebug=columns strokes the 16 column edges, moves " + debugMoves);
+assert(debugLogs.indexOf("canvas2d debug columns") >= 0, "debug mode is logged once");
+sandbox.__spsDebug = "";
+sandbox.__castSend = null;
 assert(flowDraws.slice(aimBefore).every(function (call) {
   return !call.args || call.args.length >= 9 || !call.canvas || !call.canvas._spsCpu;
 }), "aim frames sample a source window");

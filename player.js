@@ -19,7 +19,7 @@
 (function (root) {
   // Baked into player.js and the script URL. A Cast WebView that cached
   // "player.js" will not reuse that file for "player.js?v=<this>".
-  var RECEIVER_BUILD = "20261109.3";
+  var RECEIVER_BUILD = "20261110.1";
   var ROTATIONS = 2;
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
@@ -4918,11 +4918,11 @@
     if (haveOld) this._noteCpuResidents(oldList);
     var cols = this._cpuMeshCols || 16;
     var rows = this._cpuMeshRows || 9;
-    var maxView = cpuRenderSize(w, h, 0, 0);
-    var qual = cpuQualityStep(this._cpuDrawMs || 0, this._cpuGapMs || 0, this._cpuViewW || 0, cols, maxView.w, this._cpuSlow || 0);
+    var panel = cpuPanelCap(w, h);
+    var qual = cpuQualityStep(this._cpuDrawMs || 0, this._cpuGapMs || 0, this._cpuViewW || 0, cols, panel.w, this._cpuSlow || 0);
     cols = qual.cols;
     rows = qual.rows;
-    var fit = cpuRenderSize(w, h, 0, qual.w);
+    var fit = cpuRenderSize(panel.w, panel.h, 0, qual.w);
     var rw = fit.w;
     var rh = fit.h;
     this._cpuViewW = rw;
@@ -4933,7 +4933,8 @@
       if (canvas.width !== rw) canvas.width = rw;
       if (canvas.height !== rh) canvas.height = rh;
     }
-    var sizeLine = "canvas2d render " + rw + "x" + rh + " mesh " + cols + "x" + rows + " unique " + (this._cpuDetail || 0);
+    var debugMode = spsDebugMode();
+    var sizeLine = "canvas2d render " + rw + "x" + rh + " mesh " + cols + "x" + rows + " unique " + (this._cpuDetail || 0) + (debugMode ? " debug " + debugMode : "");
     if (sizeLine !== this._cpuSizeLog && (haveNew || haveOld)) {
       this._cpuSizeLog = sizeLine;
       this._reportTv(withBuild(sizeLine));
@@ -5491,6 +5492,38 @@
     return { w: Math.max(2, Math.round(aw)), h: Math.max(2, Math.round(ah)) };
   }
 
+  // Cast's layout canvas is often 1280 CSS pixels on a 4K panel. The paint
+  // has room for a 1080p backing store, which CSS then scales to the panel.
+  function cpuPanelCap(clientW, clientH) {
+    var w = clientW > 2 ? clientW : 1280;
+    var h = clientH > 2 ? clientH : 720;
+    try {
+      if (root.screen && root.screen.width > w) w = root.screen.width;
+      if (root.screen && root.screen.height > h) h = root.screen.height;
+    } catch (error) {}
+    if (w >= 960 && h >= 540 && w < 1920) {
+      w = 1920;
+      h = 1080;
+    }
+    if (w > 1920) w = 1920;
+    if (h > 1080) h = 1080;
+    return { w: w, h: h };
+  }
+
+  function spsDebugMode() {
+    var flag = "";
+    try {
+      if (root.__spsDebug) flag = String(root.__spsDebug);
+      else if (root.location) {
+        var q = String(root.location.search || "") + String(root.location.hash || "");
+        var match = /(?:^|[?&#])spsdebug=([a-z]+)/i.exec(q);
+        if (match) flag = match[1].toLowerCase();
+      }
+    } catch (error) {}
+    if (flag === "mesh" || flag === "strips" || flag === "columns") return flag;
+    return "";
+  }
+
   function cpuRenderSize(clientW, clientH, frameMs, prevW) {
     var cw = clientW > 2 ? clientW : 1280;
     var ch = clientH > 2 ? clientH : 720;
@@ -5531,8 +5564,8 @@
     // every seam.
     if (drawMs > 55 && cols > 8 && slowStreak >= 3) cols -= 4;
     else if (drawMs > 80 && cols <= 8 && w > 960 && slowStreak >= 3) w = Math.max(960, Math.round(w * 0.8));
-    else if (drawMs > 0 && drawMs < 28 && gapMs > 0 && gapMs < 50) {
-      if (w < cap) w = Math.min(cap, Math.round(w * 1.15));
+    else if (drawMs > 0 && drawMs < 20 && gapMs > 0 && gapMs < 55) {
+      if (w < cap) w = Math.min(cap, Math.round(w * 1.2));
       else if (cols < 16) cols += 4;
     }
     if (w > cap) w = cap;
@@ -5690,7 +5723,37 @@
       if (uimg && utile) indexed.push(indexStrip(uimg, utile, spanW, spanH));
     }
     if (!indexed.length) return 0;
+    var readable = true;
+    for (var p = 0; p < indexed.length; p++) {
+      indexed[p].pixels = stripPixels(indexed[p].img);
+      if (!indexed[p].pixels) readable = false;
+    }
+    if (ctx.setTransform && ctx.clip && ctx.beginPath) {
+      return paintStripAffine(ctx, indexed, spanW, spanH, yaw, pitch, roll, fov, posePitch, poseRoll, viewW, viewH, alpha, cols, rows);
+    }
+    if (readable && ctx.putImageData) {
+      return paintStripPixels(ctx, indexed, spanW, spanH, yaw, pitch, roll, fov, posePitch, poseRoll, viewW, viewH, alpha);
+    }
+    return paintStripColumns(ctx, indexed, spanW, spanH, yaw, pitch, roll, fov, posePitch, poseRoll, viewW, viewH, alpha);
+  }
+
+  function photoAffine(q0, q1, q2, s0, s1, s2) {
+    var det = q0.x * (q1.y - q2.y) + q1.x * (q2.y - q0.y) + q2.x * (q0.y - q1.y);
+    if (Math.abs(det) < 1e-8) return null;
+    var a = (s0.x * (q1.y - q2.y) + s1.x * (q2.y - q0.y) + s2.x * (q0.y - q1.y)) / det;
+    var c = (s0.x * (q2.x - q1.x) + s1.x * (q0.x - q2.x) + s2.x * (q1.x - q0.x)) / det;
+    var e = s0.x - a * q0.x - c * q0.y;
+    var b = (s0.y * (q1.y - q2.y) + s1.y * (q2.y - q0.y) + s2.y * (q0.y - q1.y)) / det;
+    var d = (s0.y * (q2.x - q1.x) + s1.y * (q0.x - q2.x) + s2.y * (q1.x - q0.x)) / det;
+    var f = s0.y - b * q0.x - d * q0.y;
+    return { a: a, b: b, c: c, d: d, e: e, f: f };
+  }
+
+  function paintStripAffine(ctx, indexed, spanW, spanH, yaw, pitch, roll, fov, posePitch, poseRoll, viewW, viewH, alpha, cols, rows) {
+    var debug = spsDebugMode();
     var aspect = viewW / viewH;
+    cols = cols > 4 ? cols : 16;
+    rows = rows > 4 ? rows : 9;
     var grid = [];
     for (var gy = 0; gy <= rows; gy++) {
       var row = [];
@@ -5714,37 +5777,521 @@
         var b = grid[y][x + 1];
         var c = grid[y + 1][x];
         var d = grid[y + 1][x + 1];
-        var ub = unwrapU(b.u, a.u);
-        var uc = unwrapU(c.u, a.u);
-        var ud = unwrapU(d.u, a.u);
-        var minU = Math.min(a.u, ub, uc, ud);
-        var maxU = Math.max(a.u, ub, uc, ud);
-        var minV = Math.min(a.v, b.v, c.v, d.v);
-        var maxV = Math.max(a.v, b.v, c.v, d.v);
-        var x0 = a.x;
-        var x1 = b.x;
-        var y0 = a.y;
-        var y1 = c.y;
-        var box = cellBox(x0, y0, x1, y1, viewW, viewH, x === cols - 1, y === rows - 1);
-        if (minU < 0 || maxU > 1) {
-          var cut = minU < 0 ? 0 : 1;
-          var spanU = maxU - minU;
-          var leftU = cut - minU;
-          var frac = spanU > 0 ? leftU / spanU : 0.5;
-          if (frac < 0) frac = 0;
-          if (frac > 1) frac = 1;
-          var mid = Math.round(box.x + box.w * frac);
-          if (mid < box.x + 1) mid = box.x + 1;
-          if (mid > box.x + box.w - 1) mid = box.x + box.w - 1;
-          var uLo0 = minU < 0 ? minU + 1 : minU;
-          var uLo1 = minU < 0 ? 1 : cut;
-          var uHi0 = minU < 0 ? 0 : cut;
-          var uHi1 = maxU > 1 ? maxU - 1 : maxU;
-          if (uLo1 > uLo0) drawn += paintIndexed(ctx, indexed, spanW, spanH, uLo0, minV, uLo1, maxV, box.x, box.y, mid - box.x + 1, box.h);
-          if (uHi1 > uHi0) drawn += paintIndexed(ctx, indexed, spanW, spanH, uHi0, minV, uHi1, maxV, mid, box.y, box.x + box.w - mid, box.h);
-        } else {
-          drawn += paintIndexed(ctx, indexed, spanW, spanH, minU, minV, maxU, maxV, box.x, box.y, box.w, box.h);
+        drawn += drawPhotoTri(ctx, indexed, spanW, spanH, a, b, c, debug);
+        drawn += drawPhotoTri(ctx, indexed, spanW, spanH, b, d, c, debug);
+      }
+    }
+    if ((debug === "mesh" || debug === "columns") && ctx.moveTo) paintDebugGrid(ctx, viewW, viewH, debug, cols, rows);
+    if (debug && !paintStripAffine.logged) {
+      paintStripAffine.logged = true;
+      try { if (root.__castSend) root.__castSend({ type: "log", message: "canvas2d debug " + debug }); } catch (error) {}
+    }
+    if (ctx.restore) ctx.restore();
+    return drawn;
+  }
+
+  function growTri(p0, p1, p2) {
+    var cx = (p0.x + p1.x + p2.x) / 3;
+    var cy = (p0.y + p1.y + p2.y) / 3;
+    function push(p) {
+      var dx = p.x - cx;
+      var dy = p.y - cy;
+      var len = Math.sqrt(dx * dx + dy * dy) || 1;
+      return { x: p.x + (dx / len) * 0.75, y: p.y + (dy / len) * 0.75 };
+    }
+    return [push(p0), push(p1), push(p2)];
+  }
+
+  // The 16 bands were axis-aligned UV boxes: each mesh cell stretched
+  // minU..maxU and minV..maxV across its rectangle, so the shared edge
+  // displayed a different photo point on each side. An affine on the true
+  // corner samples is continuous, because both triangles of that edge use
+  // the same two endpoints. The source rect is the photo window of that
+  // same affine, including padL/padT, with no extra bleed.
+  function drawPhotoTri(ctx, indexed, spanW, spanH, p0, p1, p2, debug) {
+    var parts = splitTriSeam(p0.u, p0.v, p1.u, p1.v, p2.u, p2.v, p0.x, p0.y, p1.x, p1.y, p2.x, p2.y);
+    var drawn = 0;
+    for (var part = 0; part < parts.length; part++) {
+      var tri = parts[part];
+      drawn += drawPhotoTriPart(ctx, indexed, spanW, spanH, tri[0], tri[1], tri[2], debug);
+    }
+    return drawn;
+  }
+
+  function drawPhotoTriPart(ctx, indexed, spanW, spanH, p0, p1, p2, debug) {
+    var q0 = { x: p0.u * spanW, y: p0.v * spanH };
+    var q1 = { x: p1.u * spanW, y: p1.v * spanH };
+    var q2 = { x: p2.u * spanW, y: p2.v * spanH };
+    var m = photoAffine(q0, q1, q2, p0, p1, p2);
+    if (!m || !ctx.setTransform) return 0;
+    var grown = growTri(p0, p1, p2);
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(grown[0].x, grown[0].y);
+    ctx.lineTo(grown[1].x, grown[1].y);
+    ctx.lineTo(grown[2].x, grown[2].y);
+    ctx.closePath();
+    ctx.clip();
+    ctx.setTransform(m.a, m.b, m.c, m.d, m.e, m.f);
+    var minX = Math.min(q0.x, q1.x, q2.x);
+    var maxX = Math.max(q0.x, q1.x, q2.x);
+    var minY = Math.min(q0.y, q1.y, q2.y);
+    var maxY = Math.max(q0.y, q1.y, q2.y);
+    var drawn = 0;
+    var tintIndex = -1;
+    function emit(item, seg) {
+      var ox0 = Math.max(minX, seg.photoX);
+      var ox1 = Math.min(maxX, seg.photoX + seg.photoW);
+      var oy0 = Math.max(minY, item.y0);
+      var oy1 = Math.min(maxY, item.y1);
+      if (!(ox1 > ox0) || !(oy1 > oy0)) return 0;
+      var scaleX = item.scaleX || 1;
+      var scaleY = item.scaleY || 1;
+      var local = seg.localX + (ox0 - seg.photoX);
+      var sx = ((item.tile.padL || 0) + local) * scaleX;
+      var sy = ((item.tile.padT || 0) + (oy0 - item.y0)) * scaleY;
+      var sw = (ox1 - ox0) * scaleX;
+      var sh = (oy1 - oy0) * scaleY;
+      var destX = ox0;
+      var destY = oy0;
+      var destW = ox1 - ox0;
+      var destH = oy1 - oy0;
+      var imgW = item.img.width || 0;
+      var imgH = item.img.height || 0;
+      if (imgW > 0 && sx < 0) {
+        destX += -sx / scaleX;
+        destW -= -sx / scaleX;
+        sw += sx;
+        sx = 0;
+      }
+      if (imgH > 0 && sy < 0) {
+        destY += -sy / scaleY;
+        destH -= -sy / scaleY;
+        sh += sy;
+        sy = 0;
+      }
+      if (imgW > 0 && sx + sw > imgW) {
+        var cutR = sx + sw - imgW;
+        sw -= cutR;
+        destW -= cutR / scaleX;
+      }
+      if (imgH > 0 && sy + sh > imgH) {
+        var cutB = sy + sh - imgH;
+        sh -= cutB;
+        destH -= cutB / scaleY;
+      }
+      if (!(sw > 0.5) || !(sh > 0.5) || !(destW > 0) || !(destH > 0)) return 0;
+      try {
+        ctx.drawImage(item.img, sx, sy, sw, sh, destX, destY, destW, destH);
+      } catch (error) {
+        return 0;
+      }
+      return 1;
+    }
+    for (var i = 0; i < indexed.length; i++) {
+      var item = indexed[i];
+      if (item.overview) continue;
+      if (maxY < item.y0 || minY > item.y1) continue;
+      for (var s = 0; s < item.segs.length; s++) {
+        var n = emit(item, item.segs[s]);
+        if (n && tintIndex < 0) tintIndex = i;
+        drawn += n;
+      }
+    }
+    if (!drawn) {
+      for (var j = 0; j < indexed.length; j++) {
+        var base = indexed[j];
+        if (!base.overview) continue;
+        if (maxY < base.y0 || minY > base.y1) continue;
+        for (var t = 0; t < base.segs.length; t++) drawn += emit(base, base.segs[t]);
+      }
+    }
+    if (debug === "strips" && tintIndex >= 0 && ctx.fill && ctx.setTransform) {
+      var tint = STRIP_TINTS[tintIndex % STRIP_TINTS.length];
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.globalAlpha = 0.45;
+      ctx.fillStyle = "rgb(" + tint[0] + "," + tint[1] + "," + tint[2] + ")";
+      ctx.fill();
+    }
+    ctx.restore();
+    return drawn;
+  }
+
+  function stripPixels(img) {
+    if (!img || !(img.width > 0) || !(img.height > 0)) return null;
+    if (img._cpuPixels && img._cpuPW === img.width && img._cpuPH === img.height) return img._cpuPixels;
+    if (typeof document === "undefined" || !document.createElement) return null;
+    try {
+      var canvas = document.createElement("canvas");
+      canvas.width = img.width;
+      canvas.height = img.height;
+      var ctx = canvas.getContext("2d");
+      if (!ctx || !ctx.getImageData || !ctx.drawImage) return null;
+      // A test double's drawImage is not the browser sampler. Reading it back
+      // would cache a blank buffer and skip the real strips.
+      if (String(ctx.drawImage).indexOf("[native code]") < 0) return null;
+      ctx.drawImage(img, 0, 0);
+      var data = ctx.getImageData(0, 0, img.width, img.height).data;
+      img._cpuPixels = data;
+      img._cpuPW = img.width;
+      img._cpuPH = img.height;
+      return data;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function sampleIndexed(indexed, spanW, spanH, u, v, debug) {
+    u = u - Math.floor(u);
+    if (v < 0) v = 0;
+    if (v > 1) v = 1;
+    var px = u * spanW;
+    var py = v * spanH;
+    var found = null;
+    for (var pass = 0; pass < 2; pass++) {
+      for (var i = 0; i < indexed.length; i++) {
+        var item = indexed[i];
+        if ((pass === 0) === item.overview) continue;
+        if (py < item.y0 || py > item.y1) continue;
+        var segs = item.segs;
+        for (var s = 0; s < segs.length; s++) {
+          var seg = segs[s];
+          if (px < seg.photoX || px > seg.photoX + seg.photoW) continue;
+          var local = seg.localX + (px - seg.photoX);
+          var sx = ((item.tile.padL || 0) + local) * item.scaleX;
+          var sy = ((item.tile.padT || 0) + (py - item.y0)) * item.scaleY;
+          var color = bilinear(item, sx, sy);
+          if (!color) continue;
+          found = { c: color, index: i, overview: item.overview };
+          if (!item.overview) return tintSample(found, debug);
         }
+      }
+      if (found) return tintSample(found, debug);
+    }
+    return null;
+  }
+
+  function nearestSample(item, sx, sy) {
+    var data = item.pixels;
+    var w = item.img.width;
+    var h = item.img.height;
+    if (!data || !(w > 0) || !(h > 0)) return null;
+    var nx = sx + 0.5 | 0;
+    var ny = sy + 0.5 | 0;
+    if (nx < 0) nx = 0;
+    if (ny < 0) ny = 0;
+    if (nx > w - 1) nx = w - 1;
+    if (ny > h - 1) ny = h - 1;
+    var ni = (ny * w + nx) * 4;
+    return [data[ni], data[ni + 1], data[ni + 2], 255];
+  }
+
+  function bilinear(item, sx, sy) {
+    var data = item.pixels;
+    var w = item.img.width;
+    var h = item.img.height;
+    if (!data || !(w > 1) || !(h > 1)) return null;
+    if (sx < 0) sx = 0;
+    if (sy < 0) sy = 0;
+    if (sx > w - 1) sx = w - 1;
+    if (sy > h - 1) sy = h - 1;
+    if (item.img && item.img._cpuNearest) {
+      var nx = Math.round(sx);
+      var ny = Math.round(sy);
+      if (nx < 0) nx = 0;
+      if (ny < 0) ny = 0;
+      if (nx > w - 1) nx = w - 1;
+      if (ny > h - 1) ny = h - 1;
+      var ni = (ny * w + nx) * 4;
+      return [data[ni], data[ni + 1], data[ni + 2], 255];
+    }
+    var x0 = Math.floor(sx);
+    var y0 = Math.floor(sy);
+    var x1 = x0 + 1 < w ? x0 + 1 : x0;
+    var y1 = y0 + 1 < h ? y0 + 1 : y0;
+    var tx = sx - x0;
+    var ty = sy - y0;
+    var i00 = (y0 * w + x0) * 4;
+    var i10 = (y0 * w + x1) * 4;
+    var i01 = (y1 * w + x0) * 4;
+    var i11 = (y1 * w + x1) * 4;
+    var out = [0, 0, 0, 255];
+    for (var c = 0; c < 3; c++) {
+      var a = data[i00 + c] + (data[i10 + c] - data[i00 + c]) * tx;
+      var b = data[i01 + c] + (data[i11 + c] - data[i01 + c]) * tx;
+      out[c] = a + (b - a) * ty;
+    }
+    return out;
+  }
+
+  var STRIP_TINTS = [
+    [255, 70, 70],
+    [70, 140, 255],
+    [70, 210, 90],
+    [240, 190, 40],
+    [190, 80, 230],
+  ];
+
+  function tintSample(found, debug) {
+    if (debug !== "strips" || !found) return found;
+    var tint = STRIP_TINTS[found.index % STRIP_TINTS.length];
+    found.c[0] = found.c[0] * 0.45 + tint[0] * 0.55;
+    found.c[1] = found.c[1] * 0.45 + tint[1] * 0.55;
+    found.c[2] = found.c[2] * 0.45 + tint[2] * 0.55;
+    return found;
+  }
+
+  function locateStrip(detail, overview, spanW, spanH, u, v) {
+    u = u - Math.floor(u);
+    if (v < 0) v = 0;
+    if (v > 1) v = 1;
+    var px = u * spanW;
+    var py = v * spanH;
+    var lists = [detail, overview];
+    for (var list = 0; list < 2; list++) {
+      var items = lists[list];
+      for (var i = 0; i < items.length; i++) {
+        var item = items[i];
+        if (py < item.y0 || py > item.y1) continue;
+        var segs = item.segs;
+        for (var s = 0; s < segs.length; s++) {
+          var seg = segs[s];
+          if (px < seg.photoX || px > seg.photoX + seg.photoW) continue;
+          return {
+            item: item,
+            seg: seg,
+            index: i,
+            sx: ((item.tile.padL || 0) + seg.localX + (px - seg.photoX)) * item.scaleX,
+            sy: ((item.tile.padT || 0) + (py - item.y0)) * item.scaleY,
+          };
+        }
+      }
+    }
+    return null;
+  }
+
+  function paintStripPixels(ctx, indexed, spanW, spanH, yaw, pitch, roll, fov, posePitch, poseRoll, viewW, viewH, alpha) {
+    var debug = spsDebugMode();
+    var aspect = viewW / viewH;
+    var bands = 8;
+    var focal = 1 / Math.tan(((fov > 1 ? fov : 75) * Math.PI / 180) / 2);
+    fillAimView(scratchYaw, scratchPitch, scratchRoll, scratchView, yaw || 0, pitch || 0, roll || 0);
+    var buf = new Uint8ClampedArray(viewW * viewH * 4);
+    var detail = [];
+    var overview = [];
+    for (var n = 0; n < indexed.length; n++) {
+      if (indexed[n].overview) overview.push(indexed[n]);
+      else detail.push(indexed[n]);
+    }
+    var tint = debug === "strips";
+    for (var x = 0; x < viewW; x++) {
+      var ndcX = ((x + 0.5) / viewW) * 2 - 1;
+      var markU = new Array(bands + 1);
+      var markV = new Array(bands + 1);
+      for (var b = 0; b <= bands; b++) {
+        var ndcY = 1 - (b / bands) * 2;
+        var uv = perspectiveUvFast(focal, aspect, ndcX, ndcY, posePitch, poseRoll);
+        markU[b] = uv.u;
+        markV[b] = uv.v;
+      }
+      for (var band = 0; band < bands; band++) {
+        var y0 = (band * viewH / bands) | 0;
+        var y1 = ((band + 1) * viewH / bands) | 0;
+        if (y1 <= y0) continue;
+        var u0 = markU[band];
+        var u1 = unwrapU(markU[band + 1], u0);
+        var v0 = markV[band];
+        var v1 = markV[band + 1];
+        var spanY = y1 - y0;
+        var hit0 = locateStrip(detail, overview, spanW, spanH, u0, v0);
+        var hit1 = locateStrip(detail, overview, spanW, spanH, u1, v1);
+        if (hit0 && hit1 && hit0.item === hit1.item && hit0.seg === hit1.seg) {
+          var dsx = (hit1.sx - hit0.sx) / spanY;
+          var dsy = (hit1.sy - hit0.sy) / spanY;
+          var sx = hit0.sx + dsx * 0.5;
+          var sy = hit0.sy + dsy * 0.5;
+          var data = hit0.item.pixels;
+          var iw = hit0.item.img.width;
+          var ih = hit0.item.img.height;
+          var dye = tint ? STRIP_TINTS[hit0.index % STRIP_TINTS.length] : null;
+          for (var y = y0; y < y1; y++) {
+            var ix = sx + 0.5 | 0;
+            var iy = sy + 0.5 | 0;
+            if (ix < 0) ix = 0;
+            if (iy < 0) iy = 0;
+            if (ix > iw - 1) ix = iw - 1;
+            if (iy > ih - 1) iy = ih - 1;
+            var si = (iy * iw + ix) << 2;
+            var o = (y * viewW + x) << 2;
+            var r = data[si];
+            var g = data[si + 1];
+            var bch = data[si + 2];
+            if (dye) {
+              r = r * 0.45 + dye[0] * 0.55;
+              g = g * 0.45 + dye[1] * 0.55;
+              bch = bch * 0.45 + dye[2] * 0.55;
+            }
+            buf[o] = r;
+            buf[o + 1] = g;
+            buf[o + 2] = bch;
+            buf[o + 3] = 255;
+            sx += dsx;
+            sy += dsy;
+          }
+        } else {
+          var du = (u1 - u0) / spanY;
+          var dv = (v1 - v0) / spanY;
+          var uu = u0 + du * 0.5;
+          var vv = v0 + dv * 0.5;
+          for (var y2 = y0; y2 < y1; y2++) {
+            var hit = locateStrip(detail, overview, spanW, spanH, uu, vv);
+            var o2 = (y2 * viewW + x) << 2;
+            if (!hit) {
+              buf[o2] = 11;
+              buf[o2 + 1] = 13;
+              buf[o2 + 2] = 16;
+              buf[o2 + 3] = 255;
+            } else {
+              var nix = hit.sx + 0.5 | 0;
+              var niy = hit.sy + 0.5 | 0;
+              var nw = hit.item.img.width;
+              var nh = hit.item.img.height;
+              if (nix < 0) nix = 0;
+              if (niy < 0) niy = 0;
+              if (nix > nw - 1) nix = nw - 1;
+              if (niy > nh - 1) niy = nh - 1;
+              var nsi = (niy * nw + nix) << 2;
+              var nd = hit.item.pixels;
+              var rr = nd[nsi];
+              var gg = nd[nsi + 1];
+              var bb = nd[nsi + 2];
+              if (tint) {
+                var dye2 = STRIP_TINTS[hit.index % STRIP_TINTS.length];
+                rr = rr * 0.45 + dye2[0] * 0.55;
+                gg = gg * 0.45 + dye2[1] * 0.55;
+                bb = bb * 0.45 + dye2[2] * 0.55;
+              }
+              buf[o2] = rr;
+              buf[o2 + 1] = gg;
+              buf[o2 + 2] = bb;
+              buf[o2 + 3] = 255;
+            }
+            uu += du;
+            vv += dv;
+          }
+        }
+      }
+    }
+    var image = null;
+    try {
+      if (typeof ImageData === "function") image = new ImageData(buf, viewW, viewH);
+    } catch (error) {
+      image = null;
+    }
+    if (!image) image = { data: buf, width: viewW, height: viewH };
+    paintStripPixels.last = image;
+    if (alpha > 0.999 && ctx.putImageData) {
+      try {
+        ctx.putImageData(image, 0, 0);
+      } catch (error) {
+        blitPixelBuffer(ctx, image, viewW, viewH, alpha);
+      }
+    } else {
+      blitPixelBuffer(ctx, image, viewW, viewH, alpha);
+    }
+    if ((debug === "mesh" || debug === "columns") && ctx.moveTo) {
+      paintDebugGrid(ctx, viewW, viewH, debug);
+    }
+    if (debug && !paintStripPixels.logged) {
+      paintStripPixels.logged = true;
+      try { if (root.__castSend) root.__castSend({ type: "log", message: "canvas2d debug " + debug }); } catch (error) {}
+    }
+    return viewW * bands;
+  }
+
+  function blitPixelBuffer(ctx, image, viewW, viewH, alpha) {
+    if (typeof document === "undefined" || !document.createElement) {
+      if (ctx.putImageData) ctx.putImageData(image, 0, 0);
+      return;
+    }
+    if (!cpuFrameScratch) {
+      cpuFrameScratch = document.createElement("canvas");
+      cpuFrameCtx = cpuFrameScratch.getContext("2d");
+    }
+    if (!cpuFrameCtx || !cpuFrameCtx.putImageData) {
+      if (ctx.putImageData) ctx.putImageData(image, 0, 0);
+      return;
+    }
+    if (cpuFrameScratch.width !== viewW) cpuFrameScratch.width = viewW;
+    if (cpuFrameScratch.height !== viewH) cpuFrameScratch.height = viewH;
+    cpuFrameCtx.putImageData(image, 0, 0);
+    if (ctx.save) ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.drawImage(cpuFrameScratch, 0, 0);
+    if (ctx.restore) ctx.restore();
+  }
+
+  var cpuFrameScratch = null;
+  var cpuFrameCtx = null;
+
+  function paintDebugGrid(ctx, viewW, viewH, mode, cols, rows) {
+    if (ctx.save) ctx.save();
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = mode === "columns" ? "rgba(255,40,40,0.95)" : "rgba(255,220,0,0.9)";
+    ctx.lineWidth = 1;
+    cols = cols > 1 ? cols : 16;
+    rows = rows > 1 ? rows : 9;
+    if (ctx.beginPath) ctx.beginPath();
+    for (var i = 1; i < cols; i++) {
+      var x = Math.round(i * viewW / cols) + 0.5;
+      if (ctx.moveTo) {
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, viewH);
+      }
+    }
+    if (mode === "mesh") {
+      for (var j = 1; j < rows; j++) {
+        var y = Math.round(j * viewH / rows) + 0.5;
+        if (ctx.moveTo) {
+          ctx.moveTo(0, y);
+          ctx.lineTo(viewW, y);
+        }
+      }
+    }
+    if (ctx.stroke) ctx.stroke();
+    if (ctx.restore) ctx.restore();
+  }
+
+  // Used only when the strip pixels cannot be read. Columns are a few pixels
+  // wide and each one is sampled at its own screen x, so a 16-wide bounding
+  // box is never stretched across the row.
+  function paintStripColumns(ctx, indexed, spanW, spanH, yaw, pitch, roll, fov, posePitch, poseRoll, viewW, viewH, alpha) {
+    var aspect = viewW / viewH;
+    var colW = viewW > 960 ? 4 : 2;
+    var bands = 8;
+    if (ctx.save) ctx.save();
+    ctx.globalAlpha = alpha;
+    if (ctx.imageSmoothingEnabled != null) ctx.imageSmoothingEnabled = true;
+    var drawn = 0;
+    for (var x = 0; x < viewW; x += colW) {
+      var dw = x + colW > viewW ? viewW - x : colW;
+      var ndcL = ((x + 0.5) / viewW) * 2 - 1;
+      var ndcR = ((x + dw - 0.5) / viewW) * 2 - 1;
+      for (var band = 0; band < bands; band++) {
+        var y0 = Math.round(band * viewH / bands);
+        var y1 = Math.round((band + 1) * viewH / bands);
+        var ndcT = 1 - ((y0 + 0.5) / viewH) * 2;
+        var ndcB = 1 - ((y1 - 0.5) / viewH) * 2;
+        var lt = perspectiveUv(yaw, pitch, roll, fov, aspect, ndcL, ndcT, posePitch, poseRoll);
+        var rt = perspectiveUv(yaw, pitch, roll, fov, aspect, ndcR, ndcT, posePitch, poseRoll);
+        var lb = perspectiveUv(yaw, pitch, roll, fov, aspect, ndcL, ndcB, posePitch, poseRoll);
+        var rb = perspectiveUv(yaw, pitch, roll, fov, aspect, ndcR, ndcB, posePitch, poseRoll);
+        var u0 = lt.u;
+        var u1 = unwrapU(rt.u, u0);
+        var v0 = (lt.v + rt.v) * 0.5;
+        var v1 = (lb.v + rb.v) * 0.5;
+        if (u1 < u0) { var swap = u0; u0 = u1; u1 = swap; }
+        drawn += paintIndexed(ctx, indexed, spanW, spanH, u0, Math.min(v0, v1), u1, Math.max(v0, v1), x, y0, dw, Math.max(1, y1 - y0));
       }
     }
     if (ctx.restore) ctx.restore();
@@ -5802,6 +6349,24 @@
     var dir = poseToCameraDir(world[0], world[1], world[2], posePitch || 0, poseRoll || 0);
     var len = Math.sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]) || 1;
     return equirectFromDir(dir[0] / len, dir[1] / len, dir[2] / len);
+  }
+
+  // Same projection as perspectiveUv, with the aim matrix built once per frame.
+  function perspectiveUvFast(focal, aspect, ndcX, ndcY, posePitch, poseRoll) {
+    var x = ndcX * aspect / focal;
+    var y = ndcY / focal;
+    var z = -1;
+    var len = Math.sqrt(x * x + y * y + z * z) || 1;
+    x /= len;
+    y /= len;
+    z /= len;
+    var V = scratchView;
+    var wx = V[0] * x + V[1] * y + V[2] * z;
+    var wy = V[4] * x + V[5] * y + V[6] * z;
+    var wz = V[8] * x + V[9] * y + V[10] * z;
+    var dir = poseToCameraDir(wx, wy, wz, posePitch || 0, poseRoll || 0);
+    var dlen = Math.sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]) || 1;
+    return equirectFromDir(dir[0] / dlen, dir[1] / dlen, dir[2] / dlen);
   }
 
   function unwrapU(u, ref) {
