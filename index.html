@@ -77,9 +77,10 @@
   <div id="mark" hidden><img class="logo" src="logo.png" alt="" /></div>
   <div id="busy"></div>
   <video id="wakeVideo" muted loop playsinline autoplay width="2" height="2" style="position:fixed;left:-99px;top:-99px;width:2px;height:2px;opacity:0.01;pointer-events:none"></video>
-  <script src="player.js?v=20261111.12"></script>
+  <script src="player.js?v=20261111.13"></script>
   <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
   <script>
+    var PAGE_BUILD = "20261111.13";
     var NAMESPACE = "urn:x-cast:com.cameron.viewer360";
     var viewCanvas = document.getElementById("view");
     var player = SpsphereCast.create(viewCanvas);
@@ -308,6 +309,8 @@
     var jpegLastRaf = 0;
     var jpegGaps = [];
     var jpegLastShownId = null;
+    var jpegShownArrival = null;
+    var jpegIdLogs = 0;
     var jpegUniqueFps = 0;
     var jpegPresentReady = false;
     var jpegFastSince = 0;
@@ -827,7 +830,7 @@
       var closed = step.close || [];
       for (var i = 0; i < closed.length; i++) closeJpegBitmap(closed[i]);
       if (step.show) {
-        var shownId = pose && isFinite(pose.frameId) ? pose.frameId : id;
+        var shownId = id;
         if (jpegLastShownId != null) jpegGaps.push(Math.abs(shownId - jpegLastShownId));
         jpegLastShownId = shownId;
         jpegUnique += 1;
@@ -844,7 +847,23 @@
       delete jpegJobs[id];
       if (meta && bitmap) noteJpegSample(meta.path, Date.now() - meta.started, bitmap.width, bitmap.height);
       if (bitmap) jpegDecoded += 1;
-      var step = SpsphereCast.jpegPipeFinish(jpegPipe, id, bitmap || null);
+      var phoneId = meta && meta.pose ? meta.pose.frameId : null;
+      var step = SpsphereCast.jpegPipeFinish(jpegPipe, id, bitmap || null, phoneId);
+      // player.js 20261111.11 hid a finished frame whenever another was
+      // waiting. The arrival number is the TV's own counter, so a finished
+      // bitmap is shown even if that older function said to drop it.
+      var choice = true;
+      if (SpsphereCast.jpegPresentChoice) choice = SpsphereCast.jpegPresentChoice(id, jpegShownArrival, phoneId);
+      else if (jpegShownArrival != null && id < jpegShownArrival) choice = false;
+      if (bitmap && choice && !step.show) {
+        var kept = [];
+        var retired = step.close || [];
+        for (var c = 0; c < retired.length; c++) {
+          if (retired[c] !== bitmap) kept.push(retired[c]);
+        }
+        step = { show: bitmap, close: kept, next: step.next };
+      }
+      if (bitmap && step.show) jpegShownArrival = id;
       if (bitmap && !step.show) jpegDiscarded += 1;
       applyJpegStep(step, meta && meta.pose, id);
     }
@@ -1011,6 +1030,11 @@
       jpegReceived += 1;
       var step = SpsphereCast.jpegPipePush(jpegPipe, { bytes: parsed.jpeg, pose: parsed.pose });
       jpegDropped += step.dropped;
+      if (jpegIdLogs < 5) {
+        jpegIdLogs += 1;
+        var phoneId = parsed.pose && isFinite(parsed.pose.frameId) ? parsed.pose.frameId : "none";
+        sendLog("stream frame id phone=" + phoneId + " arrival=" + step.id);
+      }
       for (var i = 0; i < step.start.length; i++) startJpegJob(step.start[i]);
     }
 
@@ -1601,7 +1625,10 @@
     } catch (e) {}
     context.start(options);
     keepReceiverAwake();
-    sendLog("receiver boot " + (SpsphereCast.RECEIVER_BUILD || ""));
+    sendLog("receiver boot " + PAGE_BUILD + " player=" + (SpsphereCast.RECEIVER_BUILD || ""));
+    if (!SpsphereCast.RECEIVER_BUILD || SpsphereCast.RECEIVER_BUILD !== PAGE_BUILD) {
+      sendLog("receiver build mismatch page=" + PAGE_BUILD + " player=" + (SpsphereCast.RECEIVER_BUILD || ""));
+    }
     maybeProbeStream();
     window.__idle = new SpsphereCast.IdleGuard(function () { return Date.now(); });
     var lastAppStateAt = Date.now();

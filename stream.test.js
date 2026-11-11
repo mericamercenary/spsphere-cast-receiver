@@ -14,10 +14,10 @@ function assert(cond, message) {
   if (!cond) throw new Error(message || "assertion failed");
 }
 
-assert(Cast.RECEIVER_BUILD === "20261111.12", "receiver build is 20261111.12, got " + Cast.RECEIVER_BUILD);
+assert(Cast.RECEIVER_BUILD === "20261111.13", "receiver build is 20261111.13, got " + Cast.RECEIVER_BUILD);
 assert(Cast.TILE_FADE_MS === 2400, "photo fade stays 2400ms");
 assert(Cast.FOCUS_HANDOFF === 0.35, "focus handoff stays 0.35");
-assert(page.indexOf("player.js?v=20261111.12") >= 0, "index.html cache-busts 20261111.12");
+assert(page.indexOf("player.js?v=20261111.13") >= 0, "index.html cache-busts 20261111.13");
 assert(page.indexOf("function _drawGl") < 0, "the page does not rewrite the WebGL draw");
 assert(code.indexOf("TILE_FADE_MS = 2400") >= 0, "player keeps the 2400ms fade");
 assert(code.indexOf("FOCUS_HANDOFF = 0.35") >= 0, "player keeps the 0.35 handoff");
@@ -229,7 +229,7 @@ function shownPerSecond(arrivalMs, decodeMs, durationMs) {
       nextIn += arrivalMs;
     }
     if (busy && t >= busy.until) {
-      const step = Cast.jpegPipeFinish(pipe, busy.id, { id: busy.id });
+      const step = Cast.jpegPipeFinish(pipe, busy.id, { id: busy.id }, 0);
       if (step.show) shown += 1;
       busy = null;
       if (step.next) busy = { id: step.next.id, until: t + decodeMs };
@@ -239,7 +239,12 @@ function shownPerSecond(arrivalMs, decodeMs, durationMs) {
   return shown / (durationMs / 1000);
 }
 const paced = shownPerSecond(33, 56, 3000);
-assert(paced >= 15, "33ms arrivals and a 56ms decode still show at least 15 unique frames per second, got " + paced.toFixed(1));
+assert(paced >= 15, "33ms arrivals, a 56ms decode, and phone frame id 0 still show at least 15 unique frames per second, got " + paced.toFixed(1));
+assert(Cast.jpegPresentChoice(2, 1, 0) === true, "a newer arrival is shown when the phone frame id is 0");
+assert(Cast.jpegPresentChoice(2, 2, 0) === true, "an equal arrival is shown when the phone frame id is 0");
+assert(Cast.jpegPresentChoice(1, 2, 0) === false, "an older arrival stays behind the frame on screen");
+assert(page.indexOf("stream frame id phone=") >= 0, "the first five frames log the SPF1 id and the TV arrival");
+assert(page.indexOf("receiver build mismatch") >= 0 && page.indexOf('PAGE_BUILD = "20261111.13"') >= 0, "the page names its build and reports a stale player.js");
 const redraws = Cast.streamCapDecision({ decodeP50: 56, frameW: 1280, frameH: 720, uniqueFps: 30, fastMs: 0 }, null);
 assert(redraws.send === false, "decode p50=56 with unique fps 30 does not send a cap");
 const slowCap = Cast.streamCapDecision({ decodeP50: 56, frameW: 1280, frameH: 720, uniqueFps: 17, fastMs: 0 }, null);
@@ -269,7 +274,7 @@ sandbox.location = { search: "?spsdebug=reproject", hash: "" };
 assert(Cast.spsReprojectDebug() === true, "spsdebug=reproject opts into aim shift");
 sandbox.location = { search: "", hash: "" };
 assert(Cast.spsReprojectDebug() === false, "aim shift is off by default");
-assert(probe.build === "20261111.12", "probe names the build");
+assert(probe.build === "20261111.13", "probe names the build");
 const jpegOnly = Cast.streamProbe(false, false);
 assert(jpegOnly.modes.length === 1 && jpegOnly.modes[0] === "jpeg-ws", "without MSE the probe is jpeg-ws only");
 assert(jpegOnly.log.indexOf("mse=0") >= 0, "the probe log records mse=0");
@@ -280,7 +285,7 @@ assert(chosen.ws === stream, "choice keeps a valid stream url");
 assert(chosen.choiceLog === "stream choice h264-mse", "choice log");
 assert(chosen.announceLog === "stream announce h264-mse", "announce log");
 assert(chosen.announce.type === "stream-announce" && chosen.announce.mode === "h264-mse", "announce message");
-assert(chosen.announce.build === "20261111.12", "announce names the build");
+assert(chosen.announce.build === "20261111.13", "announce names the build");
 assert(Cast.usableAvcCodec("avc1.42E01E") === "avc1.42E01E", "a baseline codec is usable");
 assert(Cast.usableAvcCodec("avc1.64001F") === "avc1.64001F", "a high-profile codec is usable");
 assert(Cast.usableAvcCodec("avc1.000001") === "", "an Annex-B start code is not a codec");

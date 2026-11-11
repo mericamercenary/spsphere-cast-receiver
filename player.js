@@ -19,7 +19,7 @@
 (function (root) {
   // Baked into player.js and the script URL. A Cast WebView that cached
   // "player.js" will not reuse that file for "player.js?v=<this>".
-  var RECEIVER_BUILD = "20261111.12";
+  var RECEIVER_BUILD = "20261111.13";
   var ROTATIONS = 2;
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
@@ -5581,21 +5581,30 @@
     var job = { id: id, bytes: frame && frame.bytes, pose: frame && frame.pose || null };
     if (pipe.inFlight < jpegPipeSlots(pipe)) {
       pipe.inFlight += 1;
-      return { start: [job], dropped: 0 };
+      return { start: [job], dropped: 0, id: id };
     }
     var dropped = pipe.pending ? 1 : 0;
     pipe.pending = job;
-    return { start: [], dropped: dropped };
+    return { start: [], dropped: dropped, id: id };
   }
 
-  // A finished bitmap is shown whenever it is newer than the one on
-  // screen. A frame that is only waiting is the one that can be dropped,
-  // and the single waiting slot already keeps the latest of those.
-  function jpegPipeFinish(pipe, id, bitmap) {
+  // Show using the TV's arrival number. The phone's SPF1 id (uint32 at
+  // offset 22) is ignored: a stuck 0 would hide every later frame.
+  function jpegPresentChoice(arrivalId, shownArrival, phoneFrameId) {
+    if (phoneFrameId === undefined) phoneFrameId = null;
+    if (shownArrival == null) return true;
+    if (arrivalId == null || arrivalId !== arrivalId) return true;
+    return arrivalId >= shownArrival;
+  }
+
+  // A finished bitmap is shown whenever its arrival is newer than the one
+  // on screen. A frame that is only waiting is the one that can be dropped.
+  function jpegPipeFinish(pipe, id, bitmap, phoneFrameId) {
     if (pipe.inFlight > 0) pipe.inFlight -= 1;
     var close = [];
     var show = null;
-    if (bitmap && id >= pipe.shown) {
+    var shownArrival = pipe.current ? pipe.shown : null;
+    if (bitmap && jpegPresentChoice(id, shownArrival, phoneFrameId)) {
       if (pipe.current && pipe.current !== bitmap) close.push(pipe.current);
       pipe.current = bitmap;
       pipe.shown = id;
@@ -10099,6 +10108,7 @@
     createJpegPipe: createJpegPipe,
     jpegPipePush: jpegPipePush,
     jpegPipeFinish: jpegPipeFinish,
+    jpegPresentChoice: jpegPresentChoice,
     jpegPathChoice: jpegPathChoice,
     streamCapDecision: streamCapDecision,
     spsJpegFlightDebug: spsJpegFlightDebug,
