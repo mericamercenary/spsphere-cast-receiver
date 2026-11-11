@@ -14,10 +14,10 @@ function assert(cond, message) {
   if (!cond) throw new Error(message || "assertion failed");
 }
 
-assert(Cast.RECEIVER_BUILD === "20261111.7", "receiver build is 20261111.7, got " + Cast.RECEIVER_BUILD);
+assert(Cast.RECEIVER_BUILD === "20261111.8", "receiver build is 20261111.8, got " + Cast.RECEIVER_BUILD);
 assert(Cast.TILE_FADE_MS === 2400, "photo fade stays 2400ms");
 assert(Cast.FOCUS_HANDOFF === 0.35, "focus handoff stays 0.35");
-assert(page.indexOf("player.js?v=20261111.7") >= 0, "index.html cache-busts 20261111.7");
+assert(page.indexOf("player.js?v=20261111.8") >= 0, "index.html cache-busts 20261111.8");
 assert(page.indexOf("function _drawGl") < 0, "the page does not rewrite the WebGL draw");
 assert(code.indexOf("TILE_FADE_MS = 2400") >= 0, "player keeps the 2400ms fade");
 assert(code.indexOf("FOCUS_HANDOFF = 0.35") >= 0, "player keeps the 0.35 handoff");
@@ -101,8 +101,46 @@ assert(Cast.mp4Hex(new Uint8Array([0x0a, 0xff]), 2) === "0aff", "sample hex is t
 assert(page.indexOf("isTypeSupported") >= 0, "the page logs isTypeSupported for the mime");
 assert(page.indexOf("createImageBitmap") >= 0 && page.indexOf("requestAnimationFrame") >= 0, "JPEG decode is off the onload path");
 assert(page.indexOf("frame.onload") < 0, "JPEG frames are not waited on via img.onload");
-assert(page.indexOf("dropped=") >= 0 && page.indexOf("p50=") >= 0, "JPEG stats log decode time, fps, and drops");
-assert(probe.build === "20261111.7", "probe names the build");
+assert(page.indexOf("stream present fps=") >= 0 && page.indexOf("jitter p95=") >= 0 && page.indexOf("reproject px p95=") >= 0, "presentation stats log fps, jitter, and reprojection");
+assert(page.indexOf("OffscreenCanvas") >= 0 && page.indexOf("new Worker") >= 0, "JPEG decode can leave the main thread");
+function spf1Frame(yaw, pitch, fov, overscan, id, timeMs) {
+  const buf = new ArrayBuffer(38);
+  const view = new DataView(buf);
+  const bytes = new Uint8Array(buf);
+  bytes[0] = 83; bytes[1] = 80; bytes[2] = 70; bytes[3] = 49;
+  view.setUint16(4, 34, true);
+  view.setFloat32(6, yaw, true);
+  view.setFloat32(10, pitch, true);
+  view.setFloat32(14, fov, true);
+  view.setFloat32(18, overscan, true);
+  view.setUint32(22, id, true);
+  view.setFloat64(26, timeMs, true);
+  bytes[34] = 0xff; bytes[35] = 0xd8; bytes[36] = 0xff; bytes[37] = 0xd9;
+  return bytes;
+}
+const bare = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
+const bareFrame = Cast.parseStreamFrame(bare);
+assert(bareFrame && bareFrame.pose === null && bareFrame.jpeg.length === 4, "a bare JPEG has no pose header");
+const wrapped = Cast.parseStreamFrame(spf1Frame(12.5, -3.25, 80, 0.12, 7, 1234.5));
+assert(wrapped && wrapped.pose && Math.abs(wrapped.pose.yaw - 12.5) < 0.001, "SPF1 yaw is a little-endian float");
+assert(Math.abs(wrapped.pose.pitch - -3.25) < 0.001 && Math.abs(wrapped.pose.fov - 80) < 0.001, "SPF1 pitch and fov survive");
+assert(Math.abs(wrapped.pose.overscan - 0.12) < 0.001 && wrapped.pose.frameId === 7, "SPF1 overscan and frame id survive");
+assert(wrapped.pose.timeMs === 1234.5 && wrapped.jpeg[0] === 0xff && wrapped.jpeg[1] === 0xd8, "SPF1 timestamp and JPEG follow the header");
+const plainShift = Cast.streamReproject(null, { yaw: 20, pitch: 5, fov: 70 }, 1280, 720);
+assert(plainShift.scale === 1 && plainShift.dx === 0 && plainShift.dy === 0, "a frame without a header is not moved");
+const smallShift = Cast.streamReproject(
+  { yaw: 0, pitch: 0, fov: 80, overscan: 0.15 },
+  { yaw: 2, pitch: 0, fov: 80 },
+  1000, 500
+);
+assert(smallShift.dx > 0 && smallShift.dx < 0.15 * 1000, "a small yaw change shifts inside the overscan, dx " + smallShift.dx);
+const clamped = Cast.streamReproject(
+  { yaw: 0, pitch: 0, fov: 80, overscan: 0.12 },
+  { yaw: 90, pitch: 40, fov: 80 },
+  1000, 500
+);
+assert(Math.abs(clamped.dx) <= 0.12 * 1000 + 0.01 && Math.abs(clamped.dy) <= 0.12 * 500 + 0.01, "a large aim change stays inside the overscan margin");
+assert(probe.build === "20261111.8", "probe names the build");
 const jpegOnly = Cast.streamProbe(false, false);
 assert(jpegOnly.modes.length === 1 && jpegOnly.modes[0] === "jpeg-ws", "without MSE the probe is jpeg-ws only");
 assert(jpegOnly.log.indexOf("mse=0") >= 0, "the probe log records mse=0");
@@ -113,7 +151,7 @@ assert(chosen.ws === stream, "choice keeps a valid stream url");
 assert(chosen.choiceLog === "stream choice h264-mse", "choice log");
 assert(chosen.announceLog === "stream announce h264-mse", "announce log");
 assert(chosen.announce.type === "stream-announce" && chosen.announce.mode === "h264-mse", "announce message");
-assert(chosen.announce.build === "20261111.7", "announce names the build");
+assert(chosen.announce.build === "20261111.8", "announce names the build");
 assert(Cast.usableAvcCodec("avc1.42E01E") === "avc1.42E01E", "a baseline codec is usable");
 assert(Cast.usableAvcCodec("avc1.64001F") === "avc1.64001F", "a high-profile codec is usable");
 assert(Cast.usableAvcCodec("avc1.000001") === "", "an Annex-B start code is not a codec");

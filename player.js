@@ -19,7 +19,7 @@
 (function (root) {
   // Baked into player.js and the script URL. A Cast WebView that cached
   // "player.js" will not reuse that file for "player.js?v=<this>".
-  var RECEIVER_BUILD = "20261111.7";
+  var RECEIVER_BUILD = "20261111.8";
   var ROTATIONS = 2;
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
@@ -5477,6 +5477,67 @@
     return u8.length >= 3 && u8[0] === 0xff && u8[1] === 0xd8 && u8[2] === 0xff;
   }
 
+  // SPF1 frame: magic, uint16 header bytes (little-endian, includes magic),
+  // float32 yaw, pitch, fov, overscan, uint32 frame id, float64 phone time ms,
+  // then the JPEG. A bare JPEG is unchanged.
+  function parseStreamFrame(bytes) {
+    var u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+    if (u8.length >= 6 && u8[0] === 83 && u8[1] === 80 && u8[2] === 70 && u8[3] === 49) {
+      var view = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+      var headerLen = view.getUint16(4, true);
+      if (headerLen < 34 || u8.length <= headerLen) return null;
+      var jpeg = u8.subarray(headerLen);
+      if (!jpegFrame(jpeg)) return null;
+      return {
+        pose: {
+          yaw: view.getFloat32(6, true),
+          pitch: view.getFloat32(10, true),
+          fov: view.getFloat32(14, true),
+          overscan: view.getFloat32(18, true),
+          frameId: view.getUint32(22, true),
+          timeMs: view.getFloat64(26, true),
+        },
+        jpeg: jpeg,
+      };
+    }
+    if (!jpegFrame(u8)) return null;
+    return { pose: null, jpeg: u8 };
+  }
+
+  function shortestDeg(delta) {
+    var d = delta % 360;
+    if (d > 180) d -= 360;
+    if (d < -180) d += 360;
+    return d;
+  }
+
+  // Shift and scale a rendered frame toward the live aim. The shift is
+  // clamped to the overscan margin so the sample stays inside the JPEG.
+  function streamReproject(frame, aim, width, height) {
+    if (!frame || !(frame.fov > 1) || !(width > 0) || !(height > 0)) {
+      return { scale: 1, dx: 0, dy: 0, px: 0 };
+    }
+    var aimFov = aim && aim.fov > 1 ? aim.fov : frame.fov;
+    var scale = frame.fov / aimFov;
+    if (!(scale > 0)) scale = 1;
+    if (scale > 4) scale = 4;
+    if (scale < 0.25) scale = 0.25;
+    var vRad = frame.fov * Math.PI / 180;
+    var hFov = 2 * Math.atan(Math.tan(vRad / 2) * (width / height)) * 180 / Math.PI;
+    if (!(hFov > 1)) hFov = frame.fov;
+    var dx = shortestDeg((aim && aim.yaw || 0) - (frame.yaw || 0)) / hFov * width * scale;
+    var dy = -(((aim && aim.pitch || 0) - (frame.pitch || 0)) / frame.fov) * height * scale;
+    var over = frame.overscan > 0 ? frame.overscan : 0;
+    if (over > 0.45) over = 0.45;
+    var maxX = over * width * scale;
+    var maxY = over * height * scale;
+    if (dx > maxX) dx = maxX;
+    if (dx < -maxX) dx = -maxX;
+    if (dy > maxY) dy = maxY;
+    if (dy < -maxY) dy = -maxY;
+    return { scale: scale, dx: dx, dy: dy, px: Math.sqrt(dx * dx + dy * dy) };
+  }
+
   function socketDisconnectLog(kind, remote, code, reason) {
     var name = kind === "stream" ? "stream" : "aim";
     var why = String(reason == null ? "" : reason).replace(/[\r\n]/g, " ").slice(0, 120);
@@ -9858,6 +9919,8 @@
     mp4BoxList: mp4BoxList,
     mp4AppendUnits: mp4AppendUnits,
     jpegFrame: jpegFrame,
+    parseStreamFrame: parseStreamFrame,
+    streamReproject: streamReproject,
     socketDisconnectLog: socketDisconnectLog,
     httpUrl: httpUrl,
     stepIndex: stepIndex,

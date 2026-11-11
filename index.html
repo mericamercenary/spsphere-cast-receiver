@@ -76,7 +76,7 @@
   <div id="mark" hidden><img class="logo" src="logo.png" alt="" /></div>
   <div id="busy"></div>
   <video id="wakeVideo" muted loop playsinline autoplay width="2" height="2" style="position:fixed;left:-99px;top:-99px;width:2px;height:2px;opacity:0.01;pointer-events:none"></video>
-  <script src="player.js?v=20261111.7"></script>
+  <script src="player.js?v=20261111.8"></script>
   <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
   <script>
     var NAMESPACE = "urn:x-cast:com.cameron.viewer360";
@@ -293,6 +293,18 @@
     var jpegDropped = 0;
     var jpegStatAt = 0;
     var jpegRaf = 0;
+    var jpegFramePose = null;
+    var jpegViewW = 0;
+    var jpegViewH = 0;
+    var jpegWorker = undefined;
+    var jpegJob = 0;
+    var jpegSeq = 0;
+    var jpegJobStarted = 0;
+    var jpegJobPose = null;
+    var jpegPendingPose = null;
+    var jpegIntervals = [];
+    var jpegShifts = [];
+    var jpegLastRaf = 0;
     var STREAM_WAIT_MS = 5000;
 
     function hideStreamSurface() {
@@ -336,7 +348,10 @@
         if (video.className === "stream-live") video.hidden = false;
         else video.hidden = which !== "video";
       }
-      if (frame) frame.hidden = which !== "frame";
+      if (frame) {
+        frame.hidden = which !== "frame";
+        if (which === "frame") noteJpegSurface();
+      }
       if (hold) hold.className = "";
       if (streamWaitTimer) {
         clearTimeout(streamWaitTimer);
@@ -678,79 +693,158 @@
       return sorted[index];
     }
 
-    function logJpegStats(now) {
+    function noteJpegSurface() {
+      var canvas = document.getElementById("streamFrame");
+      var ratio = window.devicePixelRatio || 1;
+      var cssW = window.innerWidth || 1280;
+      var cssH = window.innerHeight || 720;
+      var w = Math.max(2, Math.round(cssW * ratio));
+      var h = Math.max(2, Math.round(cssH * ratio));
+      jpegViewW = w;
+      jpegViewH = h;
+      if (!canvas) return;
+      if (canvas.width !== w) canvas.width = w;
+      if (canvas.height !== h) canvas.height = h;
+    }
+
+    function logPresentStats(now) {
       if (!jpegStatAt) jpegStatAt = now;
       if (now - jpegStatAt < 2000) return;
       var seconds = (now - jpegStatAt) / 1000;
       var fps = seconds > 0 ? Math.round(jpegPresented / seconds) : 0;
-      sendLog("stream jpeg decode p50=" + jpegPercentile(jpegDecodeSamples, 0.5)
-        + "ms p95=" + jpegPercentile(jpegDecodeSamples, 0.95)
-        + "ms fps=" + fps + " dropped=" + jpegDropped);
+      sendLog("stream present fps=" + fps
+        + " jitter p95=" + jpegPercentile(jpegIntervals, 0.95)
+        + " reproject px p95=" + jpegPercentile(jpegShifts, 0.95));
       jpegPresented = 0;
-      jpegDropped = 0;
-      jpegDecodeSamples = [];
+      jpegIntervals = [];
+      jpegShifts = [];
       jpegStatAt = now;
     }
 
-    function drawJpegFrame() {
-      jpegRaf = 0;
+    function drawJpegFrame(now) {
       var canvas = document.getElementById("streamFrame");
       var bitmap = jpegBitmap;
       if (!canvas || !bitmap || !canvas.getContext) return;
-      var w = bitmap.width || canvas.width || 2;
-      var h = bitmap.height || canvas.height || 2;
-      if (canvas.width !== w) canvas.width = w;
-      if (canvas.height !== h) canvas.height = h;
+      if (!(jpegViewW > 1)) noteJpegSurface();
+      var w = jpegViewW || canvas.width;
+      var h = jpegViewH || canvas.height;
+      if (!(w > 1) || !(h > 1)) return;
       var ctx = canvas.getContext("2d");
       if (!ctx) return;
-      ctx.drawImage(bitmap, 0, 0, w, h);
+      var aim = player ? { yaw: player.yaw || 0, pitch: player.pitch || 0, fov: player.fov || 75 } : null;
+      var shift = SpsphereCast.streamReproject(jpegFramePose, aim, w, h);
+      if (shift.scale < 1 && ctx.fillRect) {
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.fillStyle = "#0b0d10";
+        ctx.fillRect(0, 0, w, h);
+      }
+      ctx.setTransform(shift.scale, 0, 0, shift.scale, w / 2 + shift.dx, h / 2 + shift.dy);
+      ctx.drawImage(bitmap, -w / 2, -h / 2, w, h);
       jpegPresented += 1;
+      jpegShifts.push(Math.round(shift.px));
       if (!streamSawFrame) {
         streamSawFrame = true;
         streamRetries = 0;
         streamRejected = 0;
         showStreamSurface("frame");
+        noteJpegSurface();
       }
-      logJpegStats(Date.now());
+      logPresentStats(now || Date.now());
+    }
+
+    function jpegFrameLoop(t) {
+      if (streamMode !== "jpeg-ws" && streamDecodeMode !== "jpeg-ws") {
+        jpegRaf = 0;
+        jpegLastRaf = 0;
+        return;
+      }
+      if (jpegLastRaf) jpegIntervals.push(Math.round(t - jpegLastRaf));
+      jpegLastRaf = t;
+      drawJpegFrame(Date.now());
+      var raf = window.requestAnimationFrame || function (fn) { return setTimeout(function () { fn(Date.now()); }, 16); };
+      jpegRaf = raf(jpegFrameLoop);
     }
 
     function scheduleJpegDraw() {
       if (jpegRaf) return;
-      var raf = window.requestAnimationFrame || function (fn) { return setTimeout(fn, 16); };
-      jpegRaf = raf(drawJpegFrame);
+      var raf = window.requestAnimationFrame || function (fn) { return setTimeout(function () { fn(Date.now()); }, 16); };
+      jpegRaf = raf(jpegFrameLoop);
     }
 
-    function finishJpegDecode(bitmap, started) {
+    function finishJpegDecode(bitmap, started, pose, job) {
+      if (job !== jpegJob) {
+        closeJpegBitmap(bitmap);
+        return;
+      }
+      if (!bitmap) {
+        jpegDecoding = false;
+        if (jpegPending) decodeLatestJpeg();
+        return;
+      }
       jpegDecodeSamples.push(Date.now() - started);
+      jpegDecoding = false;
       if (jpegPending) {
         jpegDropped += 1;
         closeJpegBitmap(bitmap);
-        jpegDecoding = false;
         decodeLatestJpeg();
         return;
       }
-      jpegDecoding = false;
       if (jpegBitmap && jpegBitmap !== bitmap) closeJpegBitmap(jpegBitmap);
       jpegBitmap = bitmap;
+      jpegFramePose = pose || null;
       scheduleJpegDraw();
+    }
+
+    function ensureJpegWorker() {
+      if (jpegWorker !== undefined) return jpegWorker;
+      jpegWorker = null;
+      try {
+        if (typeof Worker !== "function" || typeof createImageBitmap !== "function" || typeof OffscreenCanvas !== "function") return null;
+        var src = "self.onmessage=function(e){var blob=new Blob([e.data.bytes],{type:'image/jpeg'});createImageBitmap(blob).then(function(bmp){var canvas=new OffscreenCanvas(bmp.width||1,bmp.height||1);var ctx=canvas.getContext('2d');if(ctx)ctx.drawImage(bmp,0,0);if(bmp.close)bmp.close();var out=canvas.transferToImageBitmap();self.postMessage({id:e.data.id,bitmap:out},[out]);}).catch(function(){self.postMessage({id:e.data.id,bitmap:null});});};";
+        var url = URL.createObjectURL(new Blob([src], { type: "text/javascript" }));
+        var worker = new Worker(url);
+        worker.onmessage = function (ev) {
+          var data = ev.data || {};
+          finishJpegDecode(data.bitmap, jpegJobStarted, jpegJobPose, data.id);
+        };
+        jpegWorker = worker;
+        return worker;
+      } catch (err) {
+        jpegWorker = null;
+        return null;
+      }
     }
 
     function decodeLatestJpeg() {
       var bytes = jpegPending;
+      var pose = jpegPendingPose;
       jpegPending = null;
+      jpegPendingPose = null;
       if (!bytes) {
         jpegDecoding = false;
         return;
       }
       jpegDecoding = true;
-      var started = Date.now();
+      jpegJob = ++jpegSeq;
+      jpegJobStarted = Date.now();
+      jpegJobPose = pose;
+      var job = jpegJob;
+      var started = jpegJobStarted;
+      var worker = ensureJpegWorker();
+      if (worker) {
+        try {
+          var copy = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+          worker.postMessage({ id: job, bytes: copy }, [copy]);
+          return;
+        } catch (err) {}
+      }
       if (typeof createImageBitmap === "function") {
         var blob = new Blob([bytes], { type: "image/jpeg" });
         var pending = null;
         try { pending = createImageBitmap(blob); } catch (err) { pending = null; }
         if (pending && pending.then) {
           pending.then(function (bitmap) {
-            finishJpegDecode(bitmap, started);
+            finishJpegDecode(bitmap, started, pose, job);
           }).catch(function () {
             jpegDecoding = false;
             if (jpegPending) decodeLatestJpeg();
@@ -763,7 +857,7 @@
           var decoder = new ImageDecoder({ data: bytes, type: "image/jpeg" });
           decoder.decode().then(function (result) {
             try { if (decoder.close) decoder.close(); } catch (err) {}
-            finishJpegDecode(result && result.image, started);
+            finishJpegDecode(result && result.image, started, pose, job);
           }).catch(function () {
             try { if (decoder.close) decoder.close(); } catch (err) {}
             jpegDecoding = false;
@@ -776,8 +870,16 @@
     }
 
     function paintJpeg(bytes) {
+      var parsed = SpsphereCast.parseStreamFrame(bytes);
+      if (!parsed) {
+        if (streamRenderFallbackSent) return;
+        streamRejected += 1;
+        if (streamRejected >= 3 && !streamSawFrame) fallbackCanvas("not-jpeg");
+        return;
+      }
       if (jpegPending) jpegDropped += 1;
-      jpegPending = bytes;
+      jpegPending = parsed.jpeg;
+      jpegPendingPose = parsed.pose;
       if (!jpegDecoding) decodeLatestJpeg();
     }
 
@@ -984,12 +1086,6 @@
     function onStreamBytes(buffer, mode) {
       var bytes = new Uint8Array(buffer);
       if (mode === "jpeg-ws") {
-        if (!SpsphereCast.jpegFrame(bytes)) {
-          if (streamRenderFallbackSent) return;
-          streamRejected += 1;
-          if (streamRejected >= 3 && !streamSawFrame) fallbackCanvas("not-jpeg");
-          return;
-        }
         paintJpeg(bytes);
         return;
       }
