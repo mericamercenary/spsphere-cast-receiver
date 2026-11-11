@@ -19,7 +19,7 @@
 (function (root) {
   // Baked into player.js and the script URL. A Cast WebView that cached
   // "player.js" will not reuse that file for "player.js?v=<this>".
-  var RECEIVER_BUILD = "20261111.8";
+  var RECEIVER_BUILD = "20261111.9";
   var ROTATIONS = 2;
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
@@ -5538,6 +5538,27 @@
     return { scale: scale, dx: dx, dy: dy, px: Math.sqrt(dx * dx + dy * dy) };
   }
 
+  // Default present: no aim shift. Crop the overscan margin, where the
+  // margin on each side of the JPEG is overscan / (1 + 2 * overscan).
+  function streamStillDraw(frame) {
+    var over = frame && frame.overscan > 0 ? frame.overscan : 0;
+    if (over > 2) over = 2;
+    var crop = over > 0 ? over / (1 + 2 * over) : 0;
+    if (crop > 0.49) crop = 0.49;
+    return { scale: 1, dx: 0, dy: 0, px: 0, crop: crop };
+  }
+
+  function spsReprojectDebug() {
+    try {
+      if (root.__spsReproject) return true;
+      if (root.location) {
+        var q = String(root.location.search || "") + String(root.location.hash || "");
+        if (/(?:^|[?&#])spsdebug=reproject(?:&|$)/i.test(q)) return true;
+      }
+    } catch (error) {}
+    return false;
+  }
+
   function socketDisconnectLog(kind, remote, code, reason) {
     var name = kind === "stream" ? "stream" : "aim";
     var why = String(reason == null ? "" : reason).replace(/[\r\n]/g, " ").slice(0, 120);
@@ -9921,6 +9942,8 @@
     jpegFrame: jpegFrame,
     parseStreamFrame: parseStreamFrame,
     streamReproject: streamReproject,
+    streamStillDraw: streamStillDraw,
+    spsReprojectDebug: spsReprojectDebug,
     socketDisconnectLog: socketDisconnectLog,
     httpUrl: httpUrl,
     stepIndex: stepIndex,

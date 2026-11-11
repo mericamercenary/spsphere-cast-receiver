@@ -76,7 +76,7 @@
   <div id="mark" hidden><img class="logo" src="logo.png" alt="" /></div>
   <div id="busy"></div>
   <video id="wakeVideo" muted loop playsinline autoplay width="2" height="2" style="position:fixed;left:-99px;top:-99px;width:2px;height:2px;opacity:0.01;pointer-events:none"></video>
-  <script src="player.js?v=20261111.8"></script>
+  <script src="player.js?v=20261111.9"></script>
   <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
   <script>
     var NAMESPACE = "urn:x-cast:com.cameron.viewer360";
@@ -731,17 +731,32 @@
       if (!(w > 1) || !(h > 1)) return;
       var ctx = canvas.getContext("2d");
       if (!ctx) return;
-      var aim = player ? { yaw: player.yaw || 0, pitch: player.pitch || 0, fov: player.fov || 75 } : null;
-      var shift = SpsphereCast.streamReproject(jpegFramePose, aim, w, h);
-      if (shift.scale < 1 && ctx.fillRect) {
+      var reproject = false;
+      try { reproject = !!SpsphereCast.spsReprojectDebug(); } catch (err) {}
+      var bw = bitmap.width || w;
+      var bh = bitmap.height || h;
+      if (reproject) {
+        var aim = player ? { yaw: player.yaw || 0, pitch: player.pitch || 0, fov: player.fov || 75 } : null;
+        var shift = SpsphereCast.streamReproject(jpegFramePose, aim, w, h);
+        if (shift.scale < 1 && ctx.fillRect) {
+          ctx.setTransform(1, 0, 0, 1, 0, 0);
+          ctx.fillStyle = "#0b0d10";
+          ctx.fillRect(0, 0, w, h);
+        }
+        ctx.setTransform(shift.scale, 0, 0, shift.scale, w / 2 + shift.dx, h / 2 + shift.dy);
+        ctx.drawImage(bitmap, -w / 2, -h / 2, w, h);
+        jpegShifts.push(Math.round(shift.px));
+      } else {
+        var still = SpsphereCast.streamStillDraw(jpegFramePose);
+        var sx = still.crop * bw;
+        var sy = still.crop * bh;
+        var sw = bw * (1 - 2 * still.crop);
+        var sh = bh * (1 - 2 * still.crop);
         ctx.setTransform(1, 0, 0, 1, 0, 0);
-        ctx.fillStyle = "#0b0d10";
-        ctx.fillRect(0, 0, w, h);
+        ctx.drawImage(bitmap, sx, sy, sw, sh, 0, 0, w, h);
+        jpegShifts.push(0);
       }
-      ctx.setTransform(shift.scale, 0, 0, shift.scale, w / 2 + shift.dx, h / 2 + shift.dy);
-      ctx.drawImage(bitmap, -w / 2, -h / 2, w, h);
       jpegPresented += 1;
-      jpegShifts.push(Math.round(shift.px));
       if (!streamSawFrame) {
         streamSawFrame = true;
         streamRetries = 0;

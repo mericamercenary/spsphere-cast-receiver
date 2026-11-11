@@ -14,10 +14,10 @@ function assert(cond, message) {
   if (!cond) throw new Error(message || "assertion failed");
 }
 
-assert(Cast.RECEIVER_BUILD === "20261111.8", "receiver build is 20261111.8, got " + Cast.RECEIVER_BUILD);
+assert(Cast.RECEIVER_BUILD === "20261111.9", "receiver build is 20261111.9, got " + Cast.RECEIVER_BUILD);
 assert(Cast.TILE_FADE_MS === 2400, "photo fade stays 2400ms");
 assert(Cast.FOCUS_HANDOFF === 0.35, "focus handoff stays 0.35");
-assert(page.indexOf("player.js?v=20261111.8") >= 0, "index.html cache-busts 20261111.8");
+assert(page.indexOf("player.js?v=20261111.9") >= 0, "index.html cache-busts 20261111.9");
 assert(page.indexOf("function _drawGl") < 0, "the page does not rewrite the WebGL draw");
 assert(code.indexOf("TILE_FADE_MS = 2400") >= 0, "player keeps the 2400ms fade");
 assert(code.indexOf("FOCUS_HANDOFF = 0.35") >= 0, "player keeps the 0.35 handoff");
@@ -140,7 +140,16 @@ const clamped = Cast.streamReproject(
   1000, 500
 );
 assert(Math.abs(clamped.dx) <= 0.12 * 1000 + 0.01 && Math.abs(clamped.dy) <= 0.12 * 500 + 0.01, "a large aim change stays inside the overscan margin");
-assert(probe.build === "20261111.8", "probe names the build");
+const still = Cast.streamStillDraw({ yaw: 40, pitch: 10, fov: 90, overscan: 0.12 });
+assert(still.dx === 0 && still.dy === 0 && still.px === 0, "the default present does not follow aim");
+assert(Math.abs(still.crop - (0.12 / 1.24)) < 1e-9, "overscan crops overscan/(1+2*overscan) per side, got " + still.crop);
+assert(Cast.streamStillDraw(null).crop === 0, "a bare JPEG is not cropped");
+assert(page.indexOf("spsReprojectDebug") >= 0 && page.indexOf("streamStillDraw") >= 0, "aim reprojection stays behind spsdebug=reproject");
+sandbox.location = { search: "?spsdebug=reproject", hash: "" };
+assert(Cast.spsReprojectDebug() === true, "spsdebug=reproject opts into aim shift");
+sandbox.location = { search: "", hash: "" };
+assert(Cast.spsReprojectDebug() === false, "aim shift is off by default");
+assert(probe.build === "20261111.9", "probe names the build");
 const jpegOnly = Cast.streamProbe(false, false);
 assert(jpegOnly.modes.length === 1 && jpegOnly.modes[0] === "jpeg-ws", "without MSE the probe is jpeg-ws only");
 assert(jpegOnly.log.indexOf("mse=0") >= 0, "the probe log records mse=0");
@@ -151,7 +160,7 @@ assert(chosen.ws === stream, "choice keeps a valid stream url");
 assert(chosen.choiceLog === "stream choice h264-mse", "choice log");
 assert(chosen.announceLog === "stream announce h264-mse", "announce log");
 assert(chosen.announce.type === "stream-announce" && chosen.announce.mode === "h264-mse", "announce message");
-assert(chosen.announce.build === "20261111.8", "announce names the build");
+assert(chosen.announce.build === "20261111.9", "announce names the build");
 assert(Cast.usableAvcCodec("avc1.42E01E") === "avc1.42E01E", "a baseline codec is usable");
 assert(Cast.usableAvcCodec("avc1.64001F") === "avc1.64001F", "a high-profile codec is usable");
 assert(Cast.usableAvcCodec("avc1.000001") === "", "an Annex-B start code is not a codec");
