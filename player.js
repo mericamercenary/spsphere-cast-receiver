@@ -19,7 +19,7 @@
 (function (root) {
   // Baked into player.js and the script URL. A Cast WebView that cached
   // "player.js" will not reuse that file for "player.js?v=<this>".
-  var RECEIVER_BUILD = "20261111.4";
+  var RECEIVER_BUILD = "20261111.5";
   var ROTATIONS = 2;
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
@@ -5299,6 +5299,101 @@
     return false;
   }
 
+  function readU32(u8, offset) {
+    return ((u8[offset] * 16777216) + (u8[offset + 1] * 65536) + (u8[offset + 2] * 256) + u8[offset + 3]) >>> 0;
+  }
+
+  function mp4Boxes(bytes) {
+    var u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+    var boxes = [];
+    var offset = 0;
+    while (offset + 8 <= u8.length) {
+      var size = readU32(u8, offset);
+      var type = String.fromCharCode(u8[offset + 4], u8[offset + 5], u8[offset + 6], u8[offset + 7]);
+      var header = 8;
+      if (size === 1) {
+        if (offset + 16 > u8.length) break;
+        var hi = readU32(u8, offset + 8);
+        var lo = readU32(u8, offset + 12);
+        size = hi * 4294967296 + lo;
+        header = 16;
+      } else if (size === 0) {
+        size = u8.length - offset;
+      }
+      if (!(size >= header) || offset + size > u8.length) break;
+      boxes.push({ type: type, size: size, start: offset, end: offset + size });
+      offset += size;
+    }
+    return { boxes: boxes, rest: offset };
+  }
+
+  function mp4Hex(bytes, count) {
+    var u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+    var n = Math.min(count > 0 ? count : 64, u8.length);
+    var out = "";
+    for (var i = 0; i < n; i++) {
+      var hex = u8[i].toString(16);
+      if (hex.length < 2) hex = "0" + hex;
+      out += hex;
+    }
+    return out;
+  }
+
+  function mp4BoxList(bytes) {
+    var u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+    var parsed = mp4Boxes(u8);
+    var parts = [];
+    for (var i = 0; i < parsed.boxes.length; i++) {
+      parts.push(parsed.boxes[i].type + ":" + parsed.boxes[i].size);
+    }
+    if (parsed.rest < u8.length) parts.push("partial:" + (u8.length - parsed.rest));
+    return parts.join(",") || "none";
+  }
+
+  // One websocket message may hold the init and the first media segment, or
+  // only the front of a box. Init is appended by itself. A moof stays with
+  // its mdat. Bytes after the last complete box are returned as rest.
+  function mp4AppendUnits(bytes) {
+    var u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+    var parsed = mp4Boxes(u8);
+    var units = [];
+    var initStart = -1;
+    var initEnd = -1;
+    var boxes = parsed.boxes;
+    var i = 0;
+    function flushInit() {
+      if (initStart < 0) return;
+      units.push({ kind: "init", start: initStart, end: initEnd });
+      initStart = -1;
+      initEnd = -1;
+    }
+    while (i < boxes.length) {
+      var box = boxes[i];
+      var initBox = box.type === "ftyp" || box.type === "moov" || box.type === "free" || box.type === "skip" || box.type === "wide";
+      if (initBox) {
+        if (initStart < 0) initStart = box.start;
+        initEnd = box.end;
+        i += 1;
+        continue;
+      }
+      flushInit();
+      if (box.type === "moof" || box.type === "mdat") {
+        var end = box.end;
+        if (box.type === "moof" && i + 1 < boxes.length && boxes[i + 1].type === "mdat") {
+          end = boxes[i + 1].end;
+          i += 2;
+        } else {
+          i += 1;
+        }
+        units.push({ kind: "media", start: box.start, end: end });
+        continue;
+      }
+      i += 1;
+    }
+    flushInit();
+    return { units: units, rest: parsed.rest };
+  }
+
   function streamChoose(hasMse, request) {
     var mode = normalizeStreamMode(request && request.mode);
     if (!mode) return null;
@@ -9695,6 +9790,9 @@
     usableAvcCodec: usableAvcCodec,
     mseFailureAction: mseFailureAction,
     fmp4Init: fmp4Init,
+    mp4Hex: mp4Hex,
+    mp4BoxList: mp4BoxList,
+    mp4AppendUnits: mp4AppendUnits,
     jpegFrame: jpegFrame,
     socketDisconnectLog: socketDisconnectLog,
     httpUrl: httpUrl,

@@ -67,11 +67,11 @@
   <canvas id="view"></canvas>
   <div id="streamHold"></div>
   <video id="streamVideo" hidden muted autoplay playsinline></video>
-  <img id="streamFrame" alt="" hidden>
+  <canvas id="streamFrame" hidden></canvas>
   <div id="mark" hidden><img class="logo" src="logo.png" alt="" /></div>
   <div id="busy"></div>
   <video id="wakeVideo" muted loop playsinline autoplay width="2" height="2" style="position:fixed;left:-99px;top:-99px;width:2px;height:2px;opacity:0.01;pointer-events:none"></video>
-  <script src="player.js?v=20261111.4"></script>
+  <script src="player.js?v=20261111.5"></script>
   <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
   <script>
     var NAMESPACE = "urn:x-cast:com.cameron.viewer360";
@@ -274,6 +274,16 @@
     var streamMseHandling = false;
     var streamNeedInit = false;
     var streamPresenting = false;
+    var streamCarry = null;
+    var streamSampleN = 0;
+    var jpegPending = null;
+    var jpegDecoding = false;
+    var jpegBitmap = null;
+    var jpegDecodeSamples = [];
+    var jpegPresented = 0;
+    var jpegDropped = 0;
+    var jpegStatAt = 0;
+    var jpegRaf = 0;
     var STREAM_WAIT_MS = 5000;
 
     function hideStreamSurface() {
@@ -333,6 +343,7 @@
       }
       hideStreamSurface();
       streamSawFrame = false;
+      closeJpegBitmap();
       sendLog("stream fallback canvas2d" + (why ? " " + why : ""));
     }
 
@@ -349,6 +360,7 @@
       streamBuffer = null;
       var source = streamSource;
       streamSource = null;
+      streamCarry = null;
       if (source) {
         try {
           if (source.readyState === "open") source.endOfStream();
@@ -489,18 +501,122 @@
       holdForStream();
     }
 
+    function closeJpegBitmap(bitmap) {
+      if (bitmap && bitmap.close) {
+        try { bitmap.close(); } catch (err) {}
+      }
+    }
+
+    function jpegPercentile(samples, p) {
+      if (!samples.length) return 0;
+      var sorted = samples.slice().sort(function (a, b) { return a - b; });
+      var index = Math.ceil(p * sorted.length) - 1;
+      if (index < 0) index = 0;
+      if (index >= sorted.length) index = sorted.length - 1;
+      return sorted[index];
+    }
+
+    function logJpegStats(now) {
+      if (!jpegStatAt) jpegStatAt = now;
+      if (now - jpegStatAt < 2000) return;
+      var seconds = (now - jpegStatAt) / 1000;
+      var fps = seconds > 0 ? Math.round(jpegPresented / seconds) : 0;
+      sendLog("stream jpeg decode p50=" + jpegPercentile(jpegDecodeSamples, 0.5)
+        + "ms p95=" + jpegPercentile(jpegDecodeSamples, 0.95)
+        + "ms fps=" + fps + " dropped=" + jpegDropped);
+      jpegPresented = 0;
+      jpegDropped = 0;
+      jpegDecodeSamples = [];
+      jpegStatAt = now;
+    }
+
+    function drawJpegFrame() {
+      jpegRaf = 0;
+      var canvas = document.getElementById("streamFrame");
+      var bitmap = jpegBitmap;
+      if (!canvas || !bitmap || !canvas.getContext) return;
+      var w = bitmap.width || canvas.width || 2;
+      var h = bitmap.height || canvas.height || 2;
+      if (canvas.width !== w) canvas.width = w;
+      if (canvas.height !== h) canvas.height = h;
+      var ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.drawImage(bitmap, 0, 0, w, h);
+      jpegPresented += 1;
+      if (!streamSawFrame) {
+        streamSawFrame = true;
+        streamRetries = 0;
+        streamRejected = 0;
+        showStreamSurface("frame");
+      }
+      logJpegStats(Date.now());
+    }
+
+    function scheduleJpegDraw() {
+      if (jpegRaf) return;
+      var raf = window.requestAnimationFrame || function (fn) { return setTimeout(fn, 16); };
+      jpegRaf = raf(drawJpegFrame);
+    }
+
+    function finishJpegDecode(bitmap, started) {
+      jpegDecodeSamples.push(Date.now() - started);
+      if (jpegPending) {
+        jpegDropped += 1;
+        closeJpegBitmap(bitmap);
+        jpegDecoding = false;
+        decodeLatestJpeg();
+        return;
+      }
+      jpegDecoding = false;
+      if (jpegBitmap && jpegBitmap !== bitmap) closeJpegBitmap(jpegBitmap);
+      jpegBitmap = bitmap;
+      scheduleJpegDraw();
+    }
+
+    function decodeLatestJpeg() {
+      var bytes = jpegPending;
+      jpegPending = null;
+      if (!bytes) {
+        jpegDecoding = false;
+        return;
+      }
+      jpegDecoding = true;
+      var started = Date.now();
+      if (typeof createImageBitmap === "function") {
+        var blob = new Blob([bytes], { type: "image/jpeg" });
+        var pending = null;
+        try { pending = createImageBitmap(blob); } catch (err) { pending = null; }
+        if (pending && pending.then) {
+          pending.then(function (bitmap) {
+            finishJpegDecode(bitmap, started);
+          }).catch(function () {
+            jpegDecoding = false;
+            if (jpegPending) decodeLatestJpeg();
+          });
+          return;
+        }
+      }
+      if (typeof ImageDecoder === "function") {
+        try {
+          var decoder = new ImageDecoder({ data: bytes, type: "image/jpeg" });
+          decoder.decode().then(function (result) {
+            try { if (decoder.close) decoder.close(); } catch (err) {}
+            finishJpegDecode(result && result.image, started);
+          }).catch(function () {
+            try { if (decoder.close) decoder.close(); } catch (err) {}
+            jpegDecoding = false;
+            if (jpegPending) decodeLatestJpeg();
+          });
+          return;
+        } catch (err) {}
+      }
+      jpegDecoding = false;
+    }
+
     function paintJpeg(bytes) {
-      var frame = document.getElementById("streamFrame");
-      if (!frame || !window.URL || !URL.createObjectURL) return;
-      var blob = new Blob([bytes], { type: "image/jpeg" });
-      var url = URL.createObjectURL(blob);
-      var prev = frame._streamUrl;
-      frame.onload = function () {
-        if (prev) { try { URL.revokeObjectURL(prev); } catch (e) {} }
-      };
-      frame._streamUrl = url;
-      frame.src = url;
-      noteStreamFrame("jpeg-ws", bytes.length || 0);
+      if (jpegPending) jpegDropped += 1;
+      jpegPending = bytes;
+      if (!jpegDecoding) decodeLatestJpeg();
     }
 
     function markPresented(video) {
@@ -565,6 +681,21 @@
       }
     }
 
+    function queueMp4(bytes) {
+      var merged = bytes;
+      if (streamCarry && streamCarry.length) {
+        merged = new Uint8Array(streamCarry.length + bytes.length);
+        merged.set(streamCarry, 0);
+        merged.set(bytes, streamCarry.length);
+      }
+      var plan = SpsphereCast.mp4AppendUnits(merged);
+      streamCarry = plan.rest < merged.length ? merged.subarray(plan.rest) : null;
+      for (var i = 0; i < plan.units.length; i++) {
+        var unit = plan.units[i];
+        streamQueue.push(merged.subarray(unit.start, unit.end));
+      }
+    }
+
     function appendH264(bytes) {
       if (streamMseStopped) return;
       if (typeof MediaSource === "undefined") {
@@ -574,7 +705,14 @@
       var video = document.getElementById("streamVideo");
       if (!video) return;
       bindVideo(video);
-      streamQueue.push(bytes);
+      if (streamSampleN < 2) {
+        logStreamOnce("sample-" + streamSampleN, "stream mse sample " + streamSampleN
+          + " bytes=" + bytes.length
+          + " hex=" + SpsphereCast.mp4Hex(bytes, 64)
+          + " boxes=" + SpsphereCast.mp4BoxList(bytes));
+        streamSampleN += 1;
+      }
+      queueMp4(bytes);
       if (streamSource) {
         pumpH264();
         return;
@@ -599,7 +737,10 @@
         var sniffed = first && SpsphereCast.codecFromAvcC(first);
         var requested = SpsphereCast.usableAvcCodec(streamCodec);
         var codec = sniffed || requested || (streamCodec ? "" : "avc1.42E01E");
-        if (!codec) {
+        var mime = 'video/mp4; codecs="' + codec + '"';
+        var supported = MediaSource.isTypeSupported ? MediaSource.isTypeSupported(mime) : true;
+        logStreamOnce("supported", "stream mse supported=" + (supported ? 1 : 0) + " mime=" + mime);
+        if (!codec || !supported) {
           logStreamOnce("codec", "stream mse unsupported codec " + (streamCodec || "none"));
           reportStreamFallback("mse");
           streamMseRelease = true;
@@ -730,6 +871,8 @@
         streamMseStopped = false;
         streamPresenting = false;
         streamNeedInit = false;
+        streamSampleN = 0;
+        streamCarry = null;
         streamLogged = {};
       }
       if (!streamSawFrame && player) {

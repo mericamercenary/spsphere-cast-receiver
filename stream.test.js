@@ -14,10 +14,10 @@ function assert(cond, message) {
   if (!cond) throw new Error(message || "assertion failed");
 }
 
-assert(Cast.RECEIVER_BUILD === "20261111.4", "receiver build is 20261111.4, got " + Cast.RECEIVER_BUILD);
+assert(Cast.RECEIVER_BUILD === "20261111.5", "receiver build is 20261111.5, got " + Cast.RECEIVER_BUILD);
 assert(Cast.TILE_FADE_MS === 2400, "photo fade stays 2400ms");
 assert(Cast.FOCUS_HANDOFF === 0.35, "focus handoff stays 0.35");
-assert(page.indexOf("player.js?v=20261111.4") >= 0, "index.html cache-busts 20261111.4");
+assert(page.indexOf("player.js?v=20261111.5") >= 0, "index.html cache-busts 20261111.5");
 assert(page.indexOf("function _drawGl") < 0, "the page does not rewrite the WebGL draw");
 assert(code.indexOf("TILE_FADE_MS = 2400") >= 0, "player keeps the 2400ms fade");
 assert(code.indexOf("FOCUS_HANDOFF = 0.35") >= 0, "player keeps the 0.35 handoff");
@@ -44,7 +44,49 @@ const secondBreak = Cast.mseFailureAction(1);
 assert(secondBreak.action === "fallback" && secondBreak.message.reason === "mse-decode", "the second decode failure leaves H.264");
 assert(Cast.fmp4Init(new Uint8Array([0, 0, 0, 16, 102, 116, 121, 112])) === true, "an ftyp box is an init segment");
 assert(Cast.fmp4Init(new Uint8Array([0, 0, 0, 1, 65, 0, 0])) === false, "a media sample is not an init segment");
-assert(probe.build === "20261111.4", "probe names the build");
+function bmff(type, payloadLen) {
+  const size = 8 + payloadLen;
+  const bytes = new Uint8Array(size);
+  bytes[0] = (size >>> 24) & 255;
+  bytes[1] = (size >>> 16) & 255;
+  bytes[2] = (size >>> 8) & 255;
+  bytes[3] = size & 255;
+  bytes[4] = type.charCodeAt(0);
+  bytes[5] = type.charCodeAt(1);
+  bytes[6] = type.charCodeAt(2);
+  bytes[7] = type.charCodeAt(3);
+  return bytes;
+}
+function catBytes(parts) {
+  let n = 0;
+  parts.forEach(function (part) { n += part.length; });
+  const out = new Uint8Array(n);
+  let offset = 0;
+  parts.forEach(function (part) { out.set(part, offset); offset += part.length; });
+  return out;
+}
+const ftyp = bmff("ftyp", 8);
+const moov = bmff("moov", 16);
+const moof = bmff("moof", 8);
+const mdat = bmff("mdat", 32);
+const combined = catBytes([ftyp, moov, moof, mdat]);
+const plan = Cast.mp4AppendUnits(combined);
+assert(plan.units.length === 2 && plan.units[0].kind === "init" && plan.units[1].kind === "media", "init and media in one message are separate appends");
+assert(plan.units[0].end === ftyp.length + moov.length && plan.units[1].end === combined.length, "the media append starts at moof");
+assert(plan.rest === combined.length, "a complete message has no leftover");
+assert(Cast.mp4BoxList(combined) === "ftyp:" + ftyp.length + ",moov:" + moov.length + ",moof:" + moof.length + ",mdat:" + mdat.length, "box list names type and size, got " + Cast.mp4BoxList(combined));
+const partial = Cast.mp4AppendUnits(ftyp.subarray(0, 10));
+assert(partial.units.length === 0 && partial.rest === 0, "a split init is not appended yet");
+assert(Cast.mp4BoxList(ftyp.subarray(0, 10)).indexOf("partial:10") >= 0, "a short read is marked partial");
+const joined = catBytes([ftyp.subarray(0, 10), ftyp.subarray(10), moov]);
+const rejoined = Cast.mp4AppendUnits(joined);
+assert(rejoined.units.length === 1 && rejoined.units[0].kind === "init", "a split init becomes one append once moov arrives");
+assert(Cast.mp4Hex(new Uint8Array([0x0a, 0xff]), 2) === "0aff", "sample hex is the first bytes");
+assert(page.indexOf("isTypeSupported") >= 0, "the page logs isTypeSupported for the mime");
+assert(page.indexOf("createImageBitmap") >= 0 && page.indexOf("requestAnimationFrame") >= 0, "JPEG decode is off the onload path");
+assert(page.indexOf("frame.onload") < 0, "JPEG frames are not waited on via img.onload");
+assert(page.indexOf("dropped=") >= 0 && page.indexOf("p50=") >= 0, "JPEG stats log decode time, fps, and drops");
+assert(probe.build === "20261111.5", "probe names the build");
 const jpegOnly = Cast.streamProbe(false, false);
 assert(jpegOnly.modes.length === 1 && jpegOnly.modes[0] === "jpeg-ws", "without MSE the probe is jpeg-ws only");
 assert(jpegOnly.log.indexOf("mse=0") >= 0, "the probe log records mse=0");
@@ -55,7 +97,7 @@ assert(chosen.ws === stream, "choice keeps a valid stream url");
 assert(chosen.choiceLog === "stream choice h264-mse", "choice log");
 assert(chosen.announceLog === "stream announce h264-mse", "announce log");
 assert(chosen.announce.type === "stream-announce" && chosen.announce.mode === "h264-mse", "announce message");
-assert(chosen.announce.build === "20261111.4", "announce names the build");
+assert(chosen.announce.build === "20261111.5", "announce names the build");
 assert(Cast.usableAvcCodec("avc1.42E01E") === "avc1.42E01E", "a baseline codec is usable");
 assert(Cast.usableAvcCodec("avc1.64001F") === "avc1.64001F", "a high-profile codec is usable");
 assert(Cast.usableAvcCodec("avc1.000001") === "", "an Annex-B start code is not a codec");
