@@ -71,7 +71,7 @@
   <div id="mark" hidden><img class="logo" src="logo.png" alt="" /></div>
   <div id="busy"></div>
   <video id="wakeVideo" muted loop playsinline autoplay width="2" height="2" style="position:fixed;left:-99px;top:-99px;width:2px;height:2px;opacity:0.01;pointer-events:none"></video>
-  <script src="player.js?v=20261111.5"></script>
+  <script src="player.js?v=20261111.6"></script>
   <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
   <script>
     var NAMESPACE = "urn:x-cast:com.cameron.viewer360";
@@ -276,6 +276,10 @@
     var streamPresenting = false;
     var streamCarry = null;
     var streamSampleN = 0;
+    var streamH264Blocked = false;
+    var streamRenderFallbackSent = false;
+    var streamVideoTornDown = false;
+    var streamObjectUrl = "";
     var jpegPending = null;
     var jpegDecoding = false;
     var jpegBitmap = null;
@@ -379,7 +383,9 @@
     function maybeProbeStream() {
       if (!player || !player.wantsPhoneStream || !player.wantsPhoneStream()) return;
       var hasMse = typeof MediaSource !== "undefined";
-      var probe = SpsphereCast.streamProbe(false, hasMse);
+      var blocked = false;
+      try { blocked = ensureH264Block(); } catch (err) { blocked = streamH264Blocked; }
+      var probe = SpsphereCast.streamProbe(false, hasMse, !blocked);
       if (!probe) return;
       if (!streamProbeLogged) {
         streamProbeLogged = true;
@@ -392,6 +398,7 @@
         modes: probe.modes,
         maxW: probe.maxW,
         maxH: probe.maxH,
+        h264: probe.h264,
         build: probe.build,
       });
     }
@@ -458,9 +465,156 @@
       }
     }
 
+    function streamDeviceId() {
+      var w = 0;
+      var h = 0;
+      var ua = "";
+      try {
+        if (window.screen) {
+          w = screen.width || 0;
+          h = screen.height || 0;
+        }
+      } catch (err) {}
+      try { ua = navigator.userAgent || ""; } catch (err) {}
+      return String(w) + "x" + String(h) + "." + ua;
+    }
+
+    function ensureH264Block() {
+      if (streamH264Blocked) return true;
+      try {
+        var raw = localStorage.getItem(SpsphereCast.h264BlockKey(streamDeviceId()));
+        if (SpsphereCast.h264Blocked(raw)) streamH264Blocked = true;
+      } catch (err) {}
+      return streamH264Blocked;
+    }
+
+    function rememberH264Block() {
+      streamH264Blocked = true;
+      try {
+        localStorage.setItem(
+          SpsphereCast.h264BlockKey(streamDeviceId()),
+          JSON.stringify(SpsphereCast.h264BlockRecord("video-render"))
+        );
+      } catch (err) {}
+    }
+
+    function logVideoRenderState(video, code, message) {
+      var cssW = "";
+      var cssH = "";
+      var visibility = "";
+      var display = "";
+      var boxW = 0;
+      var boxH = 0;
+      var inDom = 0;
+      try {
+        if (video && video.getBoundingClientRect) {
+          var rect = video.getBoundingClientRect();
+          boxW = Math.round(rect.width || 0);
+          boxH = Math.round(rect.height || 0);
+        }
+        if (window.getComputedStyle && video) {
+          var css = getComputedStyle(video);
+          cssW = css.width || "";
+          cssH = css.height || "";
+          visibility = css.visibility || "";
+          display = css.display || "";
+        }
+        if (video && document.documentElement && document.documentElement.contains && document.documentElement.contains(video)) inDom = 1;
+      } catch (err) {}
+      logStreamOnce("video-render-state", "stream video error code=" + (code != null ? code : "")
+        + " message=" + (message || "")
+        + " size=" + ((video && video.videoWidth) || 0) + "x" + ((video && video.videoHeight) || 0)
+        + " css=" + cssW + "x" + cssH
+        + " box=" + boxW + "x" + boxH
+        + " visibility=" + visibility
+        + " display=" + display
+        + " hidden=" + (video && video.hidden ? 1 : 0)
+        + " inDom=" + inDom
+        + " readyState=" + (video && video.readyState != null ? video.readyState : "")
+        + " networkState=" + (video && video.networkState != null ? video.networkState : ""));
+    }
+
+    function logBaselineSupport() {
+      function ok(codec) {
+        try {
+          if (!window.MediaSource || !MediaSource.isTypeSupported) return 0;
+          return MediaSource.isTypeSupported('video/mp4; codecs="' + codec + '"') ? 1 : 0;
+        } catch (err) {
+          return 0;
+        }
+      }
+      logStreamOnce("baseline-support", "stream mse supported avc1.42E01E=" + ok("avc1.42E01E")
+        + " avc1.42001F=" + ok("avc1.42001F")
+        + " avc1.42801F=" + ok("avc1.42801F"));
+    }
+
+    function tearDownVideo() {
+      if (streamVideoTornDown) return;
+      streamVideoTornDown = true;
+      streamMseRelease = true;
+      streamMseStopped = true;
+      streamQueue = [];
+      streamBuffer = null;
+      streamSource = null;
+      var video = null;
+      try { video = document.getElementById("streamVideo"); } catch (err) {}
+      var url = streamObjectUrl;
+      streamObjectUrl = "";
+      try {
+        if (video) {
+          video._ignoreError = true;
+          video.onerror = null;
+          video.hidden = true;
+          video.removeAttribute("src");
+        }
+      } catch (err) {}
+      try { if (video && video.load) video.load(); } catch (err) {}
+      try { if (url && window.URL && URL.revokeObjectURL) URL.revokeObjectURL(url); } catch (err) {}
+      try { if (video && video.parentNode) video.parentNode.removeChild(video); } catch (err) {}
+      streamMseRelease = false;
+    }
+
+    function fallbackVideoRender(why) {
+      if (streamRenderFallbackSent) return;
+      streamRenderFallbackSent = true;
+      streamH264Blocked = true;
+      streamMseStopped = true;
+      streamQueue = [];
+      streamPresenting = false;
+      streamSawFrame = false;
+      streamRejected = 0;
+      streamMode = "jpeg-ws";
+      streamDecodeMode = "jpeg-ws";
+      try { rememberH264Block(); } catch (err) {}
+      try { window.__castSend({ type: "stream-fallback", reason: "video-render" }); } catch (err) {}
+      try { sendLog("stream-fallback video-render"); } catch (err) {}
+      try { sendLog("stream mse skip-reset " + (why || "video-error")); } catch (err) {}
+      try {
+        if (player) {
+          player._streamActive = false;
+          player._streamHold = true;
+          player._streamHoldPainted = false;
+        }
+        var hold = document.getElementById("streamHold");
+        if (hold) hold.className = "on";
+      } catch (err) {}
+      try { holdForStream(); } catch (err) {}
+      setTimeout(function () {
+        try { tearDownVideo(); } catch (err) {}
+      }, 0);
+    }
+
     function onMseBroken(why) {
-      if (streamMseRelease || streamMseHandling) return;
+      if (streamRenderFallbackSent || streamMseRelease || streamMseHandling) return;
       if (streamMode !== "h264-mse" && streamDecodeMode !== "h264-mse") return;
+      var video = null;
+      try { video = document.getElementById("streamVideo"); } catch (err) {}
+      if (why === "video-error" || SpsphereCast.isVideoRenderFailure(video && video.error && video.error.code, (video && video.error && video.error.message) || why)) {
+        try { logVideoRenderState(video, video && video.error && video.error.code, video && video.error && video.error.message); } catch (err) {}
+        try { logBaselineSupport(); } catch (err) {}
+        fallbackVideoRender(why);
+        return;
+      }
       streamMseHandling = true;
       streamMseStopped = true;
       streamQueue = [];
@@ -633,10 +787,15 @@
       if (!video || video._streamBound) return;
       video._streamBound = true;
       video.addEventListener("error", function () {
-        if (streamMseRelease || video._ignoreError) return;
-        var err = video.error;
-        logStreamOnce("video-error", "stream video error code=" + (err && err.code != null ? err.code : "") + " message=" + (err && err.message ? err.message : ""));
-        onMseBroken("video-error");
+        try {
+          if (streamRenderFallbackSent || streamMseRelease || video._ignoreError) return;
+          var err = video.error;
+          var code = err && err.code;
+          var message = err && err.message ? err.message : "";
+          logVideoRenderState(video, code, message);
+          logBaselineSupport();
+          fallbackVideoRender("video-error");
+        } catch (err) {}
       });
       video.addEventListener("timeupdate", function () {
         if (video.currentTime > 0.01) markPresented(video);
@@ -697,7 +856,7 @@
     }
 
     function appendH264(bytes) {
-      if (streamMseStopped) return;
+      if (streamMseStopped || streamH264Blocked || streamRenderFallbackSent) return;
       if (typeof MediaSource === "undefined") {
         reportStreamFallback("no-mse");
         return;
@@ -719,7 +878,9 @@
       }
       streamSource = new MediaSource();
       video._ignoreError = false;
-      video.src = URL.createObjectURL(streamSource);
+      try { if (streamObjectUrl && URL.revokeObjectURL) URL.revokeObjectURL(streamObjectUrl); } catch (err) {}
+      streamObjectUrl = URL.createObjectURL(streamSource);
+      video.src = streamObjectUrl;
       streamSource.addEventListener("sourceended", function () {
         if (streamMseRelease || this !== streamSource) return;
         logStreamOnce("sourceended", "stream mse sourceended readyState=" + this.readyState + " buffered=" + bufferedText());
@@ -762,7 +923,10 @@
         streamBuffer.addEventListener("updateend", onUpdateEnd);
         streamBuffer.addEventListener("error", function () {
           logStreamOnce("update-error", "stream mse update error readyState=" + (streamSource && streamSource.readyState) + " buffered=" + bufferedText());
-          onMseBroken("update");
+          var render = false;
+          try { render = SpsphereCast.isVideoRenderFailure(video.error && video.error.code, video.error && video.error.message); } catch (err) {}
+          if (render) fallbackVideoRender("update");
+          else onMseBroken("update");
         });
         try {
           var playing = video.play();
@@ -776,6 +940,7 @@
       var bytes = new Uint8Array(buffer);
       if (mode === "jpeg-ws") {
         if (!SpsphereCast.jpegFrame(bytes)) {
+          if (streamRenderFallbackSent) return;
           streamRejected += 1;
           if (streamRejected >= 3 && !streamSawFrame) fallbackCanvas("not-jpeg");
           return;
@@ -855,10 +1020,16 @@
         return;
       }
       var hasMse = typeof MediaSource !== "undefined";
-      var choice = SpsphereCast.streamChoose(hasMse, msg || {});
+      var blocked = false;
+      try { blocked = ensureH264Block(); } catch (err) { blocked = streamH264Blocked; }
+      var asked = String((msg && msg.mode) || "");
+      var choice = SpsphereCast.streamChoose(hasMse && !blocked, msg || {});
       if (!choice) {
         sendLog("stream choice rejected");
         return;
+      }
+      if (blocked && /h264|^mse$/i.test(asked) && !streamRenderFallbackSent) {
+        fallbackVideoRender("remembered");
       }
       var modeChanged = streamDecodeMode !== choice.mode;
       streamMode = choice.mode;

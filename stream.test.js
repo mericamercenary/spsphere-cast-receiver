@@ -14,10 +14,10 @@ function assert(cond, message) {
   if (!cond) throw new Error(message || "assertion failed");
 }
 
-assert(Cast.RECEIVER_BUILD === "20261111.5", "receiver build is 20261111.5, got " + Cast.RECEIVER_BUILD);
+assert(Cast.RECEIVER_BUILD === "20261111.6", "receiver build is 20261111.6, got " + Cast.RECEIVER_BUILD);
 assert(Cast.TILE_FADE_MS === 2400, "photo fade stays 2400ms");
 assert(Cast.FOCUS_HANDOFF === 0.35, "focus handoff stays 0.35");
-assert(page.indexOf("player.js?v=20261111.5") >= 0, "index.html cache-busts 20261111.5");
+assert(page.indexOf("player.js?v=20261111.6") >= 0, "index.html cache-busts 20261111.6");
 assert(page.indexOf("function _drawGl") < 0, "the page does not rewrite the WebGL draw");
 assert(code.indexOf("TILE_FADE_MS = 2400") >= 0, "player keeps the 2400ms fade");
 assert(code.indexOf("FOCUS_HANDOFF = 0.35") >= 0, "player keeps the 0.35 handoff");
@@ -42,6 +42,20 @@ const firstBreak = Cast.mseFailureAction(0);
 assert(firstBreak.action === "reset" && firstBreak.message.type === "stream-reset" && firstBreak.message.maxW === 1280, "the first decode failure asks for a new init segment");
 const secondBreak = Cast.mseFailureAction(1);
 assert(secondBreak.action === "fallback" && secondBreak.message.reason === "mse-decode", "the second decode failure leaves H.264");
+assert(Cast.isVideoRenderFailure(4, "") === true, "MediaError code 4 is a render failure");
+assert(Cast.isVideoRenderFailure(3, "PIPELINE_ERROR_COULD_NOT_RENDER") === true, "the onn pipeline error is a render failure");
+assert(Cast.isVideoRenderFailure(2, "append failed") === false, "a mux append error is not a render failure");
+const renderBreak = Cast.streamFailureAction("video-error", 0);
+assert(renderBreak.action === "fallback" && renderBreak.message.type === "stream-fallback" && renderBreak.message.reason === "video-render", "a video error does not send stream-reset");
+assert(!renderBreak.message.maxW, "video-render fallback does not ask for another H.264 init");
+const remembered = Cast.streamProbe(false, true, false);
+assert(remembered.modes.length === 1 && remembered.modes[0] === "jpeg-ws" && remembered.h264 === false, "a TV that already failed H.264 probes jpeg only");
+assert(remembered.log.indexOf("h264=0") >= 0, "the probe log says h264=0");
+const blockKey = Cast.h264BlockKey("onn 1280x720");
+assert(blockKey.indexOf("spsphere.h264.block.") === 0, "the block is keyed for this device");
+const blockRecord = Cast.h264BlockRecord("video-render");
+assert(Cast.h264Blocked(JSON.stringify(blockRecord)) === true, "a stored video-render record blocks H.264");
+assert(Cast.h264Blocked("") === false && Cast.h264Blocked(null) === false, "an empty store still allows H.264");
 assert(Cast.fmp4Init(new Uint8Array([0, 0, 0, 16, 102, 116, 121, 112])) === true, "an ftyp box is an init segment");
 assert(Cast.fmp4Init(new Uint8Array([0, 0, 0, 1, 65, 0, 0])) === false, "a media sample is not an init segment");
 function bmff(type, payloadLen) {
@@ -86,7 +100,7 @@ assert(page.indexOf("isTypeSupported") >= 0, "the page logs isTypeSupported for 
 assert(page.indexOf("createImageBitmap") >= 0 && page.indexOf("requestAnimationFrame") >= 0, "JPEG decode is off the onload path");
 assert(page.indexOf("frame.onload") < 0, "JPEG frames are not waited on via img.onload");
 assert(page.indexOf("dropped=") >= 0 && page.indexOf("p50=") >= 0, "JPEG stats log decode time, fps, and drops");
-assert(probe.build === "20261111.5", "probe names the build");
+assert(probe.build === "20261111.6", "probe names the build");
 const jpegOnly = Cast.streamProbe(false, false);
 assert(jpegOnly.modes.length === 1 && jpegOnly.modes[0] === "jpeg-ws", "without MSE the probe is jpeg-ws only");
 assert(jpegOnly.log.indexOf("mse=0") >= 0, "the probe log records mse=0");
@@ -97,7 +111,7 @@ assert(chosen.ws === stream, "choice keeps a valid stream url");
 assert(chosen.choiceLog === "stream choice h264-mse", "choice log");
 assert(chosen.announceLog === "stream announce h264-mse", "announce log");
 assert(chosen.announce.type === "stream-announce" && chosen.announce.mode === "h264-mse", "announce message");
-assert(chosen.announce.build === "20261111.5", "announce names the build");
+assert(chosen.announce.build === "20261111.6", "announce names the build");
 assert(Cast.usableAvcCodec("avc1.42E01E") === "avc1.42E01E", "a baseline codec is usable");
 assert(Cast.usableAvcCodec("avc1.64001F") === "avc1.64001F", "a high-profile codec is usable");
 assert(Cast.usableAvcCodec("avc1.000001") === "", "an Annex-B start code is not a codec");
@@ -155,6 +169,11 @@ assert(page.indexOf("MediaSource") >= 0 && page.indexOf("addSourceBuffer") >= 0,
 assert(page.indexOf("STREAM_WAIT_MS = 5000") >= 0 && page.indexOf('fallbackCanvas("timeout")') >= 0, "no frame for 5s logs stream fallback canvas2d timeout");
 assert(page.indexOf('type: "stream-fallback"') >= 0, "an MSE failure tells the phone with stream-fallback");
 assert(page.indexOf("mse-decode") >= 0 && page.indexOf("mseFailureAction") >= 0, "a detached buffer rebuilds once, then falls back");
+assert(page.indexOf('reason: "video-render"') >= 0 && page.indexOf("fallbackVideoRender") >= 0, "a video element error falls back without stream-reset");
+assert(page.indexOf('onMseBroken("video-error")') < 0, "the video error path does not rebuild MSE");
+assert(page.indexOf("localStorage") >= 0 && page.indexOf("h264BlockKey") >= 0, "the H.264 failure is remembered on this TV");
+assert(page.indexOf("removeChild") >= 0 && page.indexOf("revokeObjectURL") >= 0, "the video element is removed and its object URL is revoked");
+assert(page.indexOf("avc1.42E01E") >= 0 && page.indexOf("avc1.42001F") >= 0, "the error path logs constrained-baseline support");
 assert(page.indexOf("requestVideoFrameCallback") >= 0 && page.indexOf("timeupdate") >= 0, "the video stays hidden until a frame is presented");
 assert(page.indexOf("function logStreamOnce") >= 0, "decoder errors are logged once");
 assert(page.indexOf("video.currentTime") >= 0 && page.indexOf("streamBuffer.remove") >= 0, "playback stays near the live edge and old ranges are removed");

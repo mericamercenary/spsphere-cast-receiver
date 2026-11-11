@@ -19,7 +19,7 @@
 (function (root) {
   // Baked into player.js and the script URL. A Cast WebView that cached
   // "player.js" will not reuse that file for "player.js?v=<this>".
-  var RECEIVER_BUILD = "20261111.5";
+  var RECEIVER_BUILD = "20261111.6";
   var ROTATIONS = 2;
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
@@ -5256,20 +5256,24 @@
     return text;
   }
 
-  function streamProbe(hasWebgl, hasMse) {
+  function streamProbe(hasWebgl, hasMse, h264Ok) {
     if (hasWebgl) return null;
+    var allowH264 = !!hasMse && h264Ok !== false;
     var modes = [];
-    if (hasMse) modes.push("h264-mse");
+    if (allowH264) modes.push("h264-mse");
     modes.push("jpeg-ws");
+    var log = "stream probe webgl=0 mse=" + (hasMse ? "1" : "0") + " modes=" + modes.join(",") + " max=1280x720";
+    if (h264Ok === false) log += " h264=0";
     return {
       type: "stream-probe",
       webgl: false,
       mse: !!hasMse,
+      h264: allowH264,
       modes: modes,
       maxW: 1280,
       maxH: 720,
       build: RECEIVER_BUILD,
-      log: "stream probe webgl=0 mse=" + (hasMse ? "1" : "0") + " modes=" + modes.join(",") + " max=1280x720",
+      log: log,
     };
   }
 
@@ -5286,6 +5290,47 @@
       action: "fallback",
       message: { type: "stream-fallback", reason: "mse-decode" },
     };
+  }
+
+  // Code 4 is MEDIA_ERR_SRC_NOT_SUPPORTED. On this TV that message is
+  // PIPELINE_ERROR_COULD_NOT_RENDER: the decoder cannot draw, so retrying
+  // H.264 on the same element kills the Cast process.
+  function isVideoRenderFailure(code, message) {
+    if (code === 4 || code === "4") return true;
+    var text = String(message || "");
+    if (/PIPELINE_ERROR_COULD_NOT_RENDER/i.test(text)) return true;
+    if (/MEDIA_ERR_SRC_NOT_SUPPORTED/i.test(text)) return true;
+    return false;
+  }
+
+  function streamFailureAction(kind, rebuilds) {
+    if (kind === "video-error" || kind === "video-render" || isVideoRenderFailure(null, kind)) {
+      return {
+        action: "fallback",
+        message: { type: "stream-fallback", reason: "video-render" },
+      };
+    }
+    return mseFailureAction(rebuilds);
+  }
+
+  function h264BlockKey(device) {
+    var id = String(device || "tv").replace(/[^a-zA-Z0-9._-]/g, "").slice(0, 64);
+    if (!id) id = "tv";
+    return "spsphere.h264.block." + id;
+  }
+
+  function h264BlockRecord(reason) {
+    return { reason: String(reason || "video-render"), at: Date.now() };
+  }
+
+  function h264Blocked(stored) {
+    if (stored == null || stored === "") return false;
+    if (typeof stored === "string") {
+      try { stored = JSON.parse(stored); } catch (error) {
+        return stored.indexOf("video-render") >= 0;
+      }
+    }
+    return !!(stored && stored.reason);
   }
 
   function fmp4Init(bytes) {
@@ -9789,6 +9834,11 @@
     codecFromAvcC: codecFromAvcC,
     usableAvcCodec: usableAvcCodec,
     mseFailureAction: mseFailureAction,
+    isVideoRenderFailure: isVideoRenderFailure,
+    streamFailureAction: streamFailureAction,
+    h264BlockKey: h264BlockKey,
+    h264BlockRecord: h264BlockRecord,
+    h264Blocked: h264Blocked,
     fmp4Init: fmp4Init,
     mp4Hex: mp4Hex,
     mp4BoxList: mp4BoxList,
