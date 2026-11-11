@@ -19,7 +19,7 @@
 (function (root) {
   // Baked into player.js and the script URL. A Cast WebView that cached
   // "player.js" will not reuse that file for "player.js?v=<this>".
-  var RECEIVER_BUILD = "20261111.6";
+  var RECEIVER_BUILD = "20261111.7";
   var ROTATIONS = 2;
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
@@ -5258,12 +5258,12 @@
 
   function streamProbe(hasWebgl, hasMse, h264Ok) {
     if (hasWebgl) return null;
-    var allowH264 = !!hasMse && h264Ok !== false;
+    var allowH264 = !!hasMse && h264Ok === true;
     var modes = [];
     if (allowH264) modes.push("h264-mse");
     modes.push("jpeg-ws");
     var log = "stream probe webgl=0 mse=" + (hasMse ? "1" : "0") + " modes=" + modes.join(",") + " max=1280x720";
-    if (h264Ok === false) log += " h264=0";
+    if (!allowH264) log += " h264=0";
     return {
       type: "stream-probe",
       webgl: false,
@@ -5826,6 +5826,19 @@
     } catch (error) {}
     if (flag === "mesh" || flag === "strips" || flag === "columns") return flag;
     return "";
+  }
+
+  // H.264 is an opt-in. The onn Cast renderer dies if a video element is
+  // display:none, so a normal no-WebGL TV stays on JPEG.
+  function spsH264Debug() {
+    try {
+      if (root.__spsH264) return true;
+      if (root.location) {
+        var q = String(root.location.search || "") + String(root.location.hash || "");
+        if (/(?:^|[?&#])spsdebug=h264(?:&|$)/i.test(q)) return true;
+      }
+    } catch (error) {}
+    return false;
   }
 
   function cpuRenderSize(clientW, clientH, frameMs, prevW) {
@@ -9839,6 +9852,7 @@
     h264BlockKey: h264BlockKey,
     h264BlockRecord: h264BlockRecord,
     h264Blocked: h264Blocked,
+    spsH264Debug: spsH264Debug,
     fmp4Init: fmp4Init,
     mp4Hex: mp4Hex,
     mp4BoxList: mp4BoxList,

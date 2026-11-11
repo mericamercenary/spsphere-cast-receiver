@@ -32,11 +32,17 @@
       border-top-color: #f2f5f7;
       animation: spsphere-spin 0.8s linear infinite;
     }
-    #streamVideo, #streamFrame {
+    #streamFrame {
       position: fixed; inset: 0; width: 100%; height: 100%; z-index: 3;
       object-fit: contain; background: #0b0d10; pointer-events: none;
     }
-    #streamVideo[hidden], #streamFrame[hidden] { display: none !important; }
+    #streamFrame[hidden] { display: none !important; }
+    /* Under the canvas, in layout, so a debug H.264 decoder has a real surface. */
+    #streamVideo.stream-live {
+      position: fixed; inset: 0; width: 100%; height: 100%; z-index: 0;
+      opacity: 1; display: block; visibility: visible;
+      object-fit: contain; background: #000; pointer-events: none;
+    }
     #mark {
       position: fixed; inset: 0; z-index: 4;
       background: #0b0d10;
@@ -66,12 +72,11 @@
 <body>
   <canvas id="view"></canvas>
   <div id="streamHold"></div>
-  <video id="streamVideo" hidden muted autoplay playsinline></video>
   <canvas id="streamFrame" hidden></canvas>
   <div id="mark" hidden><img class="logo" src="logo.png" alt="" /></div>
   <div id="busy"></div>
   <video id="wakeVideo" muted loop playsinline autoplay width="2" height="2" style="position:fixed;left:-99px;top:-99px;width:2px;height:2px;opacity:0.01;pointer-events:none"></video>
-  <script src="player.js?v=20261111.6"></script>
+  <script src="player.js?v=20261111.7"></script>
   <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
   <script>
     var NAMESPACE = "urn:x-cast:com.cameron.viewer360";
@@ -327,7 +332,10 @@
       var video = document.getElementById("streamVideo");
       var frame = document.getElementById("streamFrame");
       var hold = document.getElementById("streamHold");
-      if (video) video.hidden = which !== "video";
+      if (video) {
+        if (video.className === "stream-live") video.hidden = false;
+        else video.hidden = which !== "video";
+      }
       if (frame) frame.hidden = which !== "frame";
       if (hold) hold.className = "";
       if (streamWaitTimer) {
@@ -383,9 +391,9 @@
     function maybeProbeStream() {
       if (!player || !player.wantsPhoneStream || !player.wantsPhoneStream()) return;
       var hasMse = typeof MediaSource !== "undefined";
-      var blocked = false;
-      try { blocked = ensureH264Block(); } catch (err) { blocked = streamH264Blocked; }
-      var probe = SpsphereCast.streamProbe(false, hasMse, !blocked);
+      var experiment = false;
+      try { experiment = !!SpsphereCast.spsH264Debug(); } catch (err) {}
+      var probe = SpsphereCast.streamProbe(false, hasMse, experiment);
       if (!probe) return;
       if (!streamProbeLogged) {
         streamProbeLogged = true;
@@ -855,15 +863,52 @@
       }
     }
 
+    function ensureStreamVideo() {
+      if (!SpsphereCast.spsH264Debug()) return null;
+      var video = document.getElementById("streamVideo");
+      if (!video) {
+        video = document.createElement("video");
+        video.id = "streamVideo";
+        video.muted = true;
+        video.autoplay = true;
+        video.playsInline = true;
+        video.setAttribute("playsinline", "");
+        video.setAttribute("muted", "");
+        if (document.body.firstChild) document.body.insertBefore(video, document.body.firstChild);
+        else document.body.appendChild(video);
+      }
+      video.hidden = false;
+      video.className = "stream-live";
+      return video;
+    }
+
+    function logVideoBox(video) {
+      var boxW = 0;
+      var boxH = 0;
+      var display = "";
+      try {
+        var rect = video.getBoundingClientRect();
+        boxW = Math.round(rect.width || 0);
+        boxH = Math.round(rect.height || 0);
+        if (window.getComputedStyle) display = getComputedStyle(video).display || "";
+      } catch (err) {}
+      sendLog("stream video box=" + boxW + "x" + boxH + " display=" + display + " hidden=" + (video.hidden ? 1 : 0));
+    }
+
     function appendH264(bytes) {
+      if (!SpsphereCast.spsH264Debug()) return;
       if (streamMseStopped || streamH264Blocked || streamRenderFallbackSent) return;
       if (typeof MediaSource === "undefined") {
         reportStreamFallback("no-mse");
         return;
       }
-      var video = document.getElementById("streamVideo");
+      var video = ensureStreamVideo();
       if (!video) return;
       bindVideo(video);
+      if (!video._boxLogged) {
+        video._boxLogged = true;
+        setTimeout(function () { try { logVideoBox(video); } catch (err) {} }, 0);
+      }
       if (streamSampleN < 2) {
         logStreamOnce("sample-" + streamSampleN, "stream mse sample " + streamSampleN
           + " bytes=" + bytes.length
@@ -1020,16 +1065,21 @@
         return;
       }
       var hasMse = typeof MediaSource !== "undefined";
-      var blocked = false;
-      try { blocked = ensureH264Block(); } catch (err) { blocked = streamH264Blocked; }
+      var experiment = false;
+      try { experiment = !!SpsphereCast.spsH264Debug(); } catch (err) {}
       var asked = String((msg && msg.mode) || "");
-      var choice = SpsphereCast.streamChoose(hasMse && !blocked, msg || {});
+      var choice = SpsphereCast.streamChoose(hasMse && experiment, msg || {});
       if (!choice) {
         sendLog("stream choice rejected");
         return;
       }
-      if (blocked && /h264|^mse$/i.test(asked) && !streamRenderFallbackSent) {
-        fallbackVideoRender("remembered");
+      if (!experiment && /h264|^mse$/i.test(asked)) {
+        try { rememberH264Block(); } catch (err) {}
+        if (!streamRenderFallbackSent) {
+          streamRenderFallbackSent = true;
+          try { window.__castSend({ type: "stream-fallback", reason: "video-render" }); } catch (err) {}
+          try { sendLog("stream-fallback video-render"); } catch (err) {}
+        }
       }
       var modeChanged = streamDecodeMode !== choice.mode;
       streamMode = choice.mode;
