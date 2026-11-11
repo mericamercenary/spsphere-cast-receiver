@@ -18,6 +18,11 @@
       position: fixed; inset: 0; z-index: 2; display: none; pointer-events: none;
     }
     #busy.on { display: block; }
+    #streamVideo, #streamFrame {
+      position: fixed; inset: 0; width: 100%; height: 100%; z-index: 3;
+      object-fit: contain; background: #0b0d10; pointer-events: none;
+    }
+    #streamVideo[hidden], #streamFrame[hidden] { display: none !important; }
     #mark {
       position: fixed; inset: 0; z-index: 4;
       background: #0b0d10;
@@ -46,10 +51,12 @@
 </head>
 <body>
   <canvas id="view"></canvas>
+  <video id="streamVideo" hidden muted autoplay playsinline></video>
+  <img id="streamFrame" alt="" hidden>
   <div id="mark" hidden><img class="logo" src="logo.png" alt="" /></div>
   <div id="busy"></div>
   <video id="wakeVideo" muted loop playsinline autoplay width="2" height="2" style="position:fixed;left:-99px;top:-99px;width:2px;height:2px;opacity:0.01;pointer-events:none"></video>
-  <script src="player.js?v=20261110.1"></script>
+  <script src="player.js?v=20261111.1"></script>
   <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
   <script>
     var NAMESPACE = "urn:x-cast:com.cameron.viewer360";
@@ -130,10 +137,12 @@
           if (player.touchAim) player.touchAim(Date.now());
         }
       };
-      socket.onclose = function () {
+      socket.onclose = function (event) {
         if (socket !== aimSocket) return;
         aimSocket = null;
-        if (typeof sendLog === "function") sendLog("aim socket closed");
+        if (typeof sendLog === "function") {
+          sendLog(SpsphereCast.socketDisconnectLog("aim", aimUrl, event && event.code, event && event.reason));
+        }
         if (aimUrl && player && player.items && player.items.length) {
           setTimeout(function () {
             if (!aimSocket) connectAim(aimUrl);
@@ -228,13 +237,244 @@
       if (state === "visible") keepReceiverAwake();
     });
 
+    var streamMode = "";
+    var streamCodec = "";
+    var streamUrl = "";
+    var streamSocket = null;
+    var streamSawFrame = false;
+    var streamRetries = 0;
+    var streamRejected = 0;
+    var streamProbeLogged = false;
+    var streamQueue = [];
+    var streamSource = null;
+    var streamBuffer = null;
+    var streamFrameLogAt = 0;
+
+    function hideStreamSurface() {
+      var video = document.getElementById("streamVideo");
+      var frame = document.getElementById("streamFrame");
+      if (video) video.hidden = true;
+      if (frame) frame.hidden = true;
+      if (player) player._streamActive = false;
+    }
+
+    function showStreamSurface(which) {
+      var video = document.getElementById("streamVideo");
+      var frame = document.getElementById("streamFrame");
+      if (video) video.hidden = which !== "video";
+      if (frame) frame.hidden = which !== "frame";
+      if (player) player._streamActive = true;
+    }
+
+    function fallbackCanvas(why) {
+      hideStreamSurface();
+      streamSawFrame = false;
+      sendLog("stream fallback canvas2d" + (why ? " " + why : ""));
+    }
+
+    function maybeProbeStream() {
+      if (!player || !player.wantsPhoneStream || !player.wantsPhoneStream()) return;
+      var hasMse = typeof MediaSource !== "undefined";
+      var probe = SpsphereCast.streamProbe(false, hasMse);
+      if (!probe) return;
+      if (!streamProbeLogged) {
+        streamProbeLogged = true;
+        sendLog(probe.log);
+      }
+      window.__castSend({
+        type: probe.type,
+        webgl: probe.webgl,
+        mse: probe.mse,
+        modes: probe.modes,
+        build: probe.build,
+      });
+    }
+
+    function noteStreamFrame(mode, n) {
+      var first = !streamSawFrame;
+      streamSawFrame = true;
+      streamRetries = 0;
+      streamRejected = 0;
+      showStreamSurface(mode === "jpeg-ws" ? "frame" : "video");
+      var now = Date.now();
+      if (first || now - streamFrameLogAt >= 2000) {
+        streamFrameLogAt = now;
+        sendLog("stream frame " + mode + " bytes=" + n);
+      }
+    }
+
+    function paintJpeg(bytes) {
+      var frame = document.getElementById("streamFrame");
+      if (!frame || !window.URL || !URL.createObjectURL) return;
+      var blob = new Blob([bytes], { type: "image/jpeg" });
+      var url = URL.createObjectURL(blob);
+      var prev = frame._streamUrl;
+      frame.onload = function () {
+        if (prev) { try { URL.revokeObjectURL(prev); } catch (e) {} }
+      };
+      frame._streamUrl = url;
+      frame.src = url;
+      noteStreamFrame("jpeg-ws", bytes.length || 0);
+    }
+
+    function pumpH264() {
+      if (!streamBuffer || streamBuffer.updating || !streamQueue.length) return;
+      var next = streamQueue.shift();
+      var copy = next.buffer.slice(next.byteOffset, next.byteOffset + next.byteLength);
+      try {
+        streamBuffer.appendBuffer(copy);
+        noteStreamFrame("h264-mse", copy.byteLength);
+      } catch (err) {
+        if (!streamSawFrame) fallbackCanvas("append");
+        else sendLog("stream mse " + (err && err.message ? err.message : "append"));
+      }
+    }
+
+    function appendH264(bytes) {
+      if (typeof MediaSource === "undefined") {
+        fallbackCanvas("no-mse");
+        return;
+      }
+      var video = document.getElementById("streamVideo");
+      if (!video) return;
+      streamQueue.push(bytes);
+      if (streamSource) {
+        pumpH264();
+        return;
+      }
+      streamSource = new MediaSource();
+      video.src = URL.createObjectURL(streamSource);
+      streamSource.addEventListener("sourceopen", function () {
+        if (streamBuffer || !streamSource || streamSource.readyState !== "open") return;
+        var first = streamQueue.length ? streamQueue[0] : null;
+        var sniffed = (first && SpsphereCast.codecFromAvcC(first)) || streamCodec || "avc1.42E01E";
+        try {
+          streamBuffer = streamSource.addSourceBuffer('video/mp4; codecs="' + sniffed + '"');
+        } catch (err) {
+          sendLog("stream mse " + (err && err.message ? err.message : "open"));
+          fallbackCanvas("mse");
+          return;
+        }
+        try { streamBuffer.mode = "sequence"; } catch (err) {}
+        streamBuffer.addEventListener("updateend", pumpH264);
+        streamBuffer.addEventListener("error", function () {
+          if (!streamSawFrame) fallbackCanvas("mse");
+        });
+        try {
+          var playing = video.play();
+          if (playing && playing.catch) playing.catch(function () {});
+        } catch (err) {}
+        pumpH264();
+      });
+    }
+
+    function onStreamBytes(buffer, mode) {
+      var bytes = new Uint8Array(buffer);
+      if (mode === "jpeg-ws") {
+        if (!SpsphereCast.jpegFrame(bytes)) {
+          streamRejected += 1;
+          if (streamRejected >= 3 && !streamSawFrame) fallbackCanvas("not-jpeg");
+          return;
+        }
+        paintJpeg(bytes);
+        return;
+      }
+      if (mode === "h264-mse") appendH264(bytes);
+    }
+
+    function connectStream(url, mode) {
+      var safe = SpsphereCast.acceptStreamSocket(url);
+      if (!safe || !mode) return;
+      if (player && player.wantsPhoneStream && !player.wantsPhoneStream()) return;
+      if (safe === streamUrl && streamSocket && (streamSocket.readyState === 0 || streamSocket.readyState === 1)) return;
+      streamUrl = safe;
+      streamMode = mode;
+      if (streamSocket) {
+        var previous = streamSocket;
+        streamSocket = null;
+        try { previous.close(); } catch (e) {}
+      }
+      var socket;
+      try {
+        socket = new WebSocket(safe);
+      } catch (e) {
+        fallbackCanvas("open");
+        return;
+      }
+      streamSocket = socket;
+      socket.binaryType = "arraybuffer";
+      socket.onopen = function () {
+        if (socket !== streamSocket) return;
+        sendLog("stream socket open " + mode);
+      };
+      socket.onmessage = function (event) {
+        if (socket !== streamSocket || !event) return;
+        if (event.data instanceof ArrayBuffer) onStreamBytes(event.data, mode);
+      };
+      socket.onerror = function () {
+        if (socket !== streamSocket) return;
+        sendLog("stream socket error");
+      };
+      socket.onclose = function (event) {
+        if (socket !== streamSocket) return;
+        streamSocket = null;
+        sendLog(SpsphereCast.socketDisconnectLog("stream", streamUrl, event && event.code, event && event.reason));
+        if (!streamUrl || !streamMode) return;
+        if (!streamSawFrame) {
+          streamRetries += 1;
+          if (streamRetries <= 3) {
+            setTimeout(function () {
+              if (!streamSocket && streamUrl && streamMode) connectStream(streamUrl, streamMode);
+            }, 600);
+            return;
+          }
+          fallbackCanvas("closed");
+          return;
+        }
+        if (player && player.items && player.items.length) {
+          setTimeout(function () {
+            if (!streamSocket && streamUrl && streamMode) connectStream(streamUrl, streamMode);
+          }, 600);
+        }
+      };
+    }
+
+    function acceptStreamChoice(msg) {
+      if (!player || !player.wantsPhoneStream || !player.wantsPhoneStream()) {
+        sendLog("stream choice ignored webgl=1");
+        return;
+      }
+      var hasMse = typeof MediaSource !== "undefined";
+      var choice = SpsphereCast.streamChoose(hasMse, msg || {});
+      if (!choice) {
+        sendLog("stream choice rejected");
+        return;
+      }
+      streamMode = choice.mode;
+      streamCodec = choice.codec || "";
+      streamRetries = 0;
+      streamRejected = 0;
+      sendLog(choice.choiceLog);
+      window.__castSend(choice.announce);
+      sendLog(choice.announceLog);
+      var url = choice.ws || SpsphereCast.streamUrlFromAim(aimUrl);
+      if (url) connectStream(url, streamMode);
+    }
+
     function closeReceiver(reason) {
       sendLog("closing receiver: " + (reason || "stop"));
       aimUrl = "";
+      streamUrl = "";
+      streamMode = "";
       if (aimSocket) {
         try { aimSocket.close(); } catch (e) {}
         aimSocket = null;
       }
+      if (streamSocket) {
+        try { streamSocket.close(); } catch (e) {}
+        streamSocket = null;
+      }
+      hideStreamSurface();
       try {
         if (wakeVideo && typeof wakeVideo.pause === "function") wakeVideo.pause();
       } catch (e) {}
@@ -267,6 +507,20 @@
       if (msg.type === "queue") {
         keepReceiverAwake();
         connectAim(msg.ws);
+        if (msg.streamMode || msg.stream) {
+          acceptStreamChoice({
+            mode: msg.streamMode || msg.stream,
+            codec: msg.codec,
+            ws: msg.streamWs || "",
+            streamWs: msg.streamWs || "",
+          });
+        } else {
+          maybeProbeStream();
+          if (streamMode) {
+            var derived = SpsphereCast.streamUrlFromAim(msg.ws);
+            if (derived) connectStream(derived, streamMode);
+          }
+        }
         player.setSpeed(msg.speed || SpsphereCast.DEFAULT_DPS);
         player.setPace(msg.preload);
         if (msg.fadeMs) player.setSnapFadeMs(msg.fadeMs);
@@ -316,6 +570,10 @@
       } else if (msg.type === "retile") {
         player.retile(msg.id, msg.item);
         if (msg.ws) connectAim(msg.ws);
+        if (msg.ws && streamMode) {
+          var streamed = SpsphereCast.streamUrlFromAim(msg.ws);
+          if (streamed) connectStream(streamed, streamMode);
+        }
       } else if (msg.type === "fov") {
         player.setFov(msg.fov);
       } else if (msg.type === "pace") {
@@ -328,6 +586,7 @@
         sendLimits();
         sendCaps();
         if (player && player.announceBuild) player.announceBuild();
+        maybeProbeStream();
         sendLog("receiver ready (hello ack)");
         if (player && player.items && player.items.length) {
           window.__castSend({
@@ -343,6 +602,8 @@
         player.softReset("phone", msg.reason);
       } else if (msg.type === "debug") {
         player.setDebugTint(msg.on);
+      } else if (msg.type === "stream" || msg.type === "stream-choice") {
+        acceptStreamChoice(msg);
       }
     }
 
@@ -461,6 +722,7 @@
     context.start(options);
     keepReceiverAwake();
     sendLog("receiver boot " + (SpsphereCast.RECEIVER_BUILD || ""));
+    maybeProbeStream();
     window.__idle = new SpsphereCast.IdleGuard(function () { return Date.now(); });
     var lastAppStateAt = Date.now();
     setInterval(function () {

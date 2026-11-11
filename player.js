@@ -19,7 +19,7 @@
 (function (root) {
   // Baked into player.js and the script URL. A Cast WebView that cached
   // "player.js" will not reuse that file for "player.js?v=<this>".
-  var RECEIVER_BUILD = "20261110.1";
+  var RECEIVER_BUILD = "20261111.1";
   var ROTATIONS = 2;
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
@@ -4225,8 +4225,15 @@
     gl.useProgram(this._prog);
   };
 
+  Player.prototype.wantsPhoneStream = function () {
+    return !this._gl;
+  };
+
   Player.prototype.draw = function () {
     if (this._holdFrame && !this._snapOn) return;
+    // A connected phone stream is the picture. Canvas2D stays the fallback
+    // for the frames before that socket delivers anything.
+    if (this._cpuTiles && this._streamActive) return;
     if (this._cpuTiles) {
       var stamp = Date.now();
       if (this._cpuDrawStamp === stamp) {
@@ -5158,6 +5165,7 @@
     heartbeat: 1, ping: 1, speed: 1, aim: 1, chunk: 1, fetchError: 1,
     retile: 1, fov: 1, pace: 1, fade: 1, hello: 1, debug: 1,
     lan: 1, "soft-reset": 1, softReset: 1,
+    stream: 1, "stream-choice": 1,
   };
 
   function acceptAimSocket(url) {
@@ -5181,6 +5189,96 @@
     return url;
   }
 
+  // Phone-rendered picture for a TV with no WebGL. The socket is the aim
+  // URL with /stream in place of /aim. The phone chooses h264-mse or jpeg-ws
+  // after the probe. Canvas2D keeps drawing until a stream frame is shown.
+  function acceptStreamSocket(url) {
+    if (typeof url !== "string" || url.length > 300) return "";
+    var aim = url.replace(/\/stream$/, "/aim");
+    if (aim === url) return "";
+    if (!acceptAimSocket(aim)) return "";
+    return url;
+  }
+
+  function streamUrlFromAim(url) {
+    var aim = acceptAimSocket(url);
+    if (!aim) return "";
+    return aim.replace(/\/aim$/, "/stream");
+  }
+
+  function normalizeStreamMode(mode) {
+    var name = String(mode || "").toLowerCase();
+    if (name === "h264-mse" || name === "h264" || name === "mse") return "h264-mse";
+    if (name === "jpeg-ws" || name === "jpeg" || name === "jpegws") return "jpeg-ws";
+    return "";
+  }
+
+  function safeCodec(codec) {
+    var text = String(codec || "");
+    if (!/^[a-zA-Z0-9.]{4,32}$/.test(text)) return "";
+    return text;
+  }
+
+  function streamProbe(hasWebgl, hasMse) {
+    if (hasWebgl) return null;
+    var modes = [];
+    if (hasMse) modes.push("h264-mse");
+    modes.push("jpeg-ws");
+    return {
+      type: "stream-probe",
+      webgl: false,
+      mse: !!hasMse,
+      modes: modes,
+      build: RECEIVER_BUILD,
+      log: "stream probe webgl=0 mse=" + (hasMse ? "1" : "0") + " modes=" + modes.join(","),
+    };
+  }
+
+  function streamChoose(hasMse, request) {
+    var mode = normalizeStreamMode(request && request.mode);
+    if (!mode) return null;
+    if (mode === "h264-mse" && !hasMse) mode = "jpeg-ws";
+    var ws = "";
+    var given = request && (request.ws || request.streamWs) || "";
+    if (given) ws = acceptStreamSocket(given) || streamUrlFromAim(given);
+    var codec = safeCodec(request && request.codec);
+    return {
+      mode: mode,
+      codec: codec,
+      ws: ws,
+      choiceLog: "stream choice " + mode,
+      announce: { type: "stream-announce", mode: mode, codec: codec, build: RECEIVER_BUILD },
+      announceLog: "stream announce " + mode,
+    };
+  }
+
+  function codecFromAvcC(bytes) {
+    if (!bytes) return "";
+    var u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    for (var i = 0; i + 7 < u8.length; i++) {
+      if (u8[i] !== 97 || u8[i + 1] !== 118 || u8[i + 2] !== 99 || u8[i + 3] !== 67) continue;
+      function hex(n) {
+        var s = (n & 255).toString(16).toUpperCase();
+        return s.length < 2 ? "0" + s : s;
+      }
+      return safeCodec("avc1." + hex(u8[i + 5]) + hex(u8[i + 6]) + hex(u8[i + 7]));
+    }
+    return "";
+  }
+
+  function jpegFrame(bytes) {
+    if (!bytes) return false;
+    var u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    return u8.length >= 3 && u8[0] === 0xff && u8[1] === 0xd8 && u8[2] === 0xff;
+  }
+
+  function socketDisconnectLog(kind, remote, code, reason) {
+    var name = kind === "stream" ? "stream" : "aim";
+    var why = String(reason == null ? "" : reason).replace(/[\r\n]/g, " ").slice(0, 120);
+    var num = code == null ? "" : String(code);
+    return name + " disconnect remote=" + String(remote || "") + " code=" + num + " reason=" + why;
+  }
+
   function acceptCastMessage(msg) {
     if (msg == null) return null;
     if (typeof msg === "string") {
@@ -5193,7 +5291,8 @@
     }
     if (typeof msg !== "object" || typeof msg.type !== "string" || !MESSAGE_TYPES[msg.type]) return null;
     if (msg.ws != null && msg.ws !== "") {
-      var socket = acceptAimSocket(msg.ws);
+      var streamMsg = msg.type === "stream" || msg.type === "stream-choice";
+      var socket = streamMsg ? (acceptStreamSocket(msg.ws) || streamUrlFromAim(msg.ws)) : acceptAimSocket(msg.ws);
       if (!socket) return null;
       msg = Object.assign({}, msg, { ws: socket });
     }
@@ -9519,6 +9618,13 @@
     decodeSkip: decodeSkip,
     acceptCastMessage: acceptCastMessage,
     acceptAimSocket: acceptAimSocket,
+    acceptStreamSocket: acceptStreamSocket,
+    streamUrlFromAim: streamUrlFromAim,
+    streamProbe: streamProbe,
+    streamChoose: streamChoose,
+    codecFromAvcC: codecFromAvcC,
+    jpegFrame: jpegFrame,
+    socketDisconnectLog: socketDisconnectLog,
     httpUrl: httpUrl,
     stepIndex: stepIndex,
     applyPose: applyPose,
