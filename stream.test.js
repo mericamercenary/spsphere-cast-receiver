@@ -140,6 +140,18 @@ const clamped = Cast.streamReproject(
   1000, 500
 );
 assert(Math.abs(clamped.dx) <= 0.12 * 1000 + 0.01 && Math.abs(clamped.dy) <= 0.12 * 500 + 0.01, "a large aim change stays inside the overscan margin");
+const matchedPose = Cast.streamReproject(
+  { yaw: 15, pitch: -8, fov: 58.72, overscan: 0.15 },
+  { yaw: 15, pitch: -8, fov: 58.72 },
+  1280, 720
+);
+assert(matchedPose.px === 0, "aim equal to the frame pose is 0 px, got " + matchedPose.px);
+const oneDegree = Cast.streamReproject(
+  { yaw: 0, pitch: 0, fov: 58.72, overscan: 0.2 },
+  { yaw: 1, pitch: 0, fov: 58.72 },
+  1280, 720
+);
+assert(Math.abs(oneDegree.dx - 14.2) < 0.5, "1 degree at about 90 hfov on a 1280px canvas is about 14 px, got " + oneDegree.dx);
 const still = Cast.streamStillDraw({ yaw: 40, pitch: 10, fov: 90, overscan: 0.12 });
 assert(still.dx === 0 && still.dy === 0 && still.px === 0, "the default present does not follow aim");
 assert(Math.abs(still.crop - (0.12 / 1.24)) < 1e-9, "overscan crops overscan/(1+2*overscan) per side, got " + still.crop);
