@@ -77,7 +77,7 @@
   <div id="mark" hidden><img class="logo" src="logo.png" alt="" /></div>
   <div id="busy"></div>
   <video id="wakeVideo" muted loop playsinline autoplay width="2" height="2" style="position:fixed;left:-99px;top:-99px;width:2px;height:2px;opacity:0.01;pointer-events:none"></video>
-  <script src="player.js?v=20261111.10"></script>
+  <script src="player.js?v=20261111.11"></script>
   <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
   <script>
     var NAMESPACE = "urn:x-cast:com.cameron.viewer360";
@@ -297,15 +297,23 @@
     var jpegViewH = 0;
     var jpegWorker = undefined;
     var jpegJobs = {};
-    var jpegPipe = SpsphereCast.createJpegPipe();
+    var jpegFlight = 1;
+    try { if (SpsphereCast.spsJpegFlightDebug()) jpegFlight = 2; } catch (err) {}
+    var jpegPipe = SpsphereCast.createJpegPipe(jpegFlight);
     var jpegIntervals = [];
     var jpegShifts = [];
-    var jpegLastPresent = 0;
-    var jpegDrawnSeq = 0;
+    var jpegLastRaf = 0;
+    var jpegPresentFps = 0;
     var jpegPath = "";
+    var jpegBench = false;
+    try { jpegBench = !!SpsphereCast.spsJpegBenchDebug(); } catch (err) {}
     var jpegBenchIssued = 0;
     var jpegBenchWorker = [];
     var jpegBenchMain = [];
+    var jpegSampleW = 0;
+    var jpegSampleH = 0;
+    var jpegCapCheckedAt = 0;
+    var jpegCapSent = null;
     var STREAM_WAIT_MS = 5000;
 
     function hideStreamSurface() {
@@ -718,6 +726,7 @@
       if (now - jpegStatAt < 2000) return;
       var seconds = (now - jpegStatAt) / 1000;
       var fps = seconds > 0 ? Math.round(jpegPresented / seconds) : 0;
+      jpegPresentFps = fps;
       sendLog("stream present fps=" + fps
         + " jitter p95=" + jpegPercentile(jpegIntervals, 0.95)
         + " reproject px p95=" + jpegPercentile(jpegShifts, 0.95));
@@ -727,7 +736,7 @@
       jpegStatAt = now;
     }
 
-    function drawJpegFrame(now, fresh) {
+    function drawJpegFrame(now) {
       var canvas = document.getElementById("streamFrame");
       var bitmap = jpegBitmap;
       if (!canvas || !bitmap || !canvas.getContext) return;
@@ -762,13 +771,7 @@
         ctx.drawImage(bitmap, sx, sy, sw, sh, 0, 0, w, h);
         jpegShifts.push(0);
       }
-      if (fresh) {
-        var stamp = now || Date.now();
-        if (jpegLastPresent) jpegIntervals.push(Math.max(0, Math.round(stamp - jpegLastPresent)));
-        jpegLastPresent = stamp;
-        jpegPresented += 1;
-        jpegDrawnSeq = jpegPipe.shown;
-      }
+      jpegPresented += 1;
       if (!streamSawFrame) {
         streamSawFrame = true;
         streamRetries = 0;
@@ -782,14 +785,13 @@
     function jpegFrameLoop(t) {
       if (streamMode !== "jpeg-ws" && streamDecodeMode !== "jpeg-ws") {
         jpegRaf = 0;
+        jpegLastRaf = 0;
         return;
       }
-      var now = Date.now();
-      var fresh = !!(jpegBitmap && jpegPipe.shown !== jpegDrawnSeq);
-      var shift = false;
-      try { shift = !!SpsphereCast.spsReprojectDebug(); } catch (err) {}
-      if (fresh || (shift && jpegBitmap)) drawJpegFrame(now, fresh);
-      else logPresentStats(now);
+      if (jpegLastRaf) jpegIntervals.push(Math.max(0, Math.round(t - jpegLastRaf)));
+      jpegLastRaf = t || 0;
+      if (jpegBitmap) drawJpegFrame(Date.now());
+      else logPresentStats(Date.now());
       var raf = window.requestAnimationFrame || function (fn) { return setTimeout(function () { fn(Date.now()); }, 16); };
       jpegRaf = raf(jpegFrameLoop);
     }
@@ -815,27 +817,81 @@
     function onJpegDecoded(id, bitmap) {
       var meta = jpegJobs[id];
       delete jpegJobs[id];
-      if (meta) noteJpegSample(meta.path, bitmap ? Date.now() - meta.started : 1000);
+      if (meta && bitmap) noteJpegSample(meta.path, Date.now() - meta.started, bitmap.width, bitmap.height);
       applyJpegStep(SpsphereCast.jpegPipeFinish(jpegPipe, id, bitmap || null), meta && meta.pose);
     }
 
     function nextJpegPath() {
       if (jpegPath) return jpegPath;
-      if (!ensureJpegWorker()) return "main";
+      if (!jpegBench || !ensureJpegWorker()) {
+        jpegPath = ensureJpegWorker() ? "worker" : "main";
+        return jpegPath;
+      }
       var n = jpegBenchIssued;
       jpegBenchIssued += 1;
       return (n % 2 === 0) ? "worker" : "main";
     }
 
-    function noteJpegSample(path, ms) {
+    function noteJpegSample(path, ms, w, h) {
+      if (jpegBench && !jpegPath) {
+        if (path === "worker") jpegBenchWorker.push(ms);
+        else jpegBenchMain.push(ms);
+        if (jpegBenchWorker.length + jpegBenchMain.length >= 10) {
+          var choice = SpsphereCast.jpegPathChoice(jpegBenchWorker, jpegBenchMain);
+          jpegPath = choice.path;
+          sendLog(choice.log);
+        }
+      }
+      if (w > 0 && h > 0 && (w !== jpegSampleW || h !== jpegSampleH)) {
+        jpegDecodeSamples = [];
+        jpegSampleW = w;
+        jpegSampleH = h;
+        jpegCapCheckedAt = 0;
+      }
       jpegDecodeSamples.push(ms);
-      if (jpegPath) return;
-      if (path === "worker") jpegBenchWorker.push(ms);
-      else jpegBenchMain.push(ms);
-      if (jpegBenchWorker.length + jpegBenchMain.length < 10) return;
-      var choice = SpsphereCast.jpegPathChoice(jpegBenchWorker, jpegBenchMain);
-      jpegPath = choice.path;
-      sendLog(choice.log);
+      if (jpegDecodeSamples.length > 30) jpegDecodeSamples.splice(0, jpegDecodeSamples.length - 30);
+      maybeStreamCap(Date.now());
+    }
+
+    function maybeStreamCap(now) {
+      if (jpegDecodeSamples.length < 15) return;
+      if (jpegCapCheckedAt && now - jpegCapCheckedAt < 5000) return;
+      jpegCapCheckedAt = now;
+      var fps = jpegPresentFps;
+      if (jpegStatAt && jpegPresented > 0) {
+        var seconds = (now - jpegStatAt) / 1000;
+        if (seconds >= 0.4) fps = Math.round(jpegPresented / seconds);
+      }
+      var decision = SpsphereCast.streamCapDecision(
+        jpegPercentile(jpegDecodeSamples, 0.5),
+        jpegSampleW,
+        jpegSampleH,
+        fps,
+        jpegCapSent
+      );
+      if (!decision.send) return;
+      var text = JSON.stringify(decision.message);
+      var sent = false;
+      try {
+        if (streamSocket && streamSocket.readyState === 1) {
+          streamSocket.send(text);
+          sent = true;
+        }
+      } catch (err) {}
+      if (!sent) {
+        try {
+          if (aimSocket && aimSocket.readyState === 1) {
+            aimSocket.send(text);
+            sent = true;
+          }
+        } catch (err) {}
+      }
+      if (!sent) {
+        jpegCapCheckedAt = 0;
+        return;
+      }
+      jpegCapSent = { maxW: decision.message.maxW, maxH: decision.message.maxH };
+      sendLog(decision.log);
     }
 
     function ensureJpegWorker() {

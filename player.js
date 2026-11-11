@@ -19,7 +19,7 @@
 (function (root) {
   // Baked into player.js and the script URL. A Cast WebView that cached
   // "player.js" will not reuse that file for "player.js?v=<this>".
-  var RECEIVER_BUILD = "20261111.10";
+  var RECEIVER_BUILD = "20261111.11";
   var ROTATIONS = 2;
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
@@ -5566,16 +5566,20 @@
     };
   }
 
-  function createJpegPipe() {
-    return { inFlight: 0, seq: 0, pending: null, shown: 0, current: null };
+  function createJpegPipe(limit) {
+    return { inFlight: 0, seq: 0, pending: null, shown: 0, current: null, limit: limit === 2 ? 2 : 1 };
   }
 
-  // Start a decode while fewer than two are running. A third frame waits.
-  // A fourth replaces that waiting frame, so only the newest is kept.
+  function jpegPipeSlots(pipe) {
+    return pipe && pipe.limit === 2 ? 2 : 1;
+  }
+
+  // One decode runs at a time unless the pipe was opened with limit 2.
+  // Anything newer replaces the single waiting frame.
   function jpegPipePush(pipe, frame) {
     var id = ++pipe.seq;
     var job = { id: id, bytes: frame && frame.bytes, pose: frame && frame.pose || null };
-    if (pipe.inFlight < 2) {
+    if (pipe.inFlight < jpegPipeSlots(pipe)) {
       pipe.inFlight += 1;
       return { start: [job], dropped: 0 };
     }
@@ -5584,13 +5588,16 @@
     return { start: [], dropped: dropped };
   }
 
-  // Show this bitmap only when it is the newest one finished. Older
+  // The default pipe shows a bitmap only when no newer frame is already
+  // waiting. A 2-deep pipe shows the newest one that has finished. Older
   // bitmaps are returned so the caller can close them immediately.
   function jpegPipeFinish(pipe, id, bitmap) {
     if (pipe.inFlight > 0) pipe.inFlight -= 1;
     var close = [];
     var show = null;
-    if (bitmap && id >= pipe.shown) {
+    var slots = jpegPipeSlots(pipe);
+    var stale = slots < 2 && !!pipe.pending;
+    if (bitmap && !stale && id >= pipe.shown) {
       if (pipe.current && pipe.current !== bitmap) close.push(pipe.current);
       pipe.current = bitmap;
       pipe.shown = id;
@@ -5599,12 +5606,49 @@
       close.push(bitmap);
     }
     var next = null;
-    if (pipe.pending && pipe.inFlight < 2) {
+    if (pipe.pending && pipe.inFlight < slots) {
       next = pipe.pending;
       pipe.pending = null;
       pipe.inFlight += 1;
     }
     return { show: show, close: close, next: next };
+  }
+
+  // Pick the largest ladder step whose decode time, scaled by pixel
+  // count from the measured frame, is 30ms or less.
+  function streamCapDecision(decodeP50, frameW, frameH, presentFps, last) {
+    var ladder = [
+      { maxW: 1280, maxH: 720 },
+      { maxW: 960, maxH: 540 },
+      { maxW: 854, maxH: 480 },
+      { maxW: 640, maxH: 360 },
+    ];
+    var w = Number(frameW) > 0 ? Number(frameW) : 1280;
+    var h = Number(frameH) > 0 ? Number(frameH) : 720;
+    var pixels = w * h;
+    var p50 = Number(decodeP50) > 0 ? Number(decodeP50) : 0;
+    var chosen = ladder[ladder.length - 1];
+    for (var i = 0; i < ladder.length; i++) {
+      var rung = ladder[i];
+      var estimate = p50 * (rung.maxW * rung.maxH) / pixels;
+      if (estimate <= 30) {
+        chosen = rung;
+        break;
+      }
+    }
+    var message = {
+      type: "stream-cap",
+      maxW: chosen.maxW,
+      maxH: chosen.maxH,
+      decodeP50: Math.round(p50),
+      presentFps: Math.round(Number(presentFps) || 0),
+    };
+    var log = "stream cap sent " + chosen.maxW + "x" + chosen.maxH + " decode p50=" + message.decodeP50;
+    var changed = !last || last.maxW !== chosen.maxW || last.maxH !== chosen.maxH;
+    var send = false;
+    if (changed && p50 > 30) send = true;
+    if (changed && last && p50 <= 30) send = true;
+    return { send: send, message: message, log: log };
   }
 
   function jpegPathChoice(workerMs, mainMs) {
@@ -6001,6 +6045,28 @@
       if (root.location) {
         var q = String(root.location.search || "") + String(root.location.hash || "");
         if (/(?:^|[?&#])spsdebug=h264(?:&|$)/i.test(q)) return true;
+      }
+    } catch (error) {}
+    return false;
+  }
+
+  function spsJpegFlightDebug() {
+    try {
+      if (root.__spsFlight2) return true;
+      if (root.location) {
+        var q = String(root.location.search || "") + String(root.location.hash || "");
+        if (/(?:^|[?&#])spsdebug=flight2(?:&|$)/i.test(q)) return true;
+      }
+    } catch (error) {}
+    return false;
+  }
+
+  function spsJpegBenchDebug() {
+    try {
+      if (root.__spsJpegBench) return true;
+      if (root.location) {
+        var q = String(root.location.search || "") + String(root.location.hash || "");
+        if (/(?:^|[?&#])spsdebug=bench(?:&|$)/i.test(q)) return true;
       }
     } catch (error) {}
     return false;
@@ -10031,6 +10097,9 @@
     jpegPipePush: jpegPipePush,
     jpegPipeFinish: jpegPipeFinish,
     jpegPathChoice: jpegPathChoice,
+    streamCapDecision: streamCapDecision,
+    spsJpegFlightDebug: spsJpegFlightDebug,
+    spsJpegBenchDebug: spsJpegBenchDebug,
     spsReprojectDebug: spsReprojectDebug,
     socketDisconnectLog: socketDisconnectLog,
     httpUrl: httpUrl,

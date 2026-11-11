@@ -14,10 +14,10 @@ function assert(cond, message) {
   if (!cond) throw new Error(message || "assertion failed");
 }
 
-assert(Cast.RECEIVER_BUILD === "20261111.10", "receiver build is 20261111.10, got " + Cast.RECEIVER_BUILD);
+assert(Cast.RECEIVER_BUILD === "20261111.11", "receiver build is 20261111.11, got " + Cast.RECEIVER_BUILD);
 assert(Cast.TILE_FADE_MS === 2400, "photo fade stays 2400ms");
 assert(Cast.FOCUS_HANDOFF === 0.35, "focus handoff stays 0.35");
-assert(page.indexOf("player.js?v=20261111.10") >= 0, "index.html cache-busts 20261111.10");
+assert(page.indexOf("player.js?v=20261111.11") >= 0, "index.html cache-busts 20261111.11");
 assert(page.indexOf("function _drawGl") < 0, "the page does not rewrite the WebGL draw");
 assert(code.indexOf("TILE_FADE_MS = 2400") >= 0, "player keeps the 2400ms fade");
 assert(code.indexOf("FOCUS_HANDOFF = 0.35") >= 0, "player keeps the 0.35 handoff");
@@ -168,14 +168,26 @@ assert(page.indexOf("width: 100%") >= 0 && page.indexOf("height: 100%") >= 0, "C
 function bitmap(name) {
   return { name: name, width: 1280, height: 720, closed: false, close: function () { this.closed = true; } };
 }
-const pipe = Cast.createJpegPipe();
+const one = Cast.createJpegPipe();
+const firstJob = Cast.jpegPipePush(one, { bytes: new Uint8Array([1]), pose: null });
+const secondJob = Cast.jpegPipePush(one, { bytes: new Uint8Array([2]), pose: null });
+assert(one.limit === 1 && firstJob.start.length === 1 && secondJob.start.length === 0, "the default pipe decodes one frame at a time");
+assert(one.inFlight === 1, "a second frame waits, got " + one.inFlight);
+const thirdJob = Cast.jpegPipePush(one, { bytes: new Uint8Array([3]), pose: null });
+assert(thirdJob.dropped === 1, "the waiting frame is replaced by the latest");
+const staleBitmap = bitmap("stale");
+const staleDone = Cast.jpegPipeFinish(one, firstJob.start[0].id, staleBitmap);
+assert(staleDone.show === null && staleDone.close[0] === staleBitmap && staleDone.next, "a finished frame loses to the one waiting");
+staleDone.close[0].close();
+assert(staleBitmap.closed === true, "the stale bitmap is closed");
+const pipe = Cast.createJpegPipe(2);
 const started = [];
 for (let n = 0; n < 4; n++) {
   const step = Cast.jpegPipePush(pipe, { bytes: new Uint8Array([n]), pose: null });
   step.start.forEach(function (job) { started.push(job); });
   if (n < 2) assert(step.start.length === 1 && step.dropped === 0, "frame " + n + " starts immediately");
 }
-assert(pipe.inFlight === 2, "only two decodes are in flight, got " + pipe.inFlight);
+assert(pipe.inFlight === 2, "spsdebug=flight2 keeps two decodes in flight, got " + pipe.inFlight);
 assert(started.length === 2, "the third and fourth wait, got " + started.length);
 const fifth = Cast.jpegPipePush(pipe, { bytes: new Uint8Array([5]), pose: null });
 assert(fifth.dropped === 1 && fifth.start.length === 0, "a newer waiting frame replaces the older one");
@@ -194,19 +206,42 @@ assert(replaced.show === latest && replaced.close.indexOf(newer) >= 0, "the prev
 replaced.close.forEach(function (item) { item.close(); });
 assert(newer.closed === true, "the replaced bitmap is closed");
 assert(pipe.inFlight === 0 && pipe.current === latest, "the pipe keeps only the newest bitmap");
-assert(page.indexOf("jpegPipePush") >= 0 && page.indexOf("jpegPipeFinish") >= 0, "the page uses the two-deep decode pipe");
+assert(page.indexOf("jpegPipePush") >= 0 && page.indexOf("jpegPipeFinish") >= 0, "the page uses the decode pipe");
+assert(page.indexOf("var jpegFlight = 1") >= 0 && page.indexOf("spsJpegFlightDebug") >= 0, "two decodes in flight stay behind spsdebug=flight2");
 assert(page.indexOf("closeJpegBitmap(closed[i])") >= 0, "the page closes bitmaps the pipe retires");
 const mainWins = Cast.jpegPathChoice([40, 48, 55], [12, 18, 22]);
 assert(mainWins.path === "main" && mainWins.p50 === 18, "a slower worker loses to main-thread decode, got " + mainWins.log);
 assert(mainWins.log.indexOf("stream jpeg path=main decode p50=18") === 0, "the path log names main, got " + mainWins.log);
 const workerWins = Cast.jpegPathChoice([8, 11, 14], [30, 36, 40]);
 assert(workerWins.path === "worker" && workerWins.log.indexOf("stream jpeg path=worker decode p50=11") === 0, "a faster worker wins, got " + workerWins.log);
-assert(page.indexOf("jpegPathChoice") >= 0 && page.indexOf("jpegBenchIssued") >= 0, "the first frames time worker against main");
+assert(page.indexOf("jpegPathChoice") >= 0 && page.indexOf("spsJpegBenchDebug") >= 0, "the decode benchmark stays behind spsdebug=bench");
+assert(page.indexOf("ensureJpegWorker() ? \"worker\" : \"main\"") >= 0, "the default decode path is the worker");
+const slowCap = Cast.streamCapDecision(60, 1280, 720, 18, null);
+assert(slowCap.send === true, "a 60ms 720p decode asks the phone to shrink");
+assert(JSON.stringify(slowCap.message) === '{"type":"stream-cap","maxW":854,"maxH":480,"decodeP50":60,"presentFps":18}', "cap message got " + JSON.stringify(slowCap.message));
+assert(slowCap.log === "stream cap sent 854x480 decode p50=60", "cap log got " + slowCap.log);
+const again = Cast.streamCapDecision(60, 1280, 720, 18, { maxW: 854, maxH: 480 });
+assert(again.send === false, "the same cap is not sent again");
+const fit = Cast.streamCapDecision(45, 1280, 720, 22, null);
+assert(fit.message.maxW === 960 && fit.message.maxH === 540, "45ms at 720p steps to 960x540, got " + fit.message.maxW + "x" + fit.message.maxH);
+const fine = Cast.streamCapDecision(25, 1280, 720, 30, null);
+assert(fine.send === false && fine.message.maxW === 1280, "a decode under 30ms does not send a cap");
+const raised = Cast.streamCapDecision(20, 854, 480, 28, { maxW: 854, maxH: 480 });
+assert(raised.send === true && raised.message.maxW === 960 && raised.message.maxH === 540, "a faster decode raises the cap");
+assert(page.indexOf('type: "stream-cap"') < 0 || page.indexOf("streamCapDecision") >= 0, "the page builds the cap with streamCapDecision");
+assert(page.indexOf("streamSocket.send(text)") >= 0 && page.indexOf("aimSocket.send(text)") >= 0, "the cap goes out on the stream socket, then the aim socket");
+assert(page.indexOf("jpegDecodeSamples.length < 15") >= 0 && page.indexOf("jpegCapCheckedAt < 5000") >= 0, "the cap waits for 15 frames and then 5s");
+sandbox.location = { search: "?spsdebug=flight2", hash: "" };
+assert(Cast.spsJpegFlightDebug() === true, "spsdebug=flight2 opts into two decodes");
+sandbox.location = { search: "?spsdebug=bench", hash: "" };
+assert(Cast.spsJpegBenchDebug() === true && Cast.spsJpegFlightDebug() === false, "spsdebug=bench does not enable two decodes");
+sandbox.location = { search: "", hash: "" };
+assert(Cast.spsJpegFlightDebug() === false && Cast.spsJpegBenchDebug() === false, "flight2 and the benchmark are off by default");
 sandbox.location = { search: "?spsdebug=reproject", hash: "" };
 assert(Cast.spsReprojectDebug() === true, "spsdebug=reproject opts into aim shift");
 sandbox.location = { search: "", hash: "" };
 assert(Cast.spsReprojectDebug() === false, "aim shift is off by default");
-assert(probe.build === "20261111.10", "probe names the build");
+assert(probe.build === "20261111.11", "probe names the build");
 const jpegOnly = Cast.streamProbe(false, false);
 assert(jpegOnly.modes.length === 1 && jpegOnly.modes[0] === "jpeg-ws", "without MSE the probe is jpeg-ws only");
 assert(jpegOnly.log.indexOf("mse=0") >= 0, "the probe log records mse=0");
@@ -217,7 +252,7 @@ assert(chosen.ws === stream, "choice keeps a valid stream url");
 assert(chosen.choiceLog === "stream choice h264-mse", "choice log");
 assert(chosen.announceLog === "stream announce h264-mse", "announce log");
 assert(chosen.announce.type === "stream-announce" && chosen.announce.mode === "h264-mse", "announce message");
-assert(chosen.announce.build === "20261111.10", "announce names the build");
+assert(chosen.announce.build === "20261111.11", "announce names the build");
 assert(Cast.usableAvcCodec("avc1.42E01E") === "avc1.42E01E", "a baseline codec is usable");
 assert(Cast.usableAvcCodec("avc1.64001F") === "avc1.64001F", "a high-profile codec is usable");
 assert(Cast.usableAvcCodec("avc1.000001") === "", "an Annex-B start code is not a codec");
