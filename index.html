@@ -32,6 +32,7 @@
       border-top-color: #f2f5f7;
       animation: spsphere-spin 0.8s linear infinite;
     }
+    /* Backing store is at most 1280x720. These CSS sizes scale it to the panel. */
     #streamFrame {
       position: fixed; inset: 0; width: 100%; height: 100%; z-index: 3;
       object-fit: contain; background: #0b0d10; pointer-events: none;
@@ -76,7 +77,7 @@
   <div id="mark" hidden><img class="logo" src="logo.png" alt="" /></div>
   <div id="busy"></div>
   <video id="wakeVideo" muted loop playsinline autoplay width="2" height="2" style="position:fixed;left:-99px;top:-99px;width:2px;height:2px;opacity:0.01;pointer-events:none"></video>
-  <script src="player.js?v=20261111.9"></script>
+  <script src="player.js?v=20261111.10"></script>
   <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
   <script>
     var NAMESPACE = "urn:x-cast:com.cameron.viewer360";
@@ -285,8 +286,6 @@
     var streamRenderFallbackSent = false;
     var streamVideoTornDown = false;
     var streamObjectUrl = "";
-    var jpegPending = null;
-    var jpegDecoding = false;
     var jpegBitmap = null;
     var jpegDecodeSamples = [];
     var jpegPresented = 0;
@@ -297,14 +296,16 @@
     var jpegViewW = 0;
     var jpegViewH = 0;
     var jpegWorker = undefined;
-    var jpegJob = 0;
-    var jpegSeq = 0;
-    var jpegJobStarted = 0;
-    var jpegJobPose = null;
-    var jpegPendingPose = null;
+    var jpegJobs = {};
+    var jpegPipe = SpsphereCast.createJpegPipe();
     var jpegIntervals = [];
     var jpegShifts = [];
-    var jpegLastRaf = 0;
+    var jpegLastPresent = 0;
+    var jpegDrawnSeq = 0;
+    var jpegPath = "";
+    var jpegBenchIssued = 0;
+    var jpegBenchWorker = [];
+    var jpegBenchMain = [];
     var STREAM_WAIT_MS = 5000;
 
     function hideStreamSurface() {
@@ -370,7 +371,10 @@
       }
       hideStreamSurface();
       streamSawFrame = false;
-      closeJpegBitmap();
+      closeJpegBitmap(jpegBitmap);
+      jpegBitmap = null;
+      jpegPipe.current = null;
+      jpegPipe.pending = null;
       sendLog("stream fallback canvas2d" + (why ? " " + why : ""));
     }
 
@@ -693,18 +697,20 @@
       return sorted[index];
     }
 
-    function noteJpegSurface() {
+    function noteJpegSurface(frameW, frameH) {
       var canvas = document.getElementById("streamFrame");
-      var ratio = window.devicePixelRatio || 1;
-      var cssW = window.innerWidth || 1280;
-      var cssH = window.innerHeight || 720;
-      var w = Math.max(2, Math.round(cssW * ratio));
-      var h = Math.max(2, Math.round(cssH * ratio));
-      jpegViewW = w;
-      jpegViewH = h;
+      var size;
+      if (!(frameW > 0) || !(frameH > 0)) {
+        if (jpegViewW > 1 && jpegViewH > 1) size = { w: jpegViewW, h: jpegViewH };
+        else size = SpsphereCast.jpegCanvasSize(0, 0);
+      } else {
+        size = SpsphereCast.jpegCanvasSize(frameW, frameH);
+      }
+      jpegViewW = size.w;
+      jpegViewH = size.h;
       if (!canvas) return;
-      if (canvas.width !== w) canvas.width = w;
-      if (canvas.height !== h) canvas.height = h;
+      if (canvas.width !== size.w) canvas.width = size.w;
+      if (canvas.height !== size.h) canvas.height = size.h;
     }
 
     function logPresentStats(now) {
@@ -721,7 +727,7 @@
       jpegStatAt = now;
     }
 
-    function drawJpegFrame(now) {
+    function drawJpegFrame(now, fresh) {
       var canvas = document.getElementById("streamFrame");
       var bitmap = jpegBitmap;
       if (!canvas || !bitmap || !canvas.getContext) return;
@@ -756,7 +762,13 @@
         ctx.drawImage(bitmap, sx, sy, sw, sh, 0, 0, w, h);
         jpegShifts.push(0);
       }
-      jpegPresented += 1;
+      if (fresh) {
+        var stamp = now || Date.now();
+        if (jpegLastPresent) jpegIntervals.push(Math.max(0, Math.round(stamp - jpegLastPresent)));
+        jpegLastPresent = stamp;
+        jpegPresented += 1;
+        jpegDrawnSeq = jpegPipe.shown;
+      }
       if (!streamSawFrame) {
         streamSawFrame = true;
         streamRetries = 0;
@@ -770,12 +782,14 @@
     function jpegFrameLoop(t) {
       if (streamMode !== "jpeg-ws" && streamDecodeMode !== "jpeg-ws") {
         jpegRaf = 0;
-        jpegLastRaf = 0;
         return;
       }
-      if (jpegLastRaf) jpegIntervals.push(Math.round(t - jpegLastRaf));
-      jpegLastRaf = t;
-      drawJpegFrame(Date.now());
+      var now = Date.now();
+      var fresh = !!(jpegBitmap && jpegPipe.shown !== jpegDrawnSeq);
+      var shift = false;
+      try { shift = !!SpsphereCast.spsReprojectDebug(); } catch (err) {}
+      if (fresh || (shift && jpegBitmap)) drawJpegFrame(now, fresh);
+      else logPresentStats(now);
       var raf = window.requestAnimationFrame || function (fn) { return setTimeout(function () { fn(Date.now()); }, 16); };
       jpegRaf = raf(jpegFrameLoop);
     }
@@ -786,28 +800,42 @@
       jpegRaf = raf(jpegFrameLoop);
     }
 
-    function finishJpegDecode(bitmap, started, pose, job) {
-      if (job !== jpegJob) {
-        closeJpegBitmap(bitmap);
-        return;
+    function applyJpegStep(step, pose) {
+      var closed = step.close || [];
+      for (var i = 0; i < closed.length; i++) closeJpegBitmap(closed[i]);
+      if (step.show) {
+        jpegBitmap = step.show;
+        jpegFramePose = pose || null;
+        noteJpegSurface(step.show.width, step.show.height);
+        scheduleJpegDraw();
       }
-      if (!bitmap) {
-        jpegDecoding = false;
-        if (jpegPending) decodeLatestJpeg();
-        return;
-      }
-      jpegDecodeSamples.push(Date.now() - started);
-      jpegDecoding = false;
-      if (jpegPending) {
-        jpegDropped += 1;
-        closeJpegBitmap(bitmap);
-        decodeLatestJpeg();
-        return;
-      }
-      if (jpegBitmap && jpegBitmap !== bitmap) closeJpegBitmap(jpegBitmap);
-      jpegBitmap = bitmap;
-      jpegFramePose = pose || null;
-      scheduleJpegDraw();
+      if (step.next) startJpegJob(step.next);
+    }
+
+    function onJpegDecoded(id, bitmap) {
+      var meta = jpegJobs[id];
+      delete jpegJobs[id];
+      if (meta) noteJpegSample(meta.path, bitmap ? Date.now() - meta.started : 1000);
+      applyJpegStep(SpsphereCast.jpegPipeFinish(jpegPipe, id, bitmap || null), meta && meta.pose);
+    }
+
+    function nextJpegPath() {
+      if (jpegPath) return jpegPath;
+      if (!ensureJpegWorker()) return "main";
+      var n = jpegBenchIssued;
+      jpegBenchIssued += 1;
+      return (n % 2 === 0) ? "worker" : "main";
+    }
+
+    function noteJpegSample(path, ms) {
+      jpegDecodeSamples.push(ms);
+      if (jpegPath) return;
+      if (path === "worker") jpegBenchWorker.push(ms);
+      else jpegBenchMain.push(ms);
+      if (jpegBenchWorker.length + jpegBenchMain.length < 10) return;
+      var choice = SpsphereCast.jpegPathChoice(jpegBenchWorker, jpegBenchMain);
+      jpegPath = choice.path;
+      sendLog(choice.log);
     }
 
     function ensureJpegWorker() {
@@ -820,7 +848,7 @@
         var worker = new Worker(url);
         worker.onmessage = function (ev) {
           var data = ev.data || {};
-          finishJpegDecode(data.bitmap, jpegJobStarted, jpegJobPose, data.id);
+          onJpegDecoded(data.id, data.bitmap || null);
         };
         jpegWorker = worker;
         return worker;
@@ -830,39 +858,17 @@
       }
     }
 
-    function decodeLatestJpeg() {
-      var bytes = jpegPending;
-      var pose = jpegPendingPose;
-      jpegPending = null;
-      jpegPendingPose = null;
-      if (!bytes) {
-        jpegDecoding = false;
-        return;
-      }
-      jpegDecoding = true;
-      jpegJob = ++jpegSeq;
-      jpegJobStarted = Date.now();
-      jpegJobPose = pose;
-      var job = jpegJob;
-      var started = jpegJobStarted;
-      var worker = ensureJpegWorker();
-      if (worker) {
-        try {
-          var copy = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-          worker.postMessage({ id: job, bytes: copy }, [copy]);
-          return;
-        } catch (err) {}
-      }
+    function decodeJpegMain(job) {
+      var bytes = job.bytes;
       if (typeof createImageBitmap === "function") {
         var blob = new Blob([bytes], { type: "image/jpeg" });
         var pending = null;
         try { pending = createImageBitmap(blob); } catch (err) { pending = null; }
         if (pending && pending.then) {
           pending.then(function (bitmap) {
-            finishJpegDecode(bitmap, started, pose, job);
+            onJpegDecoded(job.id, bitmap);
           }).catch(function () {
-            jpegDecoding = false;
-            if (jpegPending) decodeLatestJpeg();
+            onJpegDecoded(job.id, null);
           });
           return;
         }
@@ -872,16 +878,36 @@
           var decoder = new ImageDecoder({ data: bytes, type: "image/jpeg" });
           decoder.decode().then(function (result) {
             try { if (decoder.close) decoder.close(); } catch (err) {}
-            finishJpegDecode(result && result.image, started, pose, job);
+            onJpegDecoded(job.id, result && result.image);
           }).catch(function () {
             try { if (decoder.close) decoder.close(); } catch (err) {}
-            jpegDecoding = false;
-            if (jpegPending) decodeLatestJpeg();
+            onJpegDecoded(job.id, null);
           });
           return;
         } catch (err) {}
       }
-      jpegDecoding = false;
+      onJpegDecoded(job.id, null);
+    }
+
+    function startJpegJob(job) {
+      var path = nextJpegPath();
+      jpegJobs[job.id] = { started: Date.now(), pose: job.pose || null, path: path };
+      if (path === "worker") {
+        var worker = ensureJpegWorker();
+        if (worker) {
+          try {
+            var bytes = job.bytes;
+            var copy = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+            worker.postMessage({ id: job.id, bytes: copy }, [copy]);
+            return;
+          } catch (err) {
+            jpegJobs[job.id].path = "main";
+          }
+        } else if (jpegJobs[job.id]) {
+          jpegJobs[job.id].path = "main";
+        }
+      }
+      decodeJpegMain(job);
     }
 
     function paintJpeg(bytes) {
@@ -892,10 +918,9 @@
         if (streamRejected >= 3 && !streamSawFrame) fallbackCanvas("not-jpeg");
         return;
       }
-      if (jpegPending) jpegDropped += 1;
-      jpegPending = parsed.jpeg;
-      jpegPendingPose = parsed.pose;
-      if (!jpegDecoding) decodeLatestJpeg();
+      var step = SpsphereCast.jpegPipePush(jpegPipe, { bytes: parsed.jpeg, pose: parsed.pose });
+      jpegDropped += step.dropped;
+      for (var i = 0; i < step.start.length; i++) startJpegJob(step.start[i]);
     }
 
     function markPresented(video) {

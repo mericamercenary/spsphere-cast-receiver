@@ -19,7 +19,7 @@
 (function (root) {
   // Baked into player.js and the script URL. A Cast WebView that cached
   // "player.js" will not reuse that file for "player.js?v=<this>".
-  var RECEIVER_BUILD = "20261111.9";
+  var RECEIVER_BUILD = "20261111.10";
   var ROTATIONS = 2;
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
@@ -5548,6 +5548,89 @@
     return { scale: 1, dx: 0, dy: 0, px: 0, crop: crop };
   }
 
+  // The JPEG canvas stays at the phone's frame size, and never above the
+  // 1280x720 stream. CSS scales that backing store up to the panel.
+  function jpegCanvasSize(frameW, frameH) {
+    var w = Number(frameW);
+    var h = Number(frameH);
+    if (!(w > 0) || !(h > 0)) return { w: 1280, h: 720 };
+    w = Math.round(w);
+    h = Math.round(h);
+    if (w < 2) w = 2;
+    if (h < 2) h = 2;
+    if (w <= 1280 && h <= 720) return { w: w, h: h };
+    var scale = Math.min(1280 / w, 720 / h);
+    return {
+      w: Math.max(2, Math.round(w * scale)),
+      h: Math.max(2, Math.round(h * scale)),
+    };
+  }
+
+  function createJpegPipe() {
+    return { inFlight: 0, seq: 0, pending: null, shown: 0, current: null };
+  }
+
+  // Start a decode while fewer than two are running. A third frame waits.
+  // A fourth replaces that waiting frame, so only the newest is kept.
+  function jpegPipePush(pipe, frame) {
+    var id = ++pipe.seq;
+    var job = { id: id, bytes: frame && frame.bytes, pose: frame && frame.pose || null };
+    if (pipe.inFlight < 2) {
+      pipe.inFlight += 1;
+      return { start: [job], dropped: 0 };
+    }
+    var dropped = pipe.pending ? 1 : 0;
+    pipe.pending = job;
+    return { start: [], dropped: dropped };
+  }
+
+  // Show this bitmap only when it is the newest one finished. Older
+  // bitmaps are returned so the caller can close them immediately.
+  function jpegPipeFinish(pipe, id, bitmap) {
+    if (pipe.inFlight > 0) pipe.inFlight -= 1;
+    var close = [];
+    var show = null;
+    if (bitmap && id >= pipe.shown) {
+      if (pipe.current && pipe.current !== bitmap) close.push(pipe.current);
+      pipe.current = bitmap;
+      pipe.shown = id;
+      show = bitmap;
+    } else if (bitmap) {
+      close.push(bitmap);
+    }
+    var next = null;
+    if (pipe.pending && pipe.inFlight < 2) {
+      next = pipe.pending;
+      pipe.pending = null;
+      pipe.inFlight += 1;
+    }
+    return { show: show, close: close, next: next };
+  }
+
+  function jpegPathChoice(workerMs, mainMs) {
+    function p50(samples) {
+      if (!samples || !samples.length) return 0;
+      var sorted = samples.slice().sort(function (a, b) { return a - b; });
+      var index = Math.ceil(0.5 * sorted.length) - 1;
+      if (index < 0) index = 0;
+      if (index >= sorted.length) index = sorted.length - 1;
+      return sorted[index];
+    }
+    var workerN = workerMs && workerMs.length ? workerMs.length : 0;
+    var mainN = mainMs && mainMs.length ? mainMs.length : 0;
+    var worker = workerN ? p50(workerMs) : 0;
+    var main = mainN ? p50(mainMs) : 0;
+    var path = "main";
+    var picked = main;
+    if (workerN && (!mainN || worker <= main)) {
+      path = "worker";
+      picked = worker;
+    }
+    var log = "stream jpeg path=" + path + " decode p50=" + Math.round(picked);
+    if (workerN && mainN) log += (path === "worker" ? " main=" : " worker=") + Math.round(path === "worker" ? main : worker);
+    return { path: path, p50: Math.round(picked), log: log };
+  }
+
   function spsReprojectDebug() {
     try {
       if (root.__spsReproject) return true;
@@ -9943,6 +10026,11 @@
     parseStreamFrame: parseStreamFrame,
     streamReproject: streamReproject,
     streamStillDraw: streamStillDraw,
+    jpegCanvasSize: jpegCanvasSize,
+    createJpegPipe: createJpegPipe,
+    jpegPipePush: jpegPipePush,
+    jpegPipeFinish: jpegPipeFinish,
+    jpegPathChoice: jpegPathChoice,
     spsReprojectDebug: spsReprojectDebug,
     socketDisconnectLog: socketDisconnectLog,
     httpUrl: httpUrl,

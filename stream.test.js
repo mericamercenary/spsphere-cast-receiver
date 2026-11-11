@@ -14,10 +14,10 @@ function assert(cond, message) {
   if (!cond) throw new Error(message || "assertion failed");
 }
 
-assert(Cast.RECEIVER_BUILD === "20261111.9", "receiver build is 20261111.9, got " + Cast.RECEIVER_BUILD);
+assert(Cast.RECEIVER_BUILD === "20261111.10", "receiver build is 20261111.10, got " + Cast.RECEIVER_BUILD);
 assert(Cast.TILE_FADE_MS === 2400, "photo fade stays 2400ms");
 assert(Cast.FOCUS_HANDOFF === 0.35, "focus handoff stays 0.35");
-assert(page.indexOf("player.js?v=20261111.9") >= 0, "index.html cache-busts 20261111.9");
+assert(page.indexOf("player.js?v=20261111.10") >= 0, "index.html cache-busts 20261111.10");
 assert(page.indexOf("function _drawGl") < 0, "the page does not rewrite the WebGL draw");
 assert(code.indexOf("TILE_FADE_MS = 2400") >= 0, "player keeps the 2400ms fade");
 assert(code.indexOf("FOCUS_HANDOFF = 0.35") >= 0, "player keeps the 0.35 handoff");
@@ -157,11 +157,56 @@ assert(still.dx === 0 && still.dy === 0 && still.px === 0, "the default present 
 assert(Math.abs(still.crop - (0.12 / 1.24)) < 1e-9, "overscan crops overscan/(1+2*overscan) per side, got " + still.crop);
 assert(Cast.streamStillDraw(null).crop === 0, "a bare JPEG is not cropped");
 assert(page.indexOf("spsReprojectDebug") >= 0 && page.indexOf("streamStillDraw") >= 0, "aim reprojection stays behind spsdebug=reproject");
+const panel = Cast.jpegCanvasSize(3840, 2160);
+assert(panel.w === 1280 && panel.h === 720, "a 4K backing store caps at 1280x720, got " + panel.w + "x" + panel.h);
+const frameSize = Cast.jpegCanvasSize(960, 540);
+assert(frameSize.w === 960 && frameSize.h === 540, "a smaller frame keeps its own size, got " + frameSize.w + "x" + frameSize.h);
+const wide = Cast.jpegCanvasSize(1280, 960);
+assert(wide.w === 960 && wide.h === 720, "a tall frame scales inside 1280x720, got " + wide.w + "x" + wide.h);
+assert(page.indexOf("jpegCanvasSize") >= 0 && page.indexOf("devicePixelRatio") < 0, "the JPEG canvas is not sized from the panel pixel ratio");
+assert(page.indexOf("width: 100%") >= 0 && page.indexOf("height: 100%") >= 0, "CSS scales the JPEG canvas to the screen");
+function bitmap(name) {
+  return { name: name, width: 1280, height: 720, closed: false, close: function () { this.closed = true; } };
+}
+const pipe = Cast.createJpegPipe();
+const started = [];
+for (let n = 0; n < 4; n++) {
+  const step = Cast.jpegPipePush(pipe, { bytes: new Uint8Array([n]), pose: null });
+  step.start.forEach(function (job) { started.push(job); });
+  if (n < 2) assert(step.start.length === 1 && step.dropped === 0, "frame " + n + " starts immediately");
+}
+assert(pipe.inFlight === 2, "only two decodes are in flight, got " + pipe.inFlight);
+assert(started.length === 2, "the third and fourth wait, got " + started.length);
+const fifth = Cast.jpegPipePush(pipe, { bytes: new Uint8Array([5]), pose: null });
+assert(fifth.dropped === 1 && fifth.start.length === 0, "a newer waiting frame replaces the older one");
+const newer = bitmap("newer");
+const older = bitmap("older");
+const won = Cast.jpegPipeFinish(pipe, started[1].id, newer);
+assert(won.show === newer && won.close.length === 0, "the newer in-flight frame is shown when it finishes first");
+assert(won.next && won.next.id > started[1].id, "the waiting newest frame starts when a slot frees");
+const late = Cast.jpegPipeFinish(pipe, started[0].id, older);
+assert(late.show === null && late.close.length === 1 && late.close[0] === older, "an older decode does not replace the newer frame");
+late.close[0].close();
+assert(older.closed === true, "the older bitmap is closed immediately");
+const latest = bitmap("latest");
+const replaced = Cast.jpegPipeFinish(pipe, won.next.id, latest);
+assert(replaced.show === latest && replaced.close.indexOf(newer) >= 0, "the previous bitmap is closed when a newer one wins");
+replaced.close.forEach(function (item) { item.close(); });
+assert(newer.closed === true, "the replaced bitmap is closed");
+assert(pipe.inFlight === 0 && pipe.current === latest, "the pipe keeps only the newest bitmap");
+assert(page.indexOf("jpegPipePush") >= 0 && page.indexOf("jpegPipeFinish") >= 0, "the page uses the two-deep decode pipe");
+assert(page.indexOf("closeJpegBitmap(closed[i])") >= 0, "the page closes bitmaps the pipe retires");
+const mainWins = Cast.jpegPathChoice([40, 48, 55], [12, 18, 22]);
+assert(mainWins.path === "main" && mainWins.p50 === 18, "a slower worker loses to main-thread decode, got " + mainWins.log);
+assert(mainWins.log.indexOf("stream jpeg path=main decode p50=18") === 0, "the path log names main, got " + mainWins.log);
+const workerWins = Cast.jpegPathChoice([8, 11, 14], [30, 36, 40]);
+assert(workerWins.path === "worker" && workerWins.log.indexOf("stream jpeg path=worker decode p50=11") === 0, "a faster worker wins, got " + workerWins.log);
+assert(page.indexOf("jpegPathChoice") >= 0 && page.indexOf("jpegBenchIssued") >= 0, "the first frames time worker against main");
 sandbox.location = { search: "?spsdebug=reproject", hash: "" };
 assert(Cast.spsReprojectDebug() === true, "spsdebug=reproject opts into aim shift");
 sandbox.location = { search: "", hash: "" };
 assert(Cast.spsReprojectDebug() === false, "aim shift is off by default");
-assert(probe.build === "20261111.9", "probe names the build");
+assert(probe.build === "20261111.10", "probe names the build");
 const jpegOnly = Cast.streamProbe(false, false);
 assert(jpegOnly.modes.length === 1 && jpegOnly.modes[0] === "jpeg-ws", "without MSE the probe is jpeg-ws only");
 assert(jpegOnly.log.indexOf("mse=0") >= 0, "the probe log records mse=0");
@@ -172,7 +217,7 @@ assert(chosen.ws === stream, "choice keeps a valid stream url");
 assert(chosen.choiceLog === "stream choice h264-mse", "choice log");
 assert(chosen.announceLog === "stream announce h264-mse", "announce log");
 assert(chosen.announce.type === "stream-announce" && chosen.announce.mode === "h264-mse", "announce message");
-assert(chosen.announce.build === "20261111.9", "announce names the build");
+assert(chosen.announce.build === "20261111.10", "announce names the build");
 assert(Cast.usableAvcCodec("avc1.42E01E") === "avc1.42E01E", "a baseline codec is usable");
 assert(Cast.usableAvcCodec("avc1.64001F") === "avc1.64001F", "a high-profile codec is usable");
 assert(Cast.usableAvcCodec("avc1.000001") === "", "an Annex-B start code is not a codec");
