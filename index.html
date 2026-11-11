@@ -71,7 +71,7 @@
   <div id="mark" hidden><img class="logo" src="logo.png" alt="" /></div>
   <div id="busy"></div>
   <video id="wakeVideo" muted loop playsinline autoplay width="2" height="2" style="position:fixed;left:-99px;top:-99px;width:2px;height:2px;opacity:0.01;pointer-events:none"></video>
-  <script src="player.js?v=20261111.3"></script>
+  <script src="player.js?v=20261111.4"></script>
   <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
   <script>
     var NAMESPACE = "urn:x-cast:com.cameron.viewer360";
@@ -267,6 +267,13 @@
     var streamFrameLogAt = 0;
     var streamWaitTimer = 0;
     var streamReplacing = false;
+    var streamLogged = {};
+    var streamMseStopped = false;
+    var streamMseRebuilds = 0;
+    var streamMseRelease = false;
+    var streamMseHandling = false;
+    var streamNeedInit = false;
+    var streamPresenting = false;
     var STREAM_WAIT_MS = 5000;
 
     function hideStreamSurface() {
@@ -293,7 +300,11 @@
       if (hold) hold.className = "on";
       streamWaitTimer = setTimeout(function () {
         streamWaitTimer = 0;
-        if (streamSawFrame || !streamMode) return;
+        if (streamPresenting || streamSawFrame || !streamMode) return;
+        if (streamMode === "h264-mse") {
+          onMseBroken("timeout");
+          return;
+        }
         fallbackCanvas("timeout");
       }, STREAM_WAIT_MS);
     }
@@ -336,14 +347,16 @@
     function releaseMse() {
       streamQueue = [];
       streamBuffer = null;
-      if (streamSource) {
+      var source = streamSource;
+      streamSource = null;
+      if (source) {
         try {
-          if (streamSource.readyState === "open") streamSource.endOfStream();
+          if (source.readyState === "open") source.endOfStream();
         } catch (e) {}
       }
-      streamSource = null;
       var video = document.getElementById("streamVideo");
       if (video) {
+        video._ignoreError = true;
         try {
           video.removeAttribute("src");
           if (video.load) video.load();
@@ -365,8 +378,16 @@
         webgl: probe.webgl,
         mse: probe.mse,
         modes: probe.modes,
+        maxW: probe.maxW,
+        maxH: probe.maxH,
         build: probe.build,
       });
+    }
+
+    function logStreamOnce(key, message) {
+      if (streamLogged[key]) return;
+      streamLogged[key] = true;
+      sendLog(message);
     }
 
     function noteStreamFrame(mode, n) {
@@ -380,6 +401,92 @@
         streamFrameLogAt = now;
         sendLog("stream frame " + mode + " bytes=" + n);
       }
+    }
+
+    function bufferedText() {
+      try {
+        if (!streamBuffer || !streamBuffer.buffered) return "none";
+        var parts = [];
+        for (var i = 0; i < streamBuffer.buffered.length; i++) {
+          parts.push(streamBuffer.buffered.start(i).toFixed(2) + "-" + streamBuffer.buffered.end(i).toFixed(2));
+        }
+        return parts.join(",") || "empty";
+      } catch (err) {
+        return "detached";
+      }
+    }
+
+    function mseAlive() {
+      if (streamMseStopped || streamMseRelease || !streamBuffer || !streamSource) return false;
+      if (streamSource.readyState !== "open") return false;
+      return true;
+    }
+
+    function pinLiveEdge() {
+      var video = document.getElementById("streamVideo");
+      if (!video || !streamBuffer || streamBuffer.updating || !streamBuffer.buffered || !streamBuffer.buffered.length) return;
+      var end = streamBuffer.buffered.end(streamBuffer.buffered.length - 1);
+      if (!(end > 0.2)) return;
+      if (video.currentTime < end - 0.5 || video.currentTime > end) {
+        try { video.currentTime = Math.max(0, end - 0.12); } catch (err) {}
+      }
+    }
+
+    function trimStreamBuffer() {
+      if (!streamBuffer || streamBuffer.updating || !streamBuffer.buffered || !streamBuffer.buffered.length) return false;
+      var start = streamBuffer.buffered.start(0);
+      var end = streamBuffer.buffered.end(streamBuffer.buffered.length - 1);
+      if (end - start < 6) return false;
+      try {
+        streamBuffer.remove(start, end - 2);
+        logStreamOnce("trim", "stream mse trim buffered=" + start.toFixed(2) + "-" + end.toFixed(2));
+        return true;
+      } catch (err) {
+        return false;
+      }
+    }
+
+    function onMseBroken(why) {
+      if (streamMseRelease || streamMseHandling) return;
+      if (streamMode !== "h264-mse" && streamDecodeMode !== "h264-mse") return;
+      streamMseHandling = true;
+      streamMseStopped = true;
+      streamQueue = [];
+      streamPresenting = false;
+      streamSawFrame = false;
+      var video = document.getElementById("streamVideo");
+      if (video) video.hidden = true;
+      if (player) {
+        player._streamActive = false;
+        player._streamHold = true;
+        player._streamHoldPainted = false;
+      }
+      var hold = document.getElementById("streamHold");
+      if (hold) hold.className = "on";
+      var step = SpsphereCast.mseFailureAction(streamMseRebuilds);
+      if (step.action === "reset") {
+        streamMseRebuilds += 1;
+        logStreamOnce("reset-" + why, "stream mse reset " + why + " readyState=" + (streamSource && streamSource.readyState) + " buffered=" + bufferedText());
+        try { window.__castSend(step.message); } catch (err) {}
+        sendLog("stream-reset max=" + step.message.maxW + "x" + step.message.maxH);
+        streamMseRelease = true;
+        releaseMse();
+        streamMseRelease = false;
+        streamMseStopped = false;
+        streamNeedInit = true;
+        streamMseHandling = false;
+        holdForStream();
+        return;
+      }
+      streamMseRelease = true;
+      releaseMse();
+      streamMseRelease = false;
+      streamMode = "jpeg-ws";
+      streamDecodeMode = "jpeg-ws";
+      streamMseStopped = false;
+      streamMseHandling = false;
+      reportStreamFallback("mse-decode");
+      holdForStream();
     }
 
     function paintJpeg(bytes) {
@@ -396,57 +503,125 @@
       noteStreamFrame("jpeg-ws", bytes.length || 0);
     }
 
+    function markPresented(video) {
+      if (!video || (streamMode !== "h264-mse" && streamDecodeMode !== "h264-mse")) return;
+      pinLiveEdge();
+      if (streamPresenting) return;
+      streamPresenting = true;
+      streamSawFrame = true;
+      showStreamSurface("video");
+      logStreamOnce("present", "stream frame h264-mse presenting");
+    }
+
+    function bindVideo(video) {
+      if (!video || video._streamBound) return;
+      video._streamBound = true;
+      video.addEventListener("error", function () {
+        if (streamMseRelease || video._ignoreError) return;
+        var err = video.error;
+        logStreamOnce("video-error", "stream video error code=" + (err && err.code != null ? err.code : "") + " message=" + (err && err.message ? err.message : ""));
+        onMseBroken("video-error");
+      });
+      video.addEventListener("timeupdate", function () {
+        if (video.currentTime > 0.01) markPresented(video);
+      });
+      if (typeof video.requestVideoFrameCallback === "function") {
+        var tick = function () {
+          markPresented(video);
+          if (streamMode === "h264-mse" && video.requestVideoFrameCallback) video.requestVideoFrameCallback(tick);
+        };
+        video.requestVideoFrameCallback(tick);
+      }
+    }
+
+    function onUpdateEnd() {
+      if (!mseAlive()) return;
+      if (trimStreamBuffer()) return;
+      pinLiveEdge();
+      pumpH264();
+    }
+
     function pumpH264() {
-      if (!streamBuffer || streamBuffer.updating || !streamQueue.length) return;
+      if (!mseAlive() || streamBuffer.updating || !streamQueue.length) return;
+      while (streamNeedInit && streamQueue.length && !SpsphereCast.fmp4Init(streamQueue[0])) {
+        streamQueue.shift();
+        logStreamOnce("wait-init", "stream mse waiting init");
+      }
+      if (!streamQueue.length || !mseAlive() || streamBuffer.updating) return;
       var next = streamQueue.shift();
+      if (streamNeedInit) streamNeedInit = false;
       var copy = next.buffer.slice(next.byteOffset, next.byteOffset + next.byteLength);
       try {
         streamBuffer.appendBuffer(copy);
-        noteStreamFrame("h264-mse", copy.byteLength);
       } catch (err) {
-        sendLog("stream mse " + (err && err.message ? err.message : "append"));
-        if (!streamSawFrame) reportStreamFallback("mse");
+        var message = err && err.message ? err.message : "append";
+        if (err && err.name === "QuotaExceededError") {
+          logStreamOnce("quota", "stream mse quota buffered=" + bufferedText());
+          streamQueue.unshift(next);
+          if (trimStreamBuffer()) return;
+        }
+        logStreamOnce("append", "stream mse append " + message + " readyState=" + (streamSource && streamSource.readyState) + " buffered=" + bufferedText());
+        onMseBroken("append");
       }
     }
 
     function appendH264(bytes) {
+      if (streamMseStopped) return;
       if (typeof MediaSource === "undefined") {
         reportStreamFallback("no-mse");
         return;
       }
       var video = document.getElementById("streamVideo");
       if (!video) return;
+      bindVideo(video);
       streamQueue.push(bytes);
       if (streamSource) {
         pumpH264();
         return;
       }
       streamSource = new MediaSource();
+      video._ignoreError = false;
       video.src = URL.createObjectURL(streamSource);
+      streamSource.addEventListener("sourceended", function () {
+        if (streamMseRelease || this !== streamSource) return;
+        logStreamOnce("sourceended", "stream mse sourceended readyState=" + this.readyState + " buffered=" + bufferedText());
+        onMseBroken("sourceended");
+      });
+      streamSource.addEventListener("sourceclose", function () {
+        if (streamMseRelease || this !== streamSource) return;
+        logStreamOnce("sourceclose", "stream mse sourceclose readyState=" + this.readyState + " buffered=" + bufferedText());
+        onMseBroken("sourceclose");
+      });
       streamSource.addEventListener("sourceopen", function () {
         if (streamBuffer || !streamSource || streamSource.readyState !== "open") return;
+        logStreamOnce("sourceopen", "stream mse sourceopen readyState=" + streamSource.readyState);
         var first = streamQueue.length ? streamQueue[0] : null;
         var sniffed = first && SpsphereCast.codecFromAvcC(first);
         var requested = SpsphereCast.usableAvcCodec(streamCodec);
         var codec = sniffed || requested || (streamCodec ? "" : "avc1.42E01E");
         if (!codec) {
-          sendLog("stream mse unsupported codec " + (streamCodec || "none"));
+          logStreamOnce("codec", "stream mse unsupported codec " + (streamCodec || "none"));
           reportStreamFallback("mse");
+          streamMseRelease = true;
           releaseMse();
+          streamMseRelease = false;
           return;
         }
         try {
           streamBuffer = streamSource.addSourceBuffer('video/mp4; codecs="' + codec + '"');
         } catch (err) {
-          sendLog("stream mse " + (err && err.message ? err.message : "open"));
+          logStreamOnce("open", "stream mse " + (err && err.message ? err.message : "open"));
           reportStreamFallback("mse");
+          streamMseRelease = true;
           releaseMse();
+          streamMseRelease = false;
           return;
         }
         try { streamBuffer.mode = "sequence"; } catch (err) {}
-        streamBuffer.addEventListener("updateend", pumpH264);
+        streamBuffer.addEventListener("updateend", onUpdateEnd);
         streamBuffer.addEventListener("error", function () {
-          if (!streamSawFrame) reportStreamFallback("mse");
+          logStreamOnce("update-error", "stream mse update error readyState=" + (streamSource && streamSource.readyState) + " buffered=" + bufferedText());
+          onMseBroken("update");
         });
         try {
           var playing = video.play();
@@ -550,6 +725,13 @@
       streamRetries = 0;
       streamRejected = 0;
       if (modeChanged) streamSawFrame = false;
+      if (choice.mode === "h264-mse" && modeChanged) {
+        streamMseRebuilds = 0;
+        streamMseStopped = false;
+        streamPresenting = false;
+        streamNeedInit = false;
+        streamLogged = {};
+      }
       if (!streamSawFrame && player) {
         player._streamHold = true;
         player._streamActive = false;

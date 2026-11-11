@@ -19,7 +19,7 @@
 (function (root) {
   // Baked into player.js and the script URL. A Cast WebView that cached
   // "player.js" will not reuse that file for "player.js?v=<this>".
-  var RECEIVER_BUILD = "20261111.3";
+  var RECEIVER_BUILD = "20261111.4";
   var ROTATIONS = 2;
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
@@ -5266,9 +5266,37 @@
       webgl: false,
       mse: !!hasMse,
       modes: modes,
+      maxW: 1280,
+      maxH: 720,
       build: RECEIVER_BUILD,
-      log: "stream probe webgl=0 mse=" + (hasMse ? "1" : "0") + " modes=" + modes.join(","),
+      log: "stream probe webgl=0 mse=" + (hasMse ? "1" : "0") + " modes=" + modes.join(",") + " max=1280x720",
     };
+  }
+
+  // One rebuild asks the phone for a new init segment and a keyframe at
+  // 720p. The next failure leaves H.264 and the phone should send JPEG.
+  function mseFailureAction(rebuilds) {
+    if ((rebuilds | 0) < 1) {
+      return {
+        action: "reset",
+        message: { type: "stream-reset", reason: "mse-decode", maxW: 1280, maxH: 720 },
+      };
+    }
+    return {
+      action: "fallback",
+      message: { type: "stream-fallback", reason: "mse-decode" },
+    };
+  }
+
+  function fmp4Init(bytes) {
+    if (!bytes) return false;
+    var u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    var n = u8.length < 96 ? u8.length : 96;
+    for (var i = 0; i + 3 < n; i++) {
+      if (u8[i] === 102 && u8[i + 1] === 116 && u8[i + 2] === 121 && u8[i + 3] === 112) return true;
+      if (u8[i] === 109 && u8[i + 1] === 111 && u8[i + 2] === 111 && u8[i + 3] === 118) return true;
+    }
+    return false;
   }
 
   function streamChoose(hasMse, request) {
@@ -5284,7 +5312,7 @@
       codec: codec,
       ws: ws,
       choiceLog: "stream choice " + mode,
-      announce: { type: "stream-announce", mode: mode, codec: codec, build: RECEIVER_BUILD },
+      announce: { type: "stream-announce", mode: mode, codec: codec, maxW: 1280, maxH: 720, build: RECEIVER_BUILD },
       announceLog: "stream announce " + mode,
     };
   }
@@ -9665,6 +9693,8 @@
     streamChoose: streamChoose,
     codecFromAvcC: codecFromAvcC,
     usableAvcCodec: usableAvcCodec,
+    mseFailureAction: mseFailureAction,
+    fmp4Init: fmp4Init,
     jpegFrame: jpegFrame,
     socketDisconnectLog: socketDisconnectLog,
     httpUrl: httpUrl,
