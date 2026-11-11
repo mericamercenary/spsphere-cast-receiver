@@ -19,7 +19,7 @@
 (function (root) {
   // Baked into player.js and the script URL. A Cast WebView that cached
   // "player.js" will not reuse that file for "player.js?v=<this>".
-  var RECEIVER_BUILD = "20261111.11";
+  var RECEIVER_BUILD = "20261111.12";
   var ROTATIONS = 2;
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
@@ -5588,16 +5588,14 @@
     return { start: [], dropped: dropped };
   }
 
-  // The default pipe shows a bitmap only when no newer frame is already
-  // waiting. A 2-deep pipe shows the newest one that has finished. Older
-  // bitmaps are returned so the caller can close them immediately.
+  // A finished bitmap is shown whenever it is newer than the one on
+  // screen. A frame that is only waiting is the one that can be dropped,
+  // and the single waiting slot already keeps the latest of those.
   function jpegPipeFinish(pipe, id, bitmap) {
     if (pipe.inFlight > 0) pipe.inFlight -= 1;
     var close = [];
     var show = null;
-    var slots = jpegPipeSlots(pipe);
-    var stale = slots < 2 && !!pipe.pending;
-    if (bitmap && !stale && id >= pipe.shown) {
+    if (bitmap && id >= pipe.shown) {
       if (pipe.current && pipe.current !== bitmap) close.push(pipe.current);
       pipe.current = bitmap;
       pipe.shown = id;
@@ -5606,7 +5604,7 @@
       close.push(bitmap);
     }
     var next = null;
-    if (pipe.pending && pipe.inFlight < slots) {
+    if (pipe.pending && pipe.inFlight < jpegPipeSlots(pipe)) {
       next = pipe.pending;
       pipe.pending = null;
       pipe.inFlight += 1;
@@ -5614,19 +5612,23 @@
     return { show: show, close: close, next: next };
   }
 
-  // Pick the largest ladder step whose decode time, scaled by pixel
-  // count from the measured frame, is 30ms or less.
-  function streamCapDecision(decodeP50, frameW, frameH, presentFps, last) {
+  // Shrink only when unique frames shown are under 26 fps and decode
+  // p50 is over 30ms. A lower cap already sent this session is lifted
+  // back to 1280x720 once unique fps has stayed at 28 or more for 5s.
+  function streamCapDecision(input, last) {
     var ladder = [
       { maxW: 1280, maxH: 720 },
       { maxW: 960, maxH: 540 },
       { maxW: 854, maxH: 480 },
       { maxW: 640, maxH: 360 },
     ];
-    var w = Number(frameW) > 0 ? Number(frameW) : 1280;
-    var h = Number(frameH) > 0 ? Number(frameH) : 720;
+    input = input || {};
+    var w = Number(input.frameW) > 0 ? Number(input.frameW) : 1280;
+    var h = Number(input.frameH) > 0 ? Number(input.frameH) : 720;
     var pixels = w * h;
-    var p50 = Number(decodeP50) > 0 ? Number(decodeP50) : 0;
+    var p50 = Number(input.decodeP50) > 0 ? Number(input.decodeP50) : 0;
+    var unique = Number(input.uniqueFps) || 0;
+    var fastMs = Number(input.fastMs) || 0;
     var chosen = ladder[ladder.length - 1];
     for (var i = 0; i < ladder.length; i++) {
       var rung = ladder[i];
@@ -5636,19 +5638,20 @@
         break;
       }
     }
+    var lowerSent = !!(last && (last.maxW < 1280 || last.maxH < 720));
+    if (lowerSent && unique >= 28 && fastMs >= 5000) chosen = { maxW: 1280, maxH: 720 };
     var message = {
       type: "stream-cap",
       maxW: chosen.maxW,
       maxH: chosen.maxH,
       decodeP50: Math.round(p50),
-      presentFps: Math.round(Number(presentFps) || 0),
+      presentFps: Math.round(unique),
     };
-    var log = "stream cap sent " + chosen.maxW + "x" + chosen.maxH + " decode p50=" + message.decodeP50;
+    var log = "stream cap sent " + chosen.maxW + "x" + chosen.maxH + " decode p50=" + message.decodeP50 + " reason=unique-fps";
     var changed = !last || last.maxW !== chosen.maxW || last.maxH !== chosen.maxH;
-    var send = false;
-    if (changed && p50 > 30) send = true;
-    if (changed && last && p50 <= 30) send = true;
-    return { send: send, message: message, log: log };
+    var shrink = unique < 26 && p50 > 30 && (chosen.maxW < w || chosen.maxH < h);
+    var lift = lowerSent && unique >= 28 && fastMs >= 5000 && chosen.maxW === 1280 && chosen.maxH === 720;
+    return { send: !!(changed && (shrink || lift)), message: message, log: log };
   }
 
   function jpegPathChoice(workerMs, mainMs) {

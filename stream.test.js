@@ -14,10 +14,10 @@ function assert(cond, message) {
   if (!cond) throw new Error(message || "assertion failed");
 }
 
-assert(Cast.RECEIVER_BUILD === "20261111.11", "receiver build is 20261111.11, got " + Cast.RECEIVER_BUILD);
+assert(Cast.RECEIVER_BUILD === "20261111.12", "receiver build is 20261111.12, got " + Cast.RECEIVER_BUILD);
 assert(Cast.TILE_FADE_MS === 2400, "photo fade stays 2400ms");
 assert(Cast.FOCUS_HANDOFF === 0.35, "focus handoff stays 0.35");
-assert(page.indexOf("player.js?v=20261111.11") >= 0, "index.html cache-busts 20261111.11");
+assert(page.indexOf("player.js?v=20261111.12") >= 0, "index.html cache-busts 20261111.12");
 assert(page.indexOf("function _drawGl") < 0, "the page does not rewrite the WebGL draw");
 assert(code.indexOf("TILE_FADE_MS = 2400") >= 0, "player keeps the 2400ms fade");
 assert(code.indexOf("FOCUS_HANDOFF = 0.35") >= 0, "player keeps the 0.35 handoff");
@@ -101,7 +101,8 @@ assert(Cast.mp4Hex(new Uint8Array([0x0a, 0xff]), 2) === "0aff", "sample hex is t
 assert(page.indexOf("isTypeSupported") >= 0, "the page logs isTypeSupported for the mime");
 assert(page.indexOf("createImageBitmap") >= 0 && page.indexOf("requestAnimationFrame") >= 0, "JPEG decode is off the onload path");
 assert(page.indexOf("frame.onload") < 0, "JPEG frames are not waited on via img.onload");
-assert(page.indexOf("stream present fps=") >= 0 && page.indexOf("jitter p95=") >= 0 && page.indexOf("reproject px p95=") >= 0, "presentation stats log fps, jitter, and reprojection");
+assert(page.indexOf("stream present unique fps=") >= 0 && page.indexOf("received fps=") >= 0 && page.indexOf("decoded fps=") >= 0, "presentation stats count unique frames, not redraws");
+assert(page.indexOf("discarded=") >= 0 && page.indexOf("gap p95=") >= 0 && page.indexOf("reproject px p95=") >= 0, "presentation stats log discards, frame-id gap, and reprojection");
 assert(page.indexOf("OffscreenCanvas") >= 0 && page.indexOf("new Worker") >= 0, "JPEG decode can leave the main thread");
 function spf1Frame(yaw, pitch, fov, overscan, id, timeMs) {
   const buf = new ArrayBuffer(38);
@@ -175,11 +176,10 @@ assert(one.limit === 1 && firstJob.start.length === 1 && secondJob.start.length 
 assert(one.inFlight === 1, "a second frame waits, got " + one.inFlight);
 const thirdJob = Cast.jpegPipePush(one, { bytes: new Uint8Array([3]), pose: null });
 assert(thirdJob.dropped === 1, "the waiting frame is replaced by the latest");
-const staleBitmap = bitmap("stale");
-const staleDone = Cast.jpegPipeFinish(one, firstJob.start[0].id, staleBitmap);
-assert(staleDone.show === null && staleDone.close[0] === staleBitmap && staleDone.next, "a finished frame loses to the one waiting");
-staleDone.close[0].close();
-assert(staleBitmap.closed === true, "the stale bitmap is closed");
+const finished = bitmap("finished");
+const shownAnyway = Cast.jpegPipeFinish(one, firstJob.start[0].id, finished);
+assert(shownAnyway.show === finished && shownAnyway.close.length === 0, "a finished frame is shown even when a newer one is waiting");
+assert(shownAnyway.next && shownAnyway.next.id === firstJob.start[0].id + 2, "the newest waiting frame is what starts next, got " + (shownAnyway.next && shownAnyway.next.id));
 const pipe = Cast.createJpegPipe(2);
 const started = [];
 for (let n = 0; n < 4; n++) {
@@ -216,18 +216,46 @@ const workerWins = Cast.jpegPathChoice([8, 11, 14], [30, 36, 40]);
 assert(workerWins.path === "worker" && workerWins.log.indexOf("stream jpeg path=worker decode p50=11") === 0, "a faster worker wins, got " + workerWins.log);
 assert(page.indexOf("jpegPathChoice") >= 0 && page.indexOf("spsJpegBenchDebug") >= 0, "the decode benchmark stays behind spsdebug=bench");
 assert(page.indexOf("ensureJpegWorker() ? \"worker\" : \"main\"") >= 0, "the default decode path is the worker");
-const slowCap = Cast.streamCapDecision(60, 1280, 720, 18, null);
-assert(slowCap.send === true, "a 60ms 720p decode asks the phone to shrink");
-assert(JSON.stringify(slowCap.message) === '{"type":"stream-cap","maxW":854,"maxH":480,"decodeP50":60,"presentFps":18}', "cap message got " + JSON.stringify(slowCap.message));
-assert(slowCap.log === "stream cap sent 854x480 decode p50=60", "cap log got " + slowCap.log);
-const again = Cast.streamCapDecision(60, 1280, 720, 18, { maxW: 854, maxH: 480 });
+function shownPerSecond(arrivalMs, decodeMs, durationMs) {
+  const pipe = Cast.createJpegPipe();
+  let t = 0;
+  let nextIn = 0;
+  let busy = null;
+  let shown = 0;
+  while (t <= durationMs) {
+    while (nextIn <= t && nextIn <= durationMs) {
+      const step = Cast.jpegPipePush(pipe, { bytes: new Uint8Array([nextIn + 1]) });
+      if (step.start.length && !busy) busy = { id: step.start[0].id, until: t + decodeMs };
+      nextIn += arrivalMs;
+    }
+    if (busy && t >= busy.until) {
+      const step = Cast.jpegPipeFinish(pipe, busy.id, { id: busy.id });
+      if (step.show) shown += 1;
+      busy = null;
+      if (step.next) busy = { id: step.next.id, until: t + decodeMs };
+    }
+    t += 1;
+  }
+  return shown / (durationMs / 1000);
+}
+const paced = shownPerSecond(33, 56, 3000);
+assert(paced >= 15, "33ms arrivals and a 56ms decode still show at least 15 unique frames per second, got " + paced.toFixed(1));
+const redraws = Cast.streamCapDecision({ decodeP50: 56, frameW: 1280, frameH: 720, uniqueFps: 30, fastMs: 0 }, null);
+assert(redraws.send === false, "decode p50=56 with unique fps 30 does not send a cap");
+const slowCap = Cast.streamCapDecision({ decodeP50: 56, frameW: 1280, frameH: 720, uniqueFps: 17, fastMs: 0 }, null);
+assert(slowCap.send === true, "unique fps 17 and decode p50=56 asks the phone to shrink");
+assert(JSON.stringify(slowCap.message) === '{"type":"stream-cap","maxW":854,"maxH":480,"decodeP50":56,"presentFps":17}', "cap message got " + JSON.stringify(slowCap.message));
+assert(slowCap.log === "stream cap sent 854x480 decode p50=56 reason=unique-fps", "cap log got " + slowCap.log);
+const again = Cast.streamCapDecision({ decodeP50: 56, frameW: 1280, frameH: 720, uniqueFps: 17, fastMs: 0 }, { maxW: 854, maxH: 480 });
 assert(again.send === false, "the same cap is not sent again");
-const fit = Cast.streamCapDecision(45, 1280, 720, 22, null);
-assert(fit.message.maxW === 960 && fit.message.maxH === 540, "45ms at 720p steps to 960x540, got " + fit.message.maxW + "x" + fit.message.maxH);
-const fine = Cast.streamCapDecision(25, 1280, 720, 30, null);
-assert(fine.send === false && fine.message.maxW === 1280, "a decode under 30ms does not send a cap");
-const raised = Cast.streamCapDecision(20, 854, 480, 28, { maxW: 854, maxH: 480 });
-assert(raised.send === true && raised.message.maxW === 960 && raised.message.maxH === 540, "a faster decode raises the cap");
+const fit = Cast.streamCapDecision({ decodeP50: 45, frameW: 1280, frameH: 720, uniqueFps: 22, fastMs: 0 }, null);
+assert(fit.send === true && fit.message.maxW === 960 && fit.message.maxH === 540, "45ms at 720p steps to 960x540, got " + fit.message.maxW + "x" + fit.message.maxH);
+const fine = Cast.streamCapDecision({ decodeP50: 25, frameW: 1280, frameH: 720, uniqueFps: 30, fastMs: 0 }, null);
+assert(fine.send === false, "a decode under 30ms does not send a cap");
+const tooSoon = Cast.streamCapDecision({ decodeP50: 20, frameW: 854, frameH: 480, uniqueFps: 30, fastMs: 2000 }, { maxW: 854, maxH: 480 });
+assert(tooSoon.send === false, "unique fps has to hold at 28 or more before the cap lifts");
+const raised = Cast.streamCapDecision({ decodeP50: 20, frameW: 854, frameH: 480, uniqueFps: 30, fastMs: 5000 }, { maxW: 854, maxH: 480 });
+assert(raised.send === true && raised.message.maxW === 1280 && raised.message.maxH === 720, "a held unique fps of 28 or more lifts the cap to 1280x720");
 assert(page.indexOf('type: "stream-cap"') < 0 || page.indexOf("streamCapDecision") >= 0, "the page builds the cap with streamCapDecision");
 assert(page.indexOf("streamSocket.send(text)") >= 0 && page.indexOf("aimSocket.send(text)") >= 0, "the cap goes out on the stream socket, then the aim socket");
 assert(page.indexOf("jpegDecodeSamples.length < 15") >= 0 && page.indexOf("jpegCapCheckedAt < 5000") >= 0, "the cap waits for 15 frames and then 5s");
@@ -241,7 +269,7 @@ sandbox.location = { search: "?spsdebug=reproject", hash: "" };
 assert(Cast.spsReprojectDebug() === true, "spsdebug=reproject opts into aim shift");
 sandbox.location = { search: "", hash: "" };
 assert(Cast.spsReprojectDebug() === false, "aim shift is off by default");
-assert(probe.build === "20261111.11", "probe names the build");
+assert(probe.build === "20261111.12", "probe names the build");
 const jpegOnly = Cast.streamProbe(false, false);
 assert(jpegOnly.modes.length === 1 && jpegOnly.modes[0] === "jpeg-ws", "without MSE the probe is jpeg-ws only");
 assert(jpegOnly.log.indexOf("mse=0") >= 0, "the probe log records mse=0");
@@ -252,7 +280,7 @@ assert(chosen.ws === stream, "choice keeps a valid stream url");
 assert(chosen.choiceLog === "stream choice h264-mse", "choice log");
 assert(chosen.announceLog === "stream announce h264-mse", "announce log");
 assert(chosen.announce.type === "stream-announce" && chosen.announce.mode === "h264-mse", "announce message");
-assert(chosen.announce.build === "20261111.11", "announce names the build");
+assert(chosen.announce.build === "20261111.12", "announce names the build");
 assert(Cast.usableAvcCodec("avc1.42E01E") === "avc1.42E01E", "a baseline codec is usable");
 assert(Cast.usableAvcCodec("avc1.64001F") === "avc1.64001F", "a high-profile codec is usable");
 assert(Cast.usableAvcCodec("avc1.000001") === "", "an Annex-B start code is not a codec");
