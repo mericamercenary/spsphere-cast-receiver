@@ -5588,8 +5588,9 @@
     return { start: [], dropped: dropped, id: id };
   }
 
-  // Show using the TV's arrival number. The phone's SPF1 id (uint32 at
-  // offset 22) is ignored: a stuck 0 would hide every later frame.
+  // Show using the TV's arrival number, compared with the frame on screen.
+  // A frame that is only waiting must not hide the one that just finished.
+  // The phone's SPF1 id at offset 22 is ignored here.
   function jpegPresentChoice(arrivalId, shownArrival, phoneFrameId) {
     if (phoneFrameId === undefined) phoneFrameId = null;
     if (shownArrival == null) return true;
