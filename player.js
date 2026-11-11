@@ -19,7 +19,7 @@
 (function (root) {
   // Baked into player.js and the script URL. A Cast WebView that cached
   // "player.js" will not reuse that file for "player.js?v=<this>".
-  var RECEIVER_BUILD = "20261111.2";
+  var RECEIVER_BUILD = "20261111.3";
   var ROTATIONS = 2;
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
@@ -447,7 +447,9 @@
     this._tileDraw = [];
     this._dropBases();
     this.entries = entries;
-    this._useTiles = entries.some(function (entry) { return entry.tiles && entry.tiles.length; });
+    this._useTiles = entries.some(function (entry) {
+      return (entry.tiles && entry.tiles.length) || (entry.overview && entry.overview.url);
+    });
     this.ids = entries.map(function (entry) { return entry.id; });
     this.items = entries.map(function (entry) { return entry.url; });
     this.poses = entries.map(poseOf);
@@ -514,7 +516,7 @@
       self.items.push(entry.url);
       self.poses.push(poseOf(entry));
       self._tex.push(null);
-      if (entry.tiles && entry.tiles.length) self._useTiles = true;
+      if ((entry.tiles && entry.tiles.length) || (entry.overview && entry.overview.url)) self._useTiles = true;
       if (self._useTiles) self.images.push(null);
       else self.images.push(self._loadEntry(entry));
     });
@@ -727,10 +729,11 @@
   // like the receiver was reloading.
   Player.prototype.announceBuild = function (force) {
     if (this._buildAnnounced) return;
-    var now = Date.now();
     this._flushSends();
-    if (!force && this._announcedAt && now - this._announcedAt < 4000) return;
-    this._announcedAt = now;
+    // One unforced copy, then one copy when a sender is actually listening.
+    // Canvas logs must not print this again every few seconds.
+    if (!force && this._announcedAt) return;
+    this._announcedAt = Date.now();
     if (!this._probeNote) {
       this._probeNote = withBuild("upload probe skipped reason=" + (this._setupReason || "not-run"));
     }
@@ -4236,8 +4239,8 @@
     if (this._holdFrame && !this._snapOn) return;
     // A connected phone stream is the picture. Canvas2D stays the fallback
     // for the frames before that socket delivers anything.
-    if (this._cpuTiles && this._streamActive) return;
-    if (this._cpuTiles && this._streamHold) {
+    if (this._cpuTiles && (this._streamActive || this._streamHold)) {
+      if (!(this._streamHold && !this._streamActive)) return;
       resize(this.canvas);
       var holdCtx = this._cpuContext();
       var holdCanvas = this._cpuCanvas || this.canvas;
@@ -7323,13 +7326,15 @@
     this.loaded = [];
     this.shown = false;
     if (this.hooks.onStatus) this.hooks.onStatus("busy");
-    if (!entry || !entry.tiles || !entry.tiles.length) {
+    var hasTiles = !!(entry && entry.tiles && entry.tiles.length);
+    var hasOverview = !!(entry && entry.overview && entry.overview.url);
+    if (!entry || (!hasTiles && !hasOverview)) {
       this._failOrRetry("no tiles");
       return;
     }
     if (this.hooks.onEntry) this.hooks.onEntry(entry);
-    this._beginOverview();
-    this._requestCurrent();
+    if (hasOverview) this._beginOverview();
+    if (hasTiles) this._requestCurrent();
   };
 
   PhotoSession.prototype.preload = function (entry) {
@@ -7419,6 +7424,7 @@
 
   PhotoSession.prototype.resume = function () {
     if (!this.entry || this.pending) return;
+    if (!this.entry.tiles || !this.entry.tiles.length) return;
     if (!this.budgetFull && this.shown) return;
     this.budgetFull = false;
     var done = this.tileOrder ? this.orderPos >= this.tileOrder.length : this.tileIndex >= this.entry.tiles.length;
@@ -8024,9 +8030,10 @@
         // Refill the pipe before deciding the photo is shown, so the next
         // strip is already requested while another one is still arriving.
         self._requestCurrent();
-        var finished = !self.entry || (self.tileOrder
+        var tileCount = (self.entry && self.entry.tiles && self.entry.tiles.length) || 0;
+        var finished = !self.entry || !tileCount || (self.tileOrder
           ? self.orderPos >= self.tileOrder.length
-          : self.tileIndex >= self.entry.tiles.length);
+          : self.tileIndex >= tileCount);
         var band = self._bandLoaded();
         if (self.pending && !band && !finished) return;
         if (finished || band) {

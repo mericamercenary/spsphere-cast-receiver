@@ -14,15 +14,15 @@ function assert(cond, message) {
   if (!cond) throw new Error(message || "assertion failed");
 }
 
-assert(Cast.RECEIVER_BUILD === "20261111.2", "receiver build is 20261111.2, got " + Cast.RECEIVER_BUILD);
+assert(Cast.RECEIVER_BUILD === "20261111.3", "receiver build is 20261111.3, got " + Cast.RECEIVER_BUILD);
 assert(Cast.TILE_FADE_MS === 2400, "photo fade stays 2400ms");
 assert(Cast.FOCUS_HANDOFF === 0.35, "focus handoff stays 0.35");
-assert(page.indexOf("player.js?v=20261111.2") >= 0, "index.html cache-busts 20261111.2");
+assert(page.indexOf("player.js?v=20261111.3") >= 0, "index.html cache-busts 20261111.3");
 assert(page.indexOf("function _drawGl") < 0, "the page does not rewrite the WebGL draw");
 assert(code.indexOf("TILE_FADE_MS = 2400") >= 0, "player keeps the 2400ms fade");
 assert(code.indexOf("FOCUS_HANDOFF = 0.35") >= 0, "player keeps the 0.35 handoff");
 assert(code.indexOf("function paintStripView") >= 0, "Canvas2D remains when no stream connects");
-assert(code.indexOf("this._cpuTiles && this._streamActive") >= 0, "an active stream skips the Canvas2D paint");
+assert(code.indexOf("this._cpuTiles && (this._streamActive || this._streamHold)") >= 0, "a chosen stream skips the Canvas2D mesh");
 
 const aim = "ws://192.168.1.32:5000/c/0123456789abcdef0123456789abcdef/aim";
 const stream = "ws://192.168.1.32:5000/c/0123456789abcdef0123456789abcdef/stream";
@@ -37,7 +37,7 @@ const probe = Cast.streamProbe(false, true);
 assert(probe && probe.type === "stream-probe" && probe.webgl === false && probe.mse === true, "no-WebGL probe offers a stream");
 assert(probe.modes[0] === "h264-mse" && probe.modes[1] === "jpeg-ws", "probe order is h264-mse then jpeg-ws");
 assert(probe.log === "stream probe webgl=0 mse=1 modes=h264-mse,jpeg-ws", "probe log got " + (probe && probe.log));
-assert(probe.build === "20261111.2", "probe names the build");
+assert(probe.build === "20261111.3", "probe names the build");
 const jpegOnly = Cast.streamProbe(false, false);
 assert(jpegOnly.modes.length === 1 && jpegOnly.modes[0] === "jpeg-ws", "without MSE the probe is jpeg-ws only");
 assert(jpegOnly.log.indexOf("mse=0") >= 0, "the probe log records mse=0");
@@ -48,7 +48,7 @@ assert(chosen.ws === stream, "choice keeps a valid stream url");
 assert(chosen.choiceLog === "stream choice h264-mse", "choice log");
 assert(chosen.announceLog === "stream announce h264-mse", "announce log");
 assert(chosen.announce.type === "stream-announce" && chosen.announce.mode === "h264-mse", "announce message");
-assert(chosen.announce.build === "20261111.2", "announce names the build");
+assert(chosen.announce.build === "20261111.3", "announce names the build");
 assert(Cast.usableAvcCodec("avc1.42E01E") === "avc1.42E01E", "a baseline codec is usable");
 assert(Cast.usableAvcCodec("avc1.64001F") === "avc1.64001F", "a high-profile codec is usable");
 assert(Cast.usableAvcCodec("avc1.000001") === "", "an Annex-B start code is not a codec");
@@ -113,6 +113,33 @@ assert(page.indexOf("stream frame ") >= 0, "the page logs stream frames");
 assert(page.indexOf('msg.type === "stream"') >= 0, "the page accepts the stream choice");
 assert(page.indexOf("maybeProbeStream()") >= 0, "the page sends the stream probe");
 assert(page.indexOf('id="streamVideo"') >= 0 && page.indexOf('id="streamFrame"') >= 0, "stream picture elements are on the page");
+const connectAt = page.indexOf("function connectStream");
+const choiceAt = page.indexOf("function acceptStreamChoice");
+const connectBody = page.slice(connectAt, choiceAt);
+assert(connectBody.indexOf("modeChanged") >= 0 && connectBody.indexOf("releaseMse()") >= 0, "a mode switch resets the MSE state");
+assert(connectBody.indexOf("new WebSocket") > connectBody.indexOf("modeChanged"), "a mode switch opens a new socket");
+assert(connectBody.indexOf("!modeChanged) return") >= 0, "an open socket is kept only when the mode is unchanged");
+const onlyFetches = [];
+sandbox.__castSend = function (msg) {
+  if (msg && msg.type === "fetch") onlyFetches.push(msg.id);
+};
+const onlyHost = {
+  width: 320, height: 180, style: {},
+  addEventListener: function () {},
+  getContext: function () { return null; },
+};
+const only = Cast.create(onlyHost);
+only.setQueue([{
+  id: "only",
+  url: "http://192.168.1.8/photo.jpg",
+  width: 8000,
+  height: 4000,
+  tiles: [],
+  overview: { id: "only:overview", url: "http://192.168.1.8/overview.jpg", texW: 64, texH: 32 },
+}]);
+assert(only.session && only.session.entry && !only.session.entry.tiles, "a queue with no strips still opens");
+assert(onlyFetches.indexOf("only:overview") === 0, "the overview is requested, got " + onlyFetches.join(","));
+assert(onlyFetches.length === 1, "no strip is requested, got " + onlyFetches.join(","));
 const script = page.split("<script>").pop().split("</script>")[0];
 new Function(script);
 

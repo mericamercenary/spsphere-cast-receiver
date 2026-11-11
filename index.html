@@ -71,7 +71,7 @@
   <div id="mark" hidden><img class="logo" src="logo.png" alt="" /></div>
   <div id="busy"></div>
   <video id="wakeVideo" muted loop playsinline autoplay width="2" height="2" style="position:fixed;left:-99px;top:-99px;width:2px;height:2px;opacity:0.01;pointer-events:none"></video>
-  <script src="player.js?v=20261111.2"></script>
+  <script src="player.js?v=20261111.3"></script>
   <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
   <script>
     var NAMESPACE = "urn:x-cast:com.cameron.viewer360";
@@ -266,6 +266,7 @@
     var streamBuffer = null;
     var streamFrameLogAt = 0;
     var streamWaitTimer = 0;
+    var streamReplacing = false;
     var STREAM_WAIT_MS = 5000;
 
     function hideStreamSurface() {
@@ -473,21 +474,19 @@
       var safe = SpsphereCast.acceptStreamSocket(url);
       if (!safe || !mode) return;
       if (player && player.wantsPhoneStream && !player.wantsPhoneStream()) return;
-      if (safe === streamUrl && streamSocket && (streamSocket.readyState === 0 || streamSocket.readyState === 1)) {
-        var switched = streamDecodeMode !== mode;
-        streamMode = mode;
-        streamDecodeMode = mode;
-        if (mode !== "h264-mse") releaseMse();
-        if (switched) sendLog("stream socket open " + mode);
-        return;
-      }
+      var open = streamSocket && (streamSocket.readyState === 0 || streamSocket.readyState === 1);
+      var modeChanged = !!(streamDecodeMode && streamDecodeMode !== mode);
+      if (open && safe === streamUrl && !modeChanged) return;
       streamUrl = safe;
       streamMode = mode;
+      if (modeChanged) releaseMse();
       streamDecodeMode = mode;
       if (streamSocket) {
         var previous = streamSocket;
         streamSocket = null;
+        streamReplacing = true;
         try { previous.close(); } catch (e) {}
+        streamReplacing = false;
       }
       var socket;
       try {
@@ -511,7 +510,7 @@
         sendLog("stream socket error");
       };
       socket.onclose = function (event) {
-        if (socket !== streamSocket) return;
+        if (streamReplacing || socket !== streamSocket) return;
         streamSocket = null;
         sendLog(SpsphereCast.socketDisconnectLog("stream", streamUrl, event && event.code, event && event.reason));
         if (!streamUrl || !streamMode) return;
@@ -551,12 +550,14 @@
       streamRetries = 0;
       streamRejected = 0;
       if (modeChanged) streamSawFrame = false;
+      if (!streamSawFrame && player) {
+        player._streamHold = true;
+        player._streamActive = false;
+      }
       sendLog(choice.choiceLog);
       window.__castSend(choice.announce);
       sendLog(choice.announceLog);
-      if (modeChanged || !streamSawFrame) {
-        if (modeChanged || !streamWaitTimer) holdForStream();
-      }
+      if (!streamSawFrame && (modeChanged || !streamWaitTimer)) holdForStream();
       var url = choice.ws || SpsphereCast.streamUrlFromAim(aimUrl);
       if (url) connectStream(url, streamMode);
       else streamDecodeMode = streamMode;
