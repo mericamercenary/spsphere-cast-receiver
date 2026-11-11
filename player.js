@@ -19,7 +19,7 @@
 (function (root) {
   // Baked into player.js and the script URL. A Cast WebView that cached
   // "player.js" will not reuse that file for "player.js?v=<this>".
-  var RECEIVER_BUILD = "20261111.1";
+  var RECEIVER_BUILD = "20261111.2";
   var ROTATIONS = 2;
   var FULL_TURN = 360;
   var DEFAULT_DPS = 9;
@@ -721,19 +721,22 @@
     for (var i = 0; i < box.length; i++) window.__castSend(box[i]);
   };
 
-  // The probe runs when the page is parsed, before the Cast channel exists,
-  // and a sender that connects later never sees that first send. Repeat the
-  // build id and the probe once a sender is actually listening.
-  Player.prototype.announceBuild = function () {
-    var now = this._clock ? this._clock() : Date.now();
+  // The probe runs when the page is parsed, before the Cast channel exists.
+  // Say the build and the probe again when a sender is actually listening,
+  // then stop. Canvas logs used to call this every few seconds, which looked
+  // like the receiver was reloading.
+  Player.prototype.announceBuild = function (force) {
+    if (this._buildAnnounced) return;
+    var now = Date.now();
     this._flushSends();
-    if (this._announcedAt && now - this._announcedAt < 4000) return;
+    if (!force && this._announcedAt && now - this._announcedAt < 4000) return;
     this._announcedAt = now;
     if (!this._probeNote) {
       this._probeNote = withBuild("upload probe skipped reason=" + (this._setupReason || "not-run"));
     }
     this._send({ type: "log", message: "receiver build " + RECEIVER_BUILD });
     this._send({ type: "log", message: this._probeNote });
+    if (force) this._buildAnnounced = true;
   };
 
   Player.prototype._reportTv = function (message) {
@@ -4234,6 +4237,13 @@
     // A connected phone stream is the picture. Canvas2D stays the fallback
     // for the frames before that socket delivers anything.
     if (this._cpuTiles && this._streamActive) return;
+    if (this._cpuTiles && this._streamHold) {
+      resize(this.canvas);
+      var holdCtx = this._cpuContext();
+      var holdCanvas = this._cpuCanvas || this.canvas;
+      if (holdCtx && holdCanvas) this._paintStreamHold(holdCtx, holdCanvas.width, holdCanvas.height);
+      return;
+    }
     if (this._cpuTiles) {
       var stamp = Date.now();
       if (this._cpuDrawStamp === stamp) {
@@ -5013,6 +5023,21 @@
     return drawn;
   };
 
+  Player.prototype._paintStreamHold = function (ctx, width, height) {
+    if (!ctx || !(width > 0) || !(height > 0)) return 0;
+    ctx.fillStyle = "#0b0d10";
+    if (ctx.fillRect) ctx.fillRect(0, 0, width, height);
+    var under = this._cpuUnderlayPiece();
+    var img = under && under.tex && under.tex._cpuImage;
+    if (!img || !(img.width > 0) || !ctx.drawImage) return 0;
+    try {
+      ctx.drawImage(img, 0, 0, width, height);
+      return 1;
+    } catch (error) {
+      return 0;
+    }
+  };
+
   Player.prototype._cpuUnderlayPiece = function () {
     var base = this._activeBase && this._activeBase();
     var img = base && base.tex && base.tex._cpuImage;
@@ -5216,6 +5241,15 @@
   function safeCodec(codec) {
     var text = String(codec || "");
     if (!/^[a-zA-Z0-9.]{4,32}$/.test(text)) return "";
+    return text;
+  }
+
+  // avc1.000001 is the Annex-B start code 00 00 01, not a profile. MediaSource
+  // rejects it. A real codec is avc1 plus six hex digits.
+  function usableAvcCodec(codec) {
+    var text = safeCodec(codec);
+    if (!/^avc1\.[0-9A-Fa-f]{6}$/.test(text)) return "";
+    if (text.toLowerCase() === "avc1.000000" || text.toLowerCase() === "avc1.000001") return "";
     return text;
   }
 
@@ -9623,6 +9657,7 @@
     streamProbe: streamProbe,
     streamChoose: streamChoose,
     codecFromAvcC: codecFromAvcC,
+    usableAvcCodec: usableAvcCodec,
     jpegFrame: jpegFrame,
     socketDisconnectLog: socketDisconnectLog,
     httpUrl: httpUrl,

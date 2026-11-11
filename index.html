@@ -18,6 +18,20 @@
       position: fixed; inset: 0; z-index: 2; display: none; pointer-events: none;
     }
     #busy.on { display: block; }
+    #streamHold {
+      position: fixed; inset: 0; z-index: 2; display: none; pointer-events: none;
+      background: transparent;
+    }
+    #streamHold.on { display: block; }
+    #streamHold.on::after {
+      content: "";
+      position: absolute; left: 50%; top: 50%;
+      width: 46px; height: 46px; margin: -23px 0 0 -23px;
+      border-radius: 50%;
+      border: 3px solid rgba(255, 255, 255, 0.18);
+      border-top-color: #f2f5f7;
+      animation: spsphere-spin 0.8s linear infinite;
+    }
     #streamVideo, #streamFrame {
       position: fixed; inset: 0; width: 100%; height: 100%; z-index: 3;
       object-fit: contain; background: #0b0d10; pointer-events: none;
@@ -51,12 +65,13 @@
 </head>
 <body>
   <canvas id="view"></canvas>
+  <div id="streamHold"></div>
   <video id="streamVideo" hidden muted autoplay playsinline></video>
   <img id="streamFrame" alt="" hidden>
   <div id="mark" hidden><img class="logo" src="logo.png" alt="" /></div>
   <div id="busy"></div>
   <video id="wakeVideo" muted loop playsinline autoplay width="2" height="2" style="position:fixed;left:-99px;top:-99px;width:2px;height:2px;opacity:0.01;pointer-events:none"></video>
-  <script src="player.js?v=20261111.1"></script>
+  <script src="player.js?v=20261111.2"></script>
   <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
   <script>
     var NAMESPACE = "urn:x-cast:com.cameron.viewer360";
@@ -238,6 +253,7 @@
     });
 
     var streamMode = "";
+    var streamDecodeMode = "";
     var streamCodec = "";
     var streamUrl = "";
     var streamSocket = null;
@@ -249,27 +265,89 @@
     var streamSource = null;
     var streamBuffer = null;
     var streamFrameLogAt = 0;
+    var streamWaitTimer = 0;
+    var STREAM_WAIT_MS = 5000;
 
     function hideStreamSurface() {
       var video = document.getElementById("streamVideo");
       var frame = document.getElementById("streamFrame");
+      var hold = document.getElementById("streamHold");
       if (video) video.hidden = true;
       if (frame) frame.hidden = true;
-      if (player) player._streamActive = false;
+      if (hold) hold.className = "";
+      if (player) {
+        player._streamActive = false;
+        player._streamHold = false;
+      }
+    }
+
+    function holdForStream() {
+      if (streamWaitTimer) clearTimeout(streamWaitTimer);
+      if (player) {
+        player._streamHold = true;
+        player._streamHoldPainted = false;
+        if (!streamSawFrame) player._streamActive = false;
+      }
+      var hold = document.getElementById("streamHold");
+      if (hold) hold.className = "on";
+      streamWaitTimer = setTimeout(function () {
+        streamWaitTimer = 0;
+        if (streamSawFrame || !streamMode) return;
+        fallbackCanvas("timeout");
+      }, STREAM_WAIT_MS);
     }
 
     function showStreamSurface(which) {
       var video = document.getElementById("streamVideo");
       var frame = document.getElementById("streamFrame");
+      var hold = document.getElementById("streamHold");
       if (video) video.hidden = which !== "video";
       if (frame) frame.hidden = which !== "frame";
-      if (player) player._streamActive = true;
+      if (hold) hold.className = "";
+      if (streamWaitTimer) {
+        clearTimeout(streamWaitTimer);
+        streamWaitTimer = 0;
+      }
+      if (player) {
+        player._streamHold = false;
+        player._streamActive = true;
+      }
     }
 
     function fallbackCanvas(why) {
+      if (streamWaitTimer) {
+        clearTimeout(streamWaitTimer);
+        streamWaitTimer = 0;
+      }
       hideStreamSurface();
       streamSawFrame = false;
       sendLog("stream fallback canvas2d" + (why ? " " + why : ""));
+    }
+
+    function reportStreamFallback(reason) {
+      var why = String(reason || "mse");
+      try {
+        window.__castSend({ type: "stream-fallback", reason: why });
+      } catch (e) {}
+      sendLog("stream-fallback " + why);
+    }
+
+    function releaseMse() {
+      streamQueue = [];
+      streamBuffer = null;
+      if (streamSource) {
+        try {
+          if (streamSource.readyState === "open") streamSource.endOfStream();
+        } catch (e) {}
+      }
+      streamSource = null;
+      var video = document.getElementById("streamVideo");
+      if (video) {
+        try {
+          video.removeAttribute("src");
+          if (video.load) video.load();
+        } catch (e) {}
+      }
     }
 
     function maybeProbeStream() {
@@ -325,14 +403,14 @@
         streamBuffer.appendBuffer(copy);
         noteStreamFrame("h264-mse", copy.byteLength);
       } catch (err) {
-        if (!streamSawFrame) fallbackCanvas("append");
-        else sendLog("stream mse " + (err && err.message ? err.message : "append"));
+        sendLog("stream mse " + (err && err.message ? err.message : "append"));
+        if (!streamSawFrame) reportStreamFallback("mse");
       }
     }
 
     function appendH264(bytes) {
       if (typeof MediaSource === "undefined") {
-        fallbackCanvas("no-mse");
+        reportStreamFallback("no-mse");
         return;
       }
       var video = document.getElementById("streamVideo");
@@ -347,18 +425,27 @@
       streamSource.addEventListener("sourceopen", function () {
         if (streamBuffer || !streamSource || streamSource.readyState !== "open") return;
         var first = streamQueue.length ? streamQueue[0] : null;
-        var sniffed = (first && SpsphereCast.codecFromAvcC(first)) || streamCodec || "avc1.42E01E";
+        var sniffed = first && SpsphereCast.codecFromAvcC(first);
+        var requested = SpsphereCast.usableAvcCodec(streamCodec);
+        var codec = sniffed || requested || (streamCodec ? "" : "avc1.42E01E");
+        if (!codec) {
+          sendLog("stream mse unsupported codec " + (streamCodec || "none"));
+          reportStreamFallback("mse");
+          releaseMse();
+          return;
+        }
         try {
-          streamBuffer = streamSource.addSourceBuffer('video/mp4; codecs="' + sniffed + '"');
+          streamBuffer = streamSource.addSourceBuffer('video/mp4; codecs="' + codec + '"');
         } catch (err) {
           sendLog("stream mse " + (err && err.message ? err.message : "open"));
-          fallbackCanvas("mse");
+          reportStreamFallback("mse");
+          releaseMse();
           return;
         }
         try { streamBuffer.mode = "sequence"; } catch (err) {}
         streamBuffer.addEventListener("updateend", pumpH264);
         streamBuffer.addEventListener("error", function () {
-          if (!streamSawFrame) fallbackCanvas("mse");
+          if (!streamSawFrame) reportStreamFallback("mse");
         });
         try {
           var playing = video.play();
@@ -386,9 +473,17 @@
       var safe = SpsphereCast.acceptStreamSocket(url);
       if (!safe || !mode) return;
       if (player && player.wantsPhoneStream && !player.wantsPhoneStream()) return;
-      if (safe === streamUrl && streamSocket && (streamSocket.readyState === 0 || streamSocket.readyState === 1)) return;
+      if (safe === streamUrl && streamSocket && (streamSocket.readyState === 0 || streamSocket.readyState === 1)) {
+        var switched = streamDecodeMode !== mode;
+        streamMode = mode;
+        streamDecodeMode = mode;
+        if (mode !== "h264-mse") releaseMse();
+        if (switched) sendLog("stream socket open " + mode);
+        return;
+      }
       streamUrl = safe;
       streamMode = mode;
+      streamDecodeMode = mode;
       if (streamSocket) {
         var previous = streamSocket;
         streamSocket = null;
@@ -405,11 +500,11 @@
       socket.binaryType = "arraybuffer";
       socket.onopen = function () {
         if (socket !== streamSocket) return;
-        sendLog("stream socket open " + mode);
+        sendLog("stream socket open " + (streamDecodeMode || mode));
       };
       socket.onmessage = function (event) {
         if (socket !== streamSocket || !event) return;
-        if (event.data instanceof ArrayBuffer) onStreamBytes(event.data, mode);
+        if (event.data instanceof ArrayBuffer) onStreamBytes(event.data, streamDecodeMode || mode);
       };
       socket.onerror = function () {
         if (socket !== streamSocket) return;
@@ -450,15 +545,21 @@
         sendLog("stream choice rejected");
         return;
       }
+      var modeChanged = streamDecodeMode !== choice.mode;
       streamMode = choice.mode;
       streamCodec = choice.codec || "";
       streamRetries = 0;
       streamRejected = 0;
+      if (modeChanged) streamSawFrame = false;
       sendLog(choice.choiceLog);
       window.__castSend(choice.announce);
       sendLog(choice.announceLog);
+      if (modeChanged || !streamSawFrame) {
+        if (modeChanged || !streamWaitTimer) holdForStream();
+      }
       var url = choice.ws || SpsphereCast.streamUrlFromAim(aimUrl);
       if (url) connectStream(url, streamMode);
+      else streamDecodeMode = streamMode;
     }
 
     function closeReceiver(reason) {
@@ -466,6 +567,11 @@
       aimUrl = "";
       streamUrl = "";
       streamMode = "";
+      streamDecodeMode = "";
+      if (streamWaitTimer) {
+        clearTimeout(streamWaitTimer);
+        streamWaitTimer = 0;
+      }
       if (aimSocket) {
         try { aimSocket.close(); } catch (e) {}
         aimSocket = null;
@@ -585,7 +691,7 @@
         keepReceiverAwake();
         sendLimits();
         sendCaps();
-        if (player && player.announceBuild) player.announceBuild();
+        if (player && player.announceBuild) player.announceBuild(true);
         maybeProbeStream();
         sendLog("receiver ready (hello ack)");
         if (player && player.items && player.items.length) {
@@ -676,7 +782,7 @@
         if (sysEvents.SENDER_CONNECTED) {
           context.addEventListener(sysEvents.SENDER_CONNECTED, function (event) {
             keepReceiverAwake();
-            if (player && player.announceBuild) player.announceBuild();
+            if (player && player.announceBuild) player.announceBuild(true);
             sendLog("sender connected: " + (event && event.senderId || "unknown"));
           });
         }
